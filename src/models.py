@@ -2,7 +2,7 @@ import os
 import numpy as np
 from scipy.interpolate import interp1d
 
-MODELS_FILE = os.path.join(os.path.dirname(__file__), "models_21cm.npz")
+MODELS_FILE = os.path.join(os.path.dirname(__file__), "data", "models_21cm.npz")
 
 class T21cmModel:
     """

@@ -14,6 +14,7 @@ Supported analytic dipole models:
   - "thin": frequency-dependent finite thin-dipole power pattern in free space
 """
 
+import os
 import healpy
 import numpy as np
 from scipy.interpolate import interp1d
@@ -22,7 +23,7 @@ from .healpix import HPM
 from .coord import rot_m
 from .const import c as C_LIGHT
 
-BEAM_NPZ = "eigsep_vivaldi.npz"
+BEAM_NPZ = os.path.join(os.path.dirname(__file__), "data", "eigsep_bowtie_v000.npz")
 
 _real_dtype = np.float32
 

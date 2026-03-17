@@ -20,6 +20,7 @@ is the cheap (3, 3) @ (3, N) beam-orientation multiply.
 
 from __future__ import annotations
 
+import os
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -42,9 +43,10 @@ except ImportError:
 real_dtype = np.float32
 complex_dtype = np.complex64
 
-TERRAIN_NPZ = 'horizon_models_v000.npz'
-BANDPASS_NPZ = 'bandpass.npz'
-S11_NPZ = 'S11_eigsep_bowtie_v000.npz'
+_DATA = os.path.join(os.path.dirname(__file__), 'data')
+TERRAIN_NPZ = os.path.join(_DATA, 'horizon_models_v000.npz')
+BANDPASS_NPZ = os.path.join(_DATA, 'bandpass.npz')
+S11_NPZ = os.path.join(_DATA, 'S11_eigsep_bowtie_v000.npz')
 
 DEFAULT_RESISTIVITY = 3e2  # Ohm m
 

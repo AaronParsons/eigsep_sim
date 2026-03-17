@@ -44,7 +44,7 @@ all = ["eigsep_sim[vis,dev]"]
 Repository = "https://github.com/EIGSEP/eigsep_sim"
 
 [tool.setuptools.package-data]
-eigsep_sim = ["*.npz"]
+eigsep_sim = ["data/*.npz"]
 
 [tool.setuptools.package-dir]
 eigsep_sim = "src"
