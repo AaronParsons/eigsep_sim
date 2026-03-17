@@ -1,20 +1,18 @@
 import numpy as np
 import jax.numpy as jnp
-from scipy.interpolate import interp1d
-import hera_sim
 from matvis import coordinates
-import fftvis
-#from pyuvdata.analytic_beam import AnalyticBeam, AiryBeam, UniformBeam
 from matvis.cpu.coords import CoordinateRotationERFA
 from astropy.time import Time
 from astropy.coordinates import EarthLocation, SkyCoord
 import healpy
 from pygdsm import GlobalSkyModel16 as GSM16
 import eigsep_terrain.utils as etu
-import aipy
 import tqdm
-from .src import SourceCatalog, query_vizier
+from .src import SourceCatalog
 from .hpm import HPM, float_dtype
+from .beam import Beam, load_beam
+from .models import T21cmModel
+from .coord import convert_m
 
 PRECISION = 1
 
@@ -32,51 +30,9 @@ DEFAULT_HGT = 1800 # m
 
 DEFAULT_RESISTIVITY = 3e2 # Ohm m
 
-BEAM_NPZ = 'eigsep_vivaldi.npz'
 TERRAIN_NPZ = 'horizon_models_v000.npz'
 BANDPASS_NPZ = 'bandpass.npz'
 S11_NPZ = 'S11_eigsep_bowtie_v000.npz'
-T21CM_NPZ = 'models_21cm.npz'
-
-class Beam(HPM):
-    def __init__(self, freqs, filename=BEAM_NPZ, peak_normalize=True):
-        bm_data = load_beam(freqs, filename=filename)
-        self.freqs = freqs
-        if peak_normalize:
-            bm_data /= bm_data.max()
-        nside_beam = healpy.npix2nside(bm_data.shape[0])
-        self.set_az(0)
-        self.set_alt(0)
-        HPM.__init__(self, nside_beam, interp=True)
-        self.set_map(bm_data)
-
-    def set_az(self, theta, az_vec=np.array([0, 0, 1], dtype=real_dtype)):
-        # XXX angle applied coordinates (*not* the platform); might be confusing
-        self.az = theta
-        self.rot_az = aipy.coord.rot_m(theta, az_vec)
-
-    def set_alt(self, theta, alt_vec=np.array([1, 0, 0], dtype=real_dtype)):
-        # XXX angle applied coordinates (*not* the platform); might be confusing
-        self.alt = theta
-        self.rot_alt = aipy.coord.rot_m(theta, alt_vec)
-
-    def get_rotation_matrices(self, azs, alts):
-        n_rots = azs.size
-        rot_ms = np.empty((n_rots, 3, 3), dtype=real_dtype)
-        for cnt in range(n_rots):
-            self.set_az(azs.flat[cnt])
-            self.set_alt(alts.flat[cnt])
-            rot_ms[cnt] = self.rot_az.dot(self.rot_alt)
-        rot_ms = rot_ms.reshape(azs.shape + (3, 3))
-        return rot_ms
-
-    def __getitem__(self, crd_top):
-        """Access data on a sphere via hpm[crd].
-        crd = either 1d array of pixel indices, (th,phi), or (x,y,z), where
-        th,phi,x,y,z are numpy arrays of coordinates."""
-        rot_m = self.rot_az.dot(self.rot_alt)
-        bx, by, bz = rot_m.dot(crd_top)
-        return HPM.__getitem__(self, (bx, by, bz))
 
 
 class Terrain(HPM):
@@ -124,16 +80,6 @@ class Terrain(HPM):
         return I
         
 
-def load_T21cm_models(freqs, model_index=None, filename=T21CM_NPZ):
-    npz = np.load(filename)
-    mdl_freqs = npz['freqs'] * 1e9
-    mdl_T = npz['models'] * 1e-3
-    if model_index is not None:
-        mdl_T = mdl_T[model_index]
-    mdl_interp = interp1d(mdl_freqs, mdl_T, kind='cubic', fill_value=0, bounds_error=False)
-    T_21cm = mdl_interp(freqs)
-    return T_21cm
-
 def load_bandpass(freqs, filename=BANDPASS_NPZ):
     npz = np.load(filename)
     mdl_freqs = npz['freqs']
@@ -141,14 +87,6 @@ def load_bandpass(freqs, filename=BANDPASS_NPZ):
     mdl_interp = interp1d(mdl_freqs, bp, kind='cubic', fill_value=0, bounds_error=False)
     bandpass = mdl_interp(freqs)
     return bandpass
-
-def load_beam(freqs, filename=BEAM_NPZ):
-    npz = np.load(filename)
-    mdl_freqs = npz['freqs']
-    bm = npz['bm'].T  # put in px/fq order
-    mdl_interp = interp1d(mdl_freqs, bm, kind='cubic', fill_value=0, bounds_error=False)
-    bm = mdl_interp(freqs)
-    return bm.astype(real_dtype)
 
 def load_S11(freqs, filename=S11_NPZ, termination=None):
     npz = np.load(filename)
@@ -178,7 +116,7 @@ class GlobalSim:
                  monopole=None,
                  lon=DEFAULT_LON, lat=DEFAULT_LAT, height=DEFAULT_HGT,
                 ):
-        self.eq2ga_m = aipy.coord.convert_m('eq', 'ga')
+        self.eq2ga_m = convert_m('eq', 'ga')
         self.beam = beam
         self.terrain = terrain
         self.freqs = np.asarray(freqs, dtype=real_dtype)
@@ -206,18 +144,6 @@ class GlobalSim:
         gsm_hpm.set_map(gsm_map.T)
         return gsm_hpm
 
-    def gen_point_sources(self, nsrcs, chromatic=True, power_law_index=2.0, min_src_flux=2.0,
-                                spectral_index_range=(-2, 0), fq0=150e6):
-        """Return fluxes for the specified number of sources drawn from a power law of strengths."""
-        np.random.seed(0)
-        Isky0 = min_src_flux * (1 - np.random.uniform(size=nsrcs))**(-1 / (power_law_index - 1))
-        if chromatic:
-            index0 = np.random.uniform(spectral_index_range[0], spectral_index_range[1], size=(nsrcs, 1))
-            flux = Isky0[:,None] * (self.freqs[None,:] / fq0)**index0
-        else:
-            flux = Isky0[:,None] * (freqs[None,:] / fq0)**0
-        return flux
-
     def set_sky_model(self,
                       monopole=None,
                       gsm=True,
@@ -235,15 +161,14 @@ class GlobalSim:
         self.crd_eq = np.asarray(coordinates.point_source_crd_eq(self.ra, self.dec), dtype=real_dtype)
         gx, gy, gz = self.eq2ga_m @ self.crd_eq
         self.sky_model = gsm[gx, gy, gz] 
-        self.catalog = SourceCatalog(self.nside, self.freqs, self.times)
-        if not sun:
-            self.catalog.set_sun_flux(F0_Sun=0.0)
+        self.catalog = SourceCatalog(self.nside, self.freqs)
+        if sun:
+            self.catalog.add_sun()
         if three_c:
-            srcs, fluxes = query_vizier()
-            self.catalog.add_sources(srcs, fluxes, np.full(fluxes.shape, -1), fq0=178e6)
+            self.catalog.add_vizier_3c()
         if nrandom > 0:
             self.catalog.add_random_sources(nrandom)
-        # XXX for now, rasterizing catalog
+        self.catalog.update_positions(self.times[0])
         self.sky_model += self.catalog.convert_to_healpix()
         if monopole is not None:
             assert monopole.size == self.nfreqs
