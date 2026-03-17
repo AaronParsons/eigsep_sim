@@ -11,7 +11,7 @@ import healpy
 import numpy as np
 from scipy.interpolate import interp1d
 
-from .hpm import HPM
+from .healpix import HPM
 from .coord import rot_m
 
 BEAM_NPZ = 'eigsep_vivaldi.npz'

@@ -5,7 +5,7 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord
 from aipy.src import get_catalog
 
-from .hpm import HPM
+from .healpix import HPM
 from .const import c as C, k as k_B, Jy
 
 

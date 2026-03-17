@@ -9,7 +9,7 @@ from pygdsm import GlobalSkyModel16 as GSM16
 import eigsep_terrain.utils as etu
 import tqdm
 from .src import SourceCatalog
-from .hpm import HPM, float_dtype
+from .healpix import HPM, float_dtype
 from .beam import Beam, load_beam
 from .models import T21cmModel
 from .coord import convert_m
