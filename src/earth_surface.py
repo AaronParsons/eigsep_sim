@@ -7,23 +7,13 @@ Provides the rotation from galactic to local topocentric coordinates
 
 import numpy as np
 import healpy
-from astropy.time import Time
-from astropy.coordinates import EarthLocation, SkyCoord, CartesianRepresentation
+from astropy.coordinates import EarthLocation
 import astropy.units as u
 
-
-def _icrs2gal_matrix():
-    R = np.empty((3, 3))
-    for i, v in enumerate([[1, 0, 0], [0, 1, 0], [0, 0, 1]]):
-        c = SkyCoord(CartesianRepresentation(*v, unit=u.one), frame='icrs')
-        R[:, i] = c.galactic.cartesian.xyz.value
-    return R
+from ._observer import Observer, ICRS2GAL
 
 
-_ICRS2GAL = _icrs2gal_matrix()
-
-
-class EarthSurface:
+class EarthSurface(Observer):
     """
     Observer on the Earth's surface.
 
@@ -38,14 +28,10 @@ class EarthSurface:
     """
 
     def __init__(self, lat, lon, height=0.0):
+        super().__init__()
         self.location = EarthLocation(
             lat=lat * u.deg, lon=lon * u.deg, height=height * u.m
         )
-        self.time = None
-
-    def set_time(self, t):
-        """Set the current epoch."""
-        self.time = Time(t)
 
     def rot_gal2top(self):
         """
@@ -63,7 +49,7 @@ class EarthSurface:
         north = np.cross(up, east)
         # columns of top2icrs are [east, north, up] expressed in ICRS
         top2icrs = np.column_stack([east, north, up])
-        top2gal = _ICRS2GAL @ top2icrs
+        top2gal = ICRS2GAL @ top2icrs
         return top2gal.T  # gal2top = top2gal^{-1} = top2gal.T
 
     def above_horizon(self, nside):

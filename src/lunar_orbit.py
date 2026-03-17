@@ -8,14 +8,14 @@ is tracked separately and used for lunar occultation masking.
 
 import numpy as np
 import healpy
-from astropy.time import Time
 import astropy.units as u
 
+from ._observer import Observer
 from .coord import rot_m
 from .const import R_MOON
 
 
-class LunarOrbit:
+class LunarOrbit(Observer):
     """
     Spacecraft in a circular lunar orbit with an independent spin.
 
@@ -69,7 +69,9 @@ class LunarOrbit:
 
         self.orbital_period = float(orbital_period)
         self.spin_period = float(spin_period)
+        from astropy.time import Time
         self.t0 = Time("J2000") if t0 is None else Time(t0)
+        super().__init__()
         self.time = self.t0
 
         self._th_orbit = 0.0
@@ -77,7 +79,7 @@ class LunarOrbit:
 
     def set_time(self, t):
         """Set the current epoch and update orbital and spin phases."""
-        self.time = Time(t)
+        super().set_time(t)
         dt = (self.time - self.t0).to(u.s).value
         self._th_orbit = 2 * np.pi * dt / self.orbital_period
         self._th_spin = (

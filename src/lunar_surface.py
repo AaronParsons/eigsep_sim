@@ -8,20 +8,8 @@ z=up (away from the Moon centre).
 
 import numpy as np
 import healpy
-from astropy.time import Time
-from astropy.coordinates import SkyCoord, CartesianRepresentation
-import astropy.units as u
 
-
-def _icrs2gal_matrix():
-    R = np.empty((3, 3))
-    for i, v in enumerate([[1, 0, 0], [0, 1, 0], [0, 0, 1]]):
-        c = SkyCoord(CartesianRepresentation(*v, unit=u.one), frame='icrs')
-        R[:, i] = c.galactic.cartesian.xyz.value
-    return R
-
-
-_ICRS2GAL = _icrs2gal_matrix()
+from ._observer import Observer, ICRS2GAL
 
 
 def _rotmat_x(a):
@@ -90,7 +78,7 @@ def _moon_icrs2mcmf(t):
     return _rotmat_z(W) @ _rotmat_x(np.pi / 2 - delta0) @ _rotmat_z(np.pi / 2 + alpha0)
 
 
-class LunarSurface:
+class LunarSurface(Observer):
     """
     Observer on the lunar surface.
 
@@ -103,9 +91,9 @@ class LunarSurface:
     """
 
     def __init__(self, lat, lon):
+        super().__init__()
         self.lat_rad = np.deg2rad(lat)
         self.lon_rad = np.deg2rad(lon)
-        self.time = None
         # Observer "up" direction in MCMF (body-fixed Moon frame)
         clat = np.cos(self.lat_rad)
         slat = np.sin(self.lat_rad)
@@ -114,10 +102,6 @@ class LunarSurface:
              clat * np.sin(self.lon_rad),
              slat]
         )
-
-    def set_time(self, t):
-        """Set the current epoch."""
-        self.time = Time(t)
 
     def rot_gal2top(self):
         """
@@ -133,7 +117,7 @@ class LunarSurface:
         east_icrs /= np.linalg.norm(east_icrs)
         north_icrs = np.cross(up_icrs, east_icrs)
         top2icrs = np.column_stack([east_icrs, north_icrs, up_icrs])
-        top2gal = _ICRS2GAL @ top2icrs
+        top2gal = ICRS2GAL @ top2icrs
         return top2gal.T
 
     def above_horizon(self, nside):
