@@ -494,12 +494,25 @@ class SourceCatalog:
     # ------------------------------------------------------------------
     # Render
 
-    def convert_to_healpix(self):
+    def convert_to_healpix(self, solar_system=True, fixed=True):
         """
-        Render all sources onto a galactic HEALPix brightness temperature map.
+        Render sources onto a galactic HEALPix brightness temperature map.
 
         Solar system sources must have been updated via :meth:`update_positions`
         before calling this method.
+
+        Parameters
+        ----------
+        solar_system : bool
+            Include solar system sources.  Extended bodies (Sun, Moon, Earth)
+            are spread over disc pixels via ``disc_overlap_fraction``; planets
+            with a sub-pixel disc are assigned to their nearest pixel.
+            Default: True.
+        fixed : bool
+            Include fixed catalog sources (Vizier, random, user-supplied).
+            These are always assigned to their nearest pixel, which is
+            appropriate for visualisation but can introduce pixelisation
+            artefacts in simulations.  Default: True.
 
         Returns
         -------
@@ -511,7 +524,7 @@ class SourceCatalog:
         hpx = np.zeros((npix, nfreq), dtype=self.dtype)
 
         # Fixed sources — nearest-pixel assignment
-        if len(self._crd_gal) > 0:
+        if fixed and len(self._crd_gal) > 0:
             pix = hp.vec2pix(self.nside,
                              self._crd_gal[:, 0],
                              self._crd_gal[:, 1],
@@ -519,18 +532,19 @@ class SourceCatalog:
             np.add.at(hpx, pix, self._Tsrc)
 
         # Solar system sources
-        for src in self._ss_sources:
-            if src.crd_gal is None:
-                continue
-            T = src.temperature(self.freqs).astype(self.dtype)
-            r_ang = src.angular_radius()
-            if r_ang > 0:
-                pix_disk, frac = disc_overlap_fraction(
-                    self.nside, src.crd_gal, r_ang
-                )
-                hpx[pix_disk] += frac[:, None] * T[None, :]
-            else:
-                pix = hp.vec2pix(self.nside, *src.crd_gal)
-                hpx[pix] += T
+        if solar_system:
+            for src in self._ss_sources:
+                if src.crd_gal is None:
+                    continue
+                T = src.temperature(self.freqs).astype(self.dtype)
+                r_ang = src.angular_radius()
+                if r_ang > 0:
+                    pix_disk, frac = disc_overlap_fraction(
+                        self.nside, src.crd_gal, r_ang
+                    )
+                    hpx[pix_disk] += frac[:, None] * T[None, :]
+                else:
+                    pix = hp.vec2pix(self.nside, *src.crd_gal)
+                    hpx[pix] += T
 
         return hpx
