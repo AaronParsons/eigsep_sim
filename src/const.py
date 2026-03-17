@@ -30,6 +30,12 @@ arcmin = deg / 60.          # arcminute in radians
 arcsec = arcmin / 60.       # arcsecond in radians
 ft = 30.48006096012         # length of a foot in cm
 
+# MKS constants
+Jy_mks = 1e-26              # Jansky (W / m^2 / Hz)
+R_MOON = 1_737_400          # radius of moon (m)
+R_SUN = 696_265_000         # radius of sun (m)
+R_EARTH = 6_378_137         # radius of earth (m)
+
 def description():
     return {
         'pi'          : "Pi",
@@ -56,4 +62,8 @@ def description():
         'arcmin'      : "arcminute in radians",
         'arcsec'      : "arcsecond in radians",
         'ft'          : "length of a foot in cm",
+        'Jy_mks'      : "Jansky (W / m^2 / Hz)",
+        'R_MOON'      : "radius of moon (m)",
+        'R_SUN'       : "radius of sun (m)",
+        'R_EARTH'     : "radius of earth (m)",
     }
