@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eigsep_sim"
+dynamic = ["version"]
+requires-python = ">=3.8"
+authors = [
+    {name = "Aaron Parsons", email = "aparsons@berkeley.edu"},
+]
+description = "EIGSEP Simulations"
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "eigsep_terrain @ git+https://github.com/EIGSEP/eigsep_terrain.git@main",
+]
+
+[project.optional-dependencies]
+vis = [
+    "jupyterlab",
+    "jupyterlab-vim",
+    "ipympl",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "flake8",
+]
+all = ["eigsep_sim[vis, dev]"]
+
+[project.urls]
+Repository = "https://github.com/EIGSEP/eigsep_sim"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "eigsep_sim.__version__"}
+
+[tool.black]
+line-length = 79
