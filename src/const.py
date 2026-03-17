@@ -45,7 +45,7 @@ R_SUN = const.R_sun.value         # radius of sun [m]
 R_EARTH = const.R_earth.value     # radius of earth [m]
 
 # Flux units
-Jy = const.Jy.value               # Jansky [W / m^2 / Hz]
+Jy = u.Jy.to(u.W / u.m**2 / u.Hz)  # Jansky [W / m^2 / Hz]
 
 
 def description():
