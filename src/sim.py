@@ -34,6 +34,62 @@ import tqdm
 from .healpix import HPM, float_dtype, interpolate_map
 from .beam import Beam
 
+# SH FFT spin-sweep helpers — imported lazily to avoid hard dependency on healpy.Alm
+def _sh_coupling_modes(beam_alm, sky_alm, lmax):
+    """
+    C_m = sum_{l>=m} b_lm * conj(t_lm)  for m = 0 .. lmax.
+
+    Parameters
+    ----------
+    beam_alm, sky_alm : (n_alm,) complex128
+        Spherical-harmonic coefficients (healpy convention, m >= 0 stored).
+    lmax : int
+
+    Returns
+    -------
+    C_pos : (lmax+1,) complex128
+    """
+    _, m_arr = healpy.Alm.getlm(lmax)
+    product = beam_alm * np.conj(sky_alm)
+    C_pos = np.zeros(lmax + 1, dtype=np.complex128)
+    np.add.at(C_pos, m_arr, product)
+    return C_pos
+
+
+def _sh_fft_spin(C_pos, N_phi, beam_solid_angle):
+    """
+    Evaluate T_ant(phi_k) for k=0..N_phi-1 (phi_k = 2pi k / N_phi) via FFT.
+
+    For rotations R_z(phi) about the z-axis the Wigner D-matrix is diagonal,
+    D^l_{mm'}(R_z(phi)) = delta_{mm'} e^{-im phi}, so the beam-weighted
+    integral reduces to a DFT:
+
+        T_ant(phi_k) = (1/Omega_B) sum_m C_m e^{-i m phi_k}
+
+    All N_phi orientations are evaluated via a single FFT instead of N_phi
+    separate pixel-domain sums.
+
+    Parameters
+    ----------
+    C_pos : (lmax+1,) complex128
+        Coupling modes from :func:`_sh_coupling_modes`.
+    N_phi : int
+        Number of equally-spaced spin angles.
+    beam_solid_angle : float
+        Beam normalisation: integral(B dΩ) = sum_pix(B) * (4pi/npix).
+
+    Returns
+    -------
+    T_ant : (N_phi,) float64
+    """
+    mmax = len(C_pos) - 1
+    spectrum = np.zeros(N_phi, dtype=np.complex128)
+    spectrum[0] = C_pos[0]
+    m_hi = min(mmax, N_phi // 2)
+    spectrum[1:m_hi + 1] = C_pos[1:m_hi + 1]
+    spectrum[N_phi - m_hi:N_phi] = np.conj(C_pos[m_hi:0:-1])
+    return np.fft.ifft(spectrum).real * N_phi / beam_solid_angle
+
 try:
     import eigsep_terrain.utils as etu
     _HAS_TERRAIN = True
@@ -153,10 +209,15 @@ def load_S11(freqs, filename=S11_NPZ, termination=None):
 # JAX beam-integration kernels
 # ---------------------------------------------------------------------------
 
-@partial(jax.jit, static_argnums=(0,))
-def _beam_sum(beam_nside, beam_map, sky_masked, crds_top, rot_ms):
+@partial(jax.jit, static_argnums=(0, 5))
+def _beam_sum(beam_nside, beam_map, sky_masked, crds_top, rot_ms,
+              npix_sky=None):
     """
     Beam-weighted sum over the gridded (HEALPix) sky.
+
+    The denominator (beam solid angle) is rotation-invariant for a full-sphere
+    sky and is precomputed once, halving the number of reductions per
+    orientation vs. computing it inside the scan loop.
 
     Parameters
     ----------
@@ -165,17 +226,28 @@ def _beam_sum(beam_nside, beam_map, sky_masked, crds_top, rot_ms):
     sky_masked : (npix_sky,  nfreq)  sky already multiplied by horizon+terrain mask
     crds_top   : (3, npix_sky)       topocentric pixel unit vectors
     rot_ms     : (n_orient, 3, 3)    topocentric → beam-frame rotations
+    npix_sky   : int or None  (static)
+        Number of sky pixels.  If None, inferred from sky_masked.shape[0].
+        Used to scale the beam sum to match the sky-pixel sampling density.
 
     Returns
     -------
     num : (n_orient, nfreq)   beam-weighted sky sum
-    den : (n_orient, nfreq)   beam solid-angle sum (normalisation)
+    den : (n_orient, nfreq)   beam solid-angle (repeated for each orientation)
     """
+    # Denominator: sum_pix B(R @ n_pix) is rotation-invariant for full-sphere
+    # sky.  It equals (npix_sky/npix_beam) * sum(beam_map, axis=0).
+    npix_beam = beam_map.shape[0]
+    if npix_sky is None:
+        npix_sky = sky_masked.shape[0]
+    den_row = jnp.sum(beam_map, axis=0) * (npix_sky / npix_beam)  # (nfreq,)
+
     def body(_, R):
         wgt = interpolate_map(beam_nside, beam_map, *(R @ crds_top))
-        return None, (jnp.sum(wgt * sky_masked, axis=0),
-                      jnp.sum(wgt, axis=0))
-    _, (num, den) = jax.lax.scan(body, None, rot_ms)
+        return None, jnp.sum(wgt * sky_masked, axis=0)
+
+    _, num = jax.lax.scan(body, None, rot_ms)                     # (n_orient, nfreq)
+    den = jnp.broadcast_to(den_row[None, :], num.shape)
     return num, den
 
 
@@ -472,13 +544,125 @@ class Simulator:
             for i in range(0, n_orient, chunk_size):
                 rm_chunk = rot_ms_jax[i:i + chunk_size]
                 num, den = _beam_sum(beam_nside, beam_map, sky_jax,
-                                     crds_top_jax, rm_chunk)
+                                     crds_top_jax, rm_chunk,
+                                     npix_sky=self.npix)
                 if src_vecs_top.shape[1] > 0:
                     sv_jax = jnp.asarray(src_vecs_top, dtype=float_dtype)
                     sf_jax = jnp.asarray(src_flux, dtype=float_dtype)
                     num = num + _src_sum(beam_nside, beam_map,
                                          sv_jax, sf_jax, rm_chunk)
                 t_ant[i:i + chunk_size] = np.asarray(num / den)
+
+            vis[ti] = bandpass * (S12 * t_ant + Trx)
+
+        return vis
+
+    # ------------------------------------------------------------------
+    # SH + FFT spin-sweep simulation
+    # ------------------------------------------------------------------
+
+    def sim_spin(self, times, n_phi, alt_rad=0.0, Trx=50.0, bandpass=1.0,
+                 S11=0.0, lmax=None):
+        """
+        Fast spin-sweep simulation using spherical harmonics + FFT.
+
+        For a pure rotation about the topocentric z-axis (constant altitude),
+        the Wigner D-matrix is diagonal, reducing the beam-weighted integral
+        for all N_phi spin angles to a single FFT per frequency per timestep.
+        This is orders of magnitude faster than the pixel-domain loop in
+        :meth:`sim` for large spin sweeps.
+
+        Limitations
+        -----------
+        * Horizon masking is applied per-timestep as a static map cut (pixels
+          below the horizon are zeroed in the sky map before decomposition),
+          but the mask itself does not rotate with the spin sweep.  For
+          orbital observers whose horizon changes slowly this is a good
+          approximation over one rotation period.
+        * Point sources and solar-system bodies are not included.
+        * The beam boresight altitude is fixed (no alt sweep).
+
+        Parameters
+        ----------
+        times : array_like of `~astropy.time.Time`
+            Observation epochs.
+        n_phi : int
+            Number of equally-spaced spin (azimuth) angles over [0, 2π).
+        alt_rad : float
+            Beam boresight altitude above horizon [radians].  Default 0
+            (horizon-pointing, i.e. a purely equatorial spin sweep).
+        Trx : float
+            Receiver noise temperature [K].
+        bandpass : float or array_like, shape (nfreq,)
+            Bandpass response (multiplicative).
+        S11 : float or array_like, shape (nfreq,)
+            Reflection coefficient (power).  S12 = 1 − S11.
+        lmax : int or None
+            Band-limit for the SH decomposition.  Defaults to 2 * nside.
+
+        Returns
+        -------
+        vis : ndarray, shape (ntimes, n_phi, nfreq), float32
+            Simulated antenna temperature [K] after bandpass and S11.
+        """
+        if lmax is None:
+            lmax = 2 * self.nside
+
+        times = list(times) if not isinstance(times, (list, np.ndarray)) else times
+        ntimes = len(times)
+        S12 = 1.0 - np.asarray(S11, dtype=real_dtype)
+        bandpass = np.asarray(bandpass, dtype=real_dtype)
+
+        vis = np.empty((ntimes, n_phi, self.nfreqs), dtype=real_dtype)
+
+        # Precompute beam SH coefficients (fixed throughout simulation)
+        beam_map_np = self.beam.map  # (npix_beam, nfreq)
+        npix_beam = beam_map_np.shape[0]
+        beam_alms = []
+        beam_solid_angles = []
+        for fi in range(self.nfreqs):
+            bm = beam_map_np[:, fi].astype(np.float64)
+            alm = healpy.map2alm(bm, lmax=lmax, use_pixel_weights=False)
+            beam_alms.append(alm)
+            beam_solid_angles.append(float(np.sum(bm) * (4.0 * np.pi / npix_beam)))
+
+        # Altitude pre-rotation (fixed): R_alt rotates beam boresight to alt_rad
+        from .coord import rot_m as _rot_m
+        R_alt = _rot_m(alt_rad, np.array([1.0, 0.0, 0.0])).astype(real_dtype)
+
+        for ti, t in enumerate(tqdm.tqdm(times)):
+            t = Time(t)
+            self.observer.set_time(t)
+
+            # Galactic → topocentric rotation
+            R_gal2top = self.observer.rot_gal2top().astype(real_dtype)
+
+            # Sky in topocentric frame (horizon-masked, static for this timestep)
+            crds_top = R_gal2top @ self._crds_gal         # (3, npix)
+            mask = self._horizon_mask(crds_top)            # (npix,)
+            sky_top = self._sky_gal * mask[:, None]        # (npix, nfreq)
+            # Apply altitude pre-rotation to sky: sky as seen in the alt-tilted frame
+            # We rotate sky coordinates by R_alt^{-1} = R_alt.T (altitude tilt)
+            crds_alt = R_alt.T @ crds_top                  # (3, npix)
+
+            # Reproject sky onto HEALPix at same nside (nearest-pixel assignment)
+            sky_alt_np = np.zeros_like(sky_top)
+            px_alt = healpy.vec2pix(self.nside, *crds_alt)
+            np.add.at(sky_alt_np, px_alt, sky_top)
+            # Average any duplicate-pixel assignments
+            counts = np.bincount(px_alt, minlength=self.npix)
+            counts = np.maximum(counts, 1)[:, None]
+            sky_alt_np = sky_alt_np / counts
+
+            # SH decompose sky (per frequency) and compute coupling modes C_m
+            t_ant = np.zeros((n_phi, self.nfreqs), dtype=real_dtype)
+            for fi in range(self.nfreqs):
+                sky_alm = healpy.map2alm(sky_alt_np[:, fi].astype(np.float64),
+                                         lmax=lmax, use_pixel_weights=False)
+                C_pos = _sh_coupling_modes(beam_alms[fi], sky_alm, lmax)
+                t_ant[:, fi] = _sh_fft_spin(
+                    C_pos, n_phi, beam_solid_angles[fi]
+                ).astype(real_dtype)
 
             vis[ti] = bandpass * (S12 * t_ant + Trx)
 
