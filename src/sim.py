@@ -304,15 +304,19 @@ class Simulator:
         Include the Global Sky Model 2016.
     monopole : array_like, shape (nfreq,), optional
         Isotropic monopole temperature [K] to add.
+    T_gnd : float
+        Temperature [K] assigned to horizon-blocked pixels in both
+        :meth:`sim` and :meth:`sky_map`.  Default 300.0.
     """
 
     def __init__(self, observer, freqs, beam, catalog=None, terrain=None,
-                 nside=64, gsm=True, monopole=None):
+                 nside=64, gsm=True, monopole=None, T_gnd=300.0):
         self.observer = observer
         self.freqs = np.asarray(freqs, dtype=real_dtype)
         self.beam = beam
         self.catalog = catalog
         self.terrain = terrain
+        self.T_gnd = float(T_gnd)
         self.nside = nside
         self.npix = healpy.nside2npix(nside)
 
@@ -358,6 +362,110 @@ class Simulator:
             x, y, z = self._crds_gal
             gsm_data = np.asarray(gsm_hpm[x, y, z])
         self._sky_gal += gsm_data
+
+    # ------------------------------------------------------------------
+    # Public sky accessor
+
+    def sky_map(self, frame='gal', time=None, catalog=True, nside=None,
+                channels=None, T_gnd=None, beam_weighted=False):
+        """
+        Return the sky model as a HEALPix map in the requested coordinate frame.
+
+        When *time* is provided the same horizon + terrain mask (and ground
+        temperature) used by :meth:`sim` is applied in galactic pixel space
+        before resampling, so the visualised sky is identical to the one used
+        in the simulation.
+
+        Parameters
+        ----------
+        frame : {'gal', 'eq', 'top'}
+            Output coordinate frame:
+            - ``'gal'`` — galactic (the native storage frame)
+            - ``'eq'``  — equatorial / ICRS
+            - ``'top'`` — topocentric (observer body frame at *time*)
+        time : `~astropy.time.Time` or str, optional
+            Observation epoch.  Required for ``frame='top'``.  When provided,
+            the horizon mask is applied and solar-system source positions are
+            updated (if *catalog* is True).
+        catalog : bool
+            If True (default), bake catalog sources (fixed + solar-system)
+            into the returned map.
+        nside : int, optional
+            Output HEALPix resolution.  Defaults to ``self.nside``.
+        channels : int, slice, or array_like of int, optional
+            Frequency channel selection (e.g. ``0``, ``slice(10, 20)``,
+            ``[0, 32, 64]``).  Applied before resampling.  Defaults to all
+            channels.
+        T_gnd : float or None
+            Ground temperature [K] used to fill horizon-blocked pixels.
+            Overrides ``self.T_gnd`` for this call.  Only relevant when
+            *time* is provided (masking requires observer position).
+        beam_weighted : bool
+            If True, multiply each output pixel by the beam response at its
+            topocentric direction (nearest-pixel lookup).  Requires *time*.
+
+        Returns
+        -------
+        sky : ndarray, shape (npix, nchans) or (npix,) for integer *channels*
+            Sky brightness temperature in the requested frame.
+        """
+        if nside is None:
+            nside = self.nside
+        npix_out = healpy.nside2npix(nside)
+
+        # Galactic base map (GSM + monopole)
+        sky_gal = self._sky_gal
+        if catalog and self.catalog is not None:
+            if time is not None:
+                self.catalog.update_positions(Time(time))
+            sky_gal = sky_gal + self.catalog.convert_to_healpix().astype(real_dtype)
+
+        # Resolve observer rotation once (needed for masking and/or frame='top')
+        R_gal2top = None
+        if time is not None:
+            self.observer.set_time(Time(time))
+            R_gal2top = self.observer.rot_gal2top().astype(real_dtype)
+
+        # Rotation from the output frame to galactic (for pull-resampling)
+        if frame == 'gal':
+            R_out2gal = np.eye(3, dtype=real_dtype)
+        elif frame == 'eq':
+            from ._observer import ICRS2GAL
+            R_out2gal = ICRS2GAL.astype(real_dtype)
+        elif frame == 'top':
+            if time is None:
+                raise ValueError("sky_map requires time= when frame='top'")
+            R_out2gal = R_gal2top.T                            # top → gal
+        else:
+            raise ValueError(f"unknown frame {frame!r}; choose 'gal', 'eq', or 'top'")
+
+        # Apply horizon + terrain mask in galactic pixel space — same as sim().
+        # Skipped when time is unknown (static sky visualisation).
+        if time is not None:
+            crds_top_gal = R_gal2top @ self._crds_gal         # (3, npix)
+            sky_gal = self._masked_sky_gal(crds_top_gal, sky_gal, T_gnd)
+
+        # Output pixel unit vectors and galactic lookup indices
+        crds_out = np.array(healpy.pix2vec(nside, np.arange(npix_out)), dtype=real_dtype)
+        gal_pix  = healpy.vec2pix(self.nside, *(R_out2gal @ crds_out))
+
+        # Pull-resample with early channel slicing (avoids full-bandwidth alloc)
+        sky_gal_ch = sky_gal if channels is None else sky_gal[:, channels]
+        sky_out = sky_gal_ch[gal_pix]
+
+        # Beam weighting: nearest-pixel lookup in beam map (output-pixel operation)
+        if beam_weighted:
+            if time is None:
+                raise ValueError("time= is required for beam weighting")
+            if frame == 'top':
+                crds_top_out = crds_out
+            else:
+                crds_top_out = R_gal2top @ (R_out2gal @ crds_out)
+            beam_map_ch = self.beam.map if channels is None else self.beam.map[:, channels]
+            beam_pix = healpy.vec2pix(self.beam._nside, *crds_top_out)
+            sky_out  = sky_out * beam_map_ch[beam_pix]
+
+        return sky_out
 
     # ------------------------------------------------------------------
     # Per-timestep helpers
@@ -413,6 +521,33 @@ class Simulator:
             terrain_mask = self.terrain.get_mask(crds_top)
             return geo_mask * terrain_mask
         return geo_mask
+
+    def _masked_sky_gal(self, crds_top, sky_gal, T_gnd=None):
+        """
+        Apply the horizon + terrain mask to *sky_gal* in galactic pixel space.
+
+        Blocked pixels are replaced with *T_gnd* (defaults to ``self.T_gnd``).
+        This is the shared masking step used by both :meth:`sim` and
+        :meth:`sky_map` to guarantee identical effective sky maps.
+
+        Parameters
+        ----------
+        crds_top : ndarray, shape (3, npix)
+            Topocentric unit vectors for each galactic pixel.
+        sky_gal : ndarray, shape (npix, nfreq)
+            Galactic sky map (any number of frequency channels).
+        T_gnd : float or None
+            Ground temperature [K] to assign to blocked pixels.
+            If None, uses ``self.T_gnd``.
+
+        Returns
+        -------
+        sky_masked : ndarray, shape (npix, nfreq)
+        """
+        if T_gnd is None:
+            T_gnd = self.T_gnd
+        mask = self._horizon_mask(crds_top)          # (npix,) float32
+        return sky_gal * mask[:, None] + T_gnd * (1.0 - mask[:, None])
 
     def _all_src_vecs_flux_top(self, R, ss_vecs_gal, ss_flux):
         """
@@ -519,9 +654,8 @@ class Simulator:
             R = self.observer.rot_gal2top().astype(real_dtype)  # (3, 3)
             crds_top = R @ self._crds_gal                        # (3, npix)
 
-            # Combined horizon + terrain mask → masked sky map
-            mask = self._horizon_mask(crds_top)                  # (npix,)
-            sky_masked = self._sky_gal * mask[:, None]           # (npix, nfreq)
+            # Combined horizon + terrain mask → masked sky map (T_gnd fills blocked pixels)
+            sky_masked = self._masked_sky_gal(crds_top, self._sky_gal)  # (npix, nfreq)
 
             # Discrete sources in topocentric frame
             ss_vecs_gal, ss_flux = self._ss_vecs_and_flux()
