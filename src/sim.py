@@ -413,20 +413,40 @@ class Simulator:
             nside = self.nside
         npix_out = healpy.nside2npix(nside)
 
-        # Galactic base map (GSM + monopole)
+        # --- Step 1: build galactic sky (same source inputs as sim) -----------
         sky_gal = self._sky_gal
         if catalog and self.catalog is not None:
             if time is not None:
                 self.catalog.update_positions(Time(time))
             sky_gal = sky_gal + self.catalog.convert_to_healpix().astype(real_dtype)
 
-        # Resolve observer rotation once (needed for masking and/or frame='top')
+        # --- Step 2: observer rotation (needed for masking and frame='top') ---
         R_gal2top = None
         if time is not None:
             self.observer.set_time(Time(time))
             R_gal2top = self.observer.rot_gal2top().astype(real_dtype)
 
-        # Rotation from the output frame to galactic (for pull-resampling)
+        # --- Step 3: topocentric unit vectors for each galactic pixel ----------
+        crds_top_gal = None
+        if time is not None:
+            crds_top_gal = R_gal2top @ self._crds_gal          # (3, npix)
+
+        # --- Step 4: masking in galactic pixel space — same as sim() ----------
+        if crds_top_gal is not None:
+            sky_gal = self._masked_sky_gal(crds_top_gal, sky_gal, T_gnd)
+
+        # --- Step 5: channel slice (avoids full-bandwidth alloc) --------------
+        sky_gal_ch = sky_gal if channels is None else sky_gal[:, channels]
+
+        # --- Step 6: beam weighting in galactic pixel space — same as sim() ---
+        if beam_weighted:
+            if crds_top_gal is None:
+                raise ValueError("time= is required for beam weighting")
+            beam_map_ch = self.beam.map if channels is None else self.beam.map[:, channels]
+            beam_pix = healpy.vec2pix(self.beam._nside, *crds_top_gal)
+            sky_gal_ch = sky_gal_ch * beam_map_ch[beam_pix]
+
+        # --- Step 7: resample to output frame ---------------------------------
         if frame == 'gal':
             R_out2gal = np.eye(3, dtype=real_dtype)
         elif frame == 'eq':
@@ -435,37 +455,13 @@ class Simulator:
         elif frame == 'top':
             if time is None:
                 raise ValueError("sky_map requires time= when frame='top'")
-            R_out2gal = R_gal2top.T                            # top → gal
+            R_out2gal = R_gal2top.T                             # top → gal
         else:
             raise ValueError(f"unknown frame {frame!r}; choose 'gal', 'eq', or 'top'")
 
-        # Apply horizon + terrain mask in galactic pixel space — same as sim().
-        # Skipped when time is unknown (static sky visualisation).
-        if time is not None:
-            crds_top_gal = R_gal2top @ self._crds_gal         # (3, npix)
-            sky_gal = self._masked_sky_gal(crds_top_gal, sky_gal, T_gnd)
-
-        # Output pixel unit vectors and galactic lookup indices
         crds_out = np.array(healpy.pix2vec(nside, np.arange(npix_out)), dtype=real_dtype)
         gal_pix  = healpy.vec2pix(self.nside, *(R_out2gal @ crds_out))
-
-        # Pull-resample with early channel slicing (avoids full-bandwidth alloc)
-        sky_gal_ch = sky_gal if channels is None else sky_gal[:, channels]
-        sky_out = sky_gal_ch[gal_pix]
-
-        # Beam weighting: nearest-pixel lookup in beam map (output-pixel operation)
-        if beam_weighted:
-            if time is None:
-                raise ValueError("time= is required for beam weighting")
-            if frame == 'top':
-                crds_top_out = crds_out
-            else:
-                crds_top_out = R_gal2top @ (R_out2gal @ crds_out)
-            beam_map_ch = self.beam.map if channels is None else self.beam.map[:, channels]
-            beam_pix = healpy.vec2pix(self.beam._nside, *crds_top_out)
-            sky_out  = sky_out * beam_map_ch[beam_pix]
-
-        return sky_out
+        return sky_gal_ch[gal_pix]
 
     # ------------------------------------------------------------------
     # Per-timestep helpers
