@@ -12,20 +12,43 @@ import astropy.units as u
 
 from ._observer import Observer
 from .coord import rot_m
-from .const import R_MOON
+from .const import R_MOON, GM_MOON
+
+
+def circular_orbital_period(altitude):
+    """
+    Orbital period [s] for a circular lunar orbit at *altitude* metres above
+    the surface.
+
+    Uses Kepler's third law with the Moon's standard gravitational parameter
+    GM_MOON = 4.9048695 × 10¹² m³ s⁻².
+
+    Parameters
+    ----------
+    altitude : float
+        Altitude above the lunar surface [m].
+
+    Returns
+    -------
+    period : float
+        Orbital period [s].
+    """
+    r = R_MOON + altitude
+    return 2.0 * np.pi * np.sqrt(r ** 3 / GM_MOON)
 
 
 class LunarOrbit(Observer):
     """
     Spacecraft in a circular lunar orbit with an independent spin.
 
-    The galactic frame is used as the inertial reference throughout,
-    consistent with the GSM sky model.
+    The orbital period is computed automatically from *altitude* via Kepler's
+    third law (:func:`circular_orbital_period`).  The galactic frame is used
+    as the inertial reference throughout, consistent with the GSM sky model.
 
     Parameters
     ----------
     altitude : float
-        Orbital altitude above the lunar surface, metres.
+        Orbital altitude above the lunar surface [m].
     rot_orbit_vec : array_like, shape (3,)
         Unit vector in the galactic frame normal to the orbital plane.
         The spacecraft orbits counter-clockwise around this axis.
@@ -34,10 +57,8 @@ class LunarOrbit(Observer):
     start_pos : array_like, shape (3,), optional
         Unit vector in the galactic frame giving the initial orbital
         position direction from the Moon centre.  Default: [1, 0, 0].
-    orbital_period : float
-        Orbital period in seconds.  Default: 7200 (2 h, ~100 km altitude).
     spin_period : float
-        Spacecraft spin period in seconds.  0 means no spin.
+        Spacecraft spin period [s].  0 means no spin.
     t0 : `~astropy.time.Time` or str, optional
         Reference epoch: spacecraft is at ``start_pos`` with zero spin
         phase at this time.  Default: J2000.
@@ -49,12 +70,12 @@ class LunarOrbit(Observer):
         rot_orbit_vec,
         rot_spin_vec,
         start_pos=None,
-        orbital_period=7200.0,
         spin_period=0.0,
         t0=None,
     ):
         self.altitude = altitude
         self.orbital_radius = R_MOON + altitude
+        self.orbital_period = circular_orbital_period(altitude)
 
         self.rot_orbit_vec = np.asarray(rot_orbit_vec, dtype=float)
         self.rot_orbit_vec /= np.linalg.norm(self.rot_orbit_vec)
@@ -67,7 +88,6 @@ class LunarOrbit(Observer):
         self.start_pos = np.asarray(start_pos, dtype=float)
         self.start_pos /= np.linalg.norm(self.start_pos)
 
-        self.orbital_period = float(orbital_period)
         self.spin_period = float(spin_period)
         from astropy.time import Time
         self.t0 = Time("J2000") if t0 is None else Time(t0)

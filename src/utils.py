@@ -1,5 +1,5 @@
 import numpy as np
-import eigsep_terrain.reflectivity as etu
+import eigsep_terrain.reflectivity as etr
 
 from .coord import rot_m
 from .const import R_MOON
@@ -24,9 +24,9 @@ def moon_reflect_vector(vec_to_surface, moon_pos, r=R_MOON):
 
 def reflectivity(freqs, resistivity_ohm_m, eta0=1):
     omega = 2 * np.pi * freqs  # Hz
-    conductivity = etu.conductivity_from_resistivity(resistivity_ohm_m)
-    eta = etu.permittivity_from_conductivity(conductivity, freqs)
-    R = etu.reflection_coefficient(eta, eta0=eta0)
+    conductivity = etr.conductivity_from_resistivity(resistivity_ohm_m)
+    eta = etr.permittivity_from_conductivity(conductivity, freqs)
+    R = etr.reflection_coefficient(eta, eta0=eta0)
     return R
 
 

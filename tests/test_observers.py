@@ -15,8 +15,8 @@ from astropy.time import Time
 from eigsep_sim._observer import Observer, ICRS2GAL
 from eigsep_sim.earth_surface import EarthSurface
 from eigsep_sim.lunar_surface import LunarSurface, _moon_icrs2mcmf
-from eigsep_sim.lunar_orbit import LunarOrbit
-from eigsep_sim.const import R_MOON
+from eigsep_sim.lunar_orbit import LunarOrbit, circular_orbital_period
+from eigsep_sim.const import R_MOON, GM_MOON
 
 # A fixed epoch used throughout
 T0 = Time("2025-01-01T00:00:00", scale="utc")
@@ -217,6 +217,23 @@ class TestLunarSurface:
 # LunarOrbit
 # ---------------------------------------------------------------------------
 
+class TestCircularOrbitalPeriod:
+    def test_kepler_formula(self):
+        """T² = 4π²r³/GM  →  T = 2π sqrt(r³/GM)."""
+        alt = 100e3
+        r = R_MOON + alt
+        expected = 2 * np.pi * np.sqrt(r ** 3 / GM_MOON)
+        np.testing.assert_allclose(circular_orbital_period(alt), expected, rtol=1e-12)
+
+    def test_higher_altitude_longer_period(self):
+        assert circular_orbital_period(200e3) > circular_orbital_period(100e3)
+
+    def test_100km_approximately_two_hours(self):
+        """100 km LLO period is ~7066 s (~1.96 h)."""
+        T = circular_orbital_period(100e3)
+        assert 6800 < T < 7300
+
+
 class TestLunarOrbit:
     def _make(self, altitude=1e5, spin_period=0.0, th_spin=0.0):
         obs = LunarOrbit(
@@ -224,7 +241,6 @@ class TestLunarOrbit:
             rot_orbit_vec=[0, 0, 1],
             rot_spin_vec=[0, 0, 1],
             start_pos=[1, 0, 0],
-            orbital_period=7200.0,
             spin_period=spin_period,
             t0=T0,
         )
@@ -294,8 +310,8 @@ class TestLunarOrbit:
 
     def test_set_time_updates_phases(self):
         obs = self._make()
-        obs.set_time(T0 + 3600.0 * u.s)   # one half-orbit later (period=7200 s)
-        # Half an orbital period: th_orbit should be π
+        half_period = obs.orbital_period / 2.0
+        obs.set_time(T0 + half_period * u.s)
         np.testing.assert_allclose(obs._th_orbit, np.pi, atol=1e-10)
 
     def test_set_time_spin_period_zero(self):

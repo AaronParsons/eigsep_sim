@@ -44,6 +44,9 @@ R_MOON = 1_737_400.0              # radius of moon [m] (not in astropy)
 R_SUN = const.R_sun.value         # radius of sun [m]
 R_EARTH = const.R_earth.value     # radius of earth [m]
 
+# Gravitational parameters (GM, m³/s²)
+GM_MOON = 4.9048695e12            # standard gravitational parameter of the Moon
+
 # Flux units
 Jy = u.Jy.to(u.W / u.m**2 / u.Hz)  # Jansky [W / m^2 / Hz]
 
@@ -76,4 +79,5 @@ def description():
         "R_MOON": "radius of moon [m]",
         "R_SUN": "radius of sun [m]",
         "R_EARTH": "radius of earth [m]",
+        "GM_MOON": "standard gravitational parameter of the Moon [m³/s²]",
     }

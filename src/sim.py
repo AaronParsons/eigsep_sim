@@ -91,7 +91,7 @@ def _sh_fft_spin(C_pos, N_phi, beam_solid_angle):
     return np.fft.ifft(spectrum).real * N_phi / beam_solid_angle
 
 try:
-    import eigsep_terrain.utils as etu
+    import eigsep_terrain.reflectivity as etr
     _HAS_TERRAIN = True
 except ImportError:
     _HAS_TERRAIN = False
@@ -176,9 +176,9 @@ class Terrain(HPM):
     def reflectivity(self, freqs, eta0=1):
         if not _HAS_TERRAIN:
             raise ImportError("eigsep_terrain is required for reflectivity calculations")
-        conductivity = etu.conductivity_from_resistivity(self.resistivity_ohm_m)
-        eta = etu.permittivity_from_conductivity(conductivity, freqs)
-        gamma = etu.reflection_coefficient(eta, eta0=eta0)
+        conductivity = etr.conductivity_from_resistivity(self.resistivity_ohm_m)
+        eta = etr.permittivity_from_conductivity(conductivity, freqs)
+        gamma = etr.reflection_coefficient(eta, eta0=eta0)
         return gamma.astype(real_dtype)
 
 
@@ -561,7 +561,7 @@ class Simulator:
     # SH + FFT simulation helpers
     # ------------------------------------------------------------------
 
-    def _sky_topocentric(self, R_gal2top):
+    def _sky_topocentric(self, R_gal2top, sky_gal=None):
         """
         Pull-resample the galactic sky to standard topocentric HEALPix pixels
         and apply the horizon mask.
@@ -570,6 +570,10 @@ class Simulator:
         ----------
         R_gal2top : (3, 3) float32
             Galactic → topocentric rotation matrix.
+        sky_gal : (npix, nfreq) float32, optional
+            Galactic sky map to resample.  Defaults to ``self._sky_gal``.
+            Pass a pre-augmented map (e.g. with baked-in catalog sources) to
+            include additional components without mutating instance state.
 
         Returns
         -------
@@ -577,17 +581,20 @@ class Simulator:
             Sky temperature in topocentric pixel ordering with below-horizon
             pixels zeroed.
         """
+        if sky_gal is None:
+            sky_gal = self._sky_gal
         # Standard topocentric pixel unit vectors (3, npix)
         crds_top_std = np.array(
             healpy.pix2vec(self.nside, np.arange(self.npix)), dtype=real_dtype
         )
-        # For each topocentric pixel, find the galactic pixel it came from
+        # For each topocentric pixel j, find the galactic pixel it came from
         gal_dirs = R_gal2top.T @ crds_top_std          # R_top2gal applied
         gal_pix = healpy.vec2pix(self.nside, *gal_dirs)
-        sky_top = self._sky_gal[gal_pix]               # (npix, nfreq)
-        # Horizon mask in topocentric pixel ordering
-        mask_top = self.observer.above_horizon(self.nside).astype(real_dtype)
-        return sky_top * mask_top[:, None]              # (npix, nfreq)
+        sky_top = sky_gal[gal_pix]                     # (npix, nfreq)
+        # Horizon mask: above_horizon is indexed by galactic pixel; remap to
+        # topocentric by looking up the galactic pixel for each topocentric pixel.
+        mask_gal = self.observer.above_horizon(self.nside).astype(real_dtype)
+        return sky_top * mask_gal[gal_pix, None]        # (npix, nfreq)
 
     def _beam_sh(self, lmax):
         """
@@ -609,6 +616,64 @@ class Simulator:
                 float(np.sum(bm) * (4.0 * np.pi / npix_beam))
             )
         return beam_alms, beam_solid_angles
+
+    def _moon_surface_emission(self, sky_gal, gamma, T_regolith=200.0):
+        """
+        Galactic-frame emission map for Moon-disk pixels (thermal + reflected sky).
+
+        For each pixel on the Moon's disc (as seen from the spacecraft), the
+        emission is::
+
+            T_pix(ν) = (1 − γ(ν)) · T_regolith + γ(ν) · T_sky(r̂_reflected, ν)
+
+        where *r̂_reflected* is the direction of the sky that mirrors into the
+        spacecraft's line of sight after reflecting off the local surface normal.
+
+        Requires the observer to implement ``spacecraft_position()`` and
+        ``above_horizon()`` (i.e. a :class:`~eigsep_sim.lunar_orbit.LunarOrbit`).
+
+        Parameters
+        ----------
+        sky_gal : (npix, nfreq) float32
+            Galactic sky map used for reflected-sky lookups.
+        gamma : (nfreq,) float32
+            Frequency-dependent surface amplitude reflectivity (0–1).
+        T_regolith : float
+            Mean lunar surface temperature [K].
+
+        Returns
+        -------
+        emission : (npix, nfreq) float32
+            Galactic-frame map; nonzero only at Moon-disk pixels.
+        """
+        from .const import R_MOON as _R_MOON
+
+        moon_mask = ~self.observer.above_horizon(self.nside)  # True = on Moon disk
+        emission = np.zeros((self.npix, self.nfreqs), dtype=real_dtype)
+        if not moon_mask.any():
+            return emission
+
+        moon_pix = np.where(moon_mask)[0]
+        moon_normals = self._crds_gal[:, moon_pix]   # (3, n_moon) outward normals
+
+        # Vector from each surface point toward the spacecraft
+        pos = self.observer.spacecraft_position()     # (3,) metres from Moon centre
+        surface_pts = moon_normals * _R_MOON          # (3, n_moon) metres
+        v_to_sc = pos[:, None] - surface_pts          # (3, n_moon)
+        v_to_sc /= np.linalg.norm(v_to_sc, axis=0)   # normalise
+
+        # Reflected viewing direction: r = 2(v·n)n − v
+        dot_vn = np.einsum('ij,ij->j', v_to_sc, moon_normals)   # (n_moon,)
+        refl = 2 * dot_vn[None, :] * moon_normals - v_to_sc     # (3, n_moon)
+
+        # Sky temperature in the reflected directions (galactic frame lookup)
+        refl_pix = healpy.vec2pix(self.nside, *refl)
+        T_sky_refl = sky_gal[refl_pix]               # (n_moon, nfreq)
+
+        gamma = np.asarray(gamma, dtype=real_dtype)
+        T_surface = (1.0 - gamma[None, :]) * T_regolith + gamma[None, :] * T_sky_refl
+        emission[moon_pix] = T_surface
+        return emission
 
     # ------------------------------------------------------------------
     # SH + FFT spin-sweep simulation (z-axis only)
@@ -789,5 +854,135 @@ class Simulator:
                         C_pos, n_phi, beam_solid_angles[fi]
                     ).astype(real_dtype)
                 vis[ti, ai] = bandpass * (S12 * t_ant + Trx)
+
+        return vis
+
+    # ------------------------------------------------------------------
+    # Orbital sweep (LunarOrbit)
+    # ------------------------------------------------------------------
+
+    def sim_orbit_spin(self, n_orbit, n_phi, time=None, Trx=50.0,
+                       bandpass=1.0, S11=0.0, lmax=None,
+                       T_regolith=200.0, terrain_type=None):
+        """
+        Simulate over one full circular orbit with a spin sweep at each
+        orbital position.
+
+        Iterates over *n_orbit* equally-spaced orbital phases in [0, 2π)
+        by calling ``observer.set_phases(th_orbit)`` at each step, then
+        performs the SH+FFT spin sweep for the *n_phi* spin angles.
+
+        **Occultation**: the observer's ``above_horizon`` mask (lunar
+        occultation from :class:`~eigsep_sim.lunar_orbit.LunarOrbit`) is
+        applied automatically at each orbital position, zeroing sky pixels
+        blocked by the Moon.
+
+        **Lunar surface emission**: if *resistivity_ohm_m* is given, blocked
+        Moon-disk pixels are replaced with thermal emission plus reflected sky
+        via :meth:`_moon_surface_emission`.
+
+        **Catalog sources**: Sun, Earth, and fixed point sources are baked into
+        the sky map once at *time* before the orbit loop begins.  Orbital
+        periods (~2 h) are much shorter than the timescale on which
+        solar-system positions change, so this snapshot is a good
+        approximation.
+
+        Requires the observer to implement ``set_phases(th_orbit, th_spin=0)``
+        — see :class:`~eigsep_sim.lunar_orbit.LunarOrbit`.
+
+        Parameters
+        ----------
+        n_orbit : int
+            Number of equally-spaced orbital positions over [0, 2π).
+        n_phi : int
+            Number of equally-spaced spin angles over [0, 2π).
+        time : `~astropy.time.Time` or str, optional
+            Epoch at which solar-system source positions are fixed.  Required
+            if a catalog with solar-system sources was supplied.
+        Trx : float
+            Receiver noise temperature [K].
+        bandpass : float or array_like, shape (nfreq,)
+            Bandpass response (multiplicative).
+        S11 : float or array_like, shape (nfreq,)
+            Reflection coefficient (power).  S12 = 1 − S11.
+        lmax : int or None
+            SH band-limit.  Defaults to 2 * nside.
+        T_regolith : float
+            Mean lunar surface temperature [K] for thermal emission.
+            Only used when *terrain_type* is set.
+        terrain_type : str or None
+            Named terrain type from ``eigsep_terrain.reflectivity.TERRAIN_TYPES``
+            (e.g. ``'lunar_regolith'``).  When given, Moon-disk pixels receive
+            thermal emission + reflected sky weighted by the terrain's
+            frequency-dependent reflectivity (accounting for both eps_r and
+            resistivity).  When None, Moon-disk pixels remain zeroed.
+
+        Returns
+        -------
+        vis : ndarray, shape (n_orbit, n_phi, nfreq), float32
+            Simulated antenna temperature [K].
+        """
+        if not hasattr(self.observer, 'set_phases'):
+            raise TypeError(
+                f"{type(self.observer).__name__} does not implement set_phases; "
+                "use LunarOrbit or another observer that supports orbital phases"
+            )
+        if lmax is None:
+            lmax = 2 * self.nside
+
+        S12 = 1.0 - np.asarray(S11, dtype=real_dtype)
+        bandpass = np.asarray(bandpass, dtype=real_dtype)
+
+        # Snapshot sky: GSM + monopole + catalog sources baked in at `time`
+        sky_gal = self._sky_gal
+        if self.catalog is not None:
+            if time is not None:
+                self.catalog.update_positions(Time(time))
+            src_map = self.catalog.convert_to_healpix().astype(real_dtype)
+            sky_gal = sky_gal + src_map
+
+        # Lunar surface reflectivity (optional)
+        gamma = None
+        if terrain_type is not None:
+            if not _HAS_TERRAIN:
+                raise ImportError("eigsep_terrain is required for terrain reflectivity")
+            gamma = np.abs(
+                etr.terrain_reflection_coefficient(
+                    terrain_type, self.freqs.astype(np.float64)
+                )
+            ).astype(real_dtype)
+
+        # Topocentric pixel unit vectors — constant across orbital positions
+        crds_top_std = np.array(
+            healpy.pix2vec(self.nside, np.arange(self.npix)), dtype=real_dtype
+        )  # (3, npix)
+
+        vis = np.empty((n_orbit, n_phi, self.nfreqs), dtype=real_dtype)
+        beam_alms, beam_solid_angles = self._beam_sh(lmax)
+        th_orbits = np.linspace(0.0, 2 * np.pi, n_orbit, endpoint=False)
+
+        for oi, th_orbit in enumerate(tqdm.tqdm(th_orbits)):
+            self.observer.set_phases(th_orbit)
+            R_gal2top = self.observer.rot_gal2top().astype(real_dtype)
+            sky_top = self._sky_topocentric(R_gal2top, sky_gal=sky_gal)
+
+            # Add Moon surface emission to previously-zeroed Moon-disk pixels
+            if gamma is not None:
+                moon_em_gal = self._moon_surface_emission(sky_gal, gamma, T_regolith)
+                gal_pix = healpy.vec2pix(self.nside, *(R_gal2top.T @ crds_top_std))
+                sky_top = sky_top + moon_em_gal[gal_pix]
+
+            t_ant = np.zeros((n_phi, self.nfreqs), dtype=real_dtype)
+            for fi in range(self.nfreqs):
+                sky_alm = healpy.map2alm(
+                    sky_top[:, fi].astype(np.float64),
+                    lmax=lmax, use_pixel_weights=False,
+                )
+                C_pos = _sh_coupling_modes(beam_alms[fi], sky_alm, lmax)
+                t_ant[:, fi] = _sh_fft_spin(
+                    C_pos, n_phi, beam_solid_angles[fi]
+                ).astype(real_dtype)
+
+            vis[oi] = bandpass * (S12 * t_ant + Trx)
 
         return vis
