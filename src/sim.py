@@ -558,39 +558,81 @@ class Simulator:
         return vis
 
     # ------------------------------------------------------------------
-    # SH + FFT spin-sweep simulation
+    # SH + FFT simulation helpers
     # ------------------------------------------------------------------
 
-    def sim_spin(self, times, n_phi, alt_rad=0.0, Trx=50.0, bandpass=1.0,
+    def _sky_topocentric(self, R_gal2top):
+        """
+        Pull-resample the galactic sky to standard topocentric HEALPix pixels
+        and apply the horizon mask.
+
+        Parameters
+        ----------
+        R_gal2top : (3, 3) float32
+            Galactic → topocentric rotation matrix.
+
+        Returns
+        -------
+        sky_top_masked : (npix, nfreq) float32
+            Sky temperature in topocentric pixel ordering with below-horizon
+            pixels zeroed.
+        """
+        # Standard topocentric pixel unit vectors (3, npix)
+        crds_top_std = np.array(
+            healpy.pix2vec(self.nside, np.arange(self.npix)), dtype=real_dtype
+        )
+        # For each topocentric pixel, find the galactic pixel it came from
+        gal_dirs = R_gal2top.T @ crds_top_std          # R_top2gal applied
+        gal_pix = healpy.vec2pix(self.nside, *gal_dirs)
+        sky_top = self._sky_gal[gal_pix]               # (npix, nfreq)
+        # Horizon mask in topocentric pixel ordering
+        mask_top = self.observer.above_horizon(self.nside).astype(real_dtype)
+        return sky_top * mask_top[:, None]              # (npix, nfreq)
+
+    def _beam_sh(self, lmax):
+        """
+        Precompute SH coefficients and solid angles for the beam.
+
+        Returns
+        -------
+        beam_alms : list of (n_alm,) complex128, length nfreq
+        beam_solid_angles : list of float, length nfreq
+        """
+        beam_map_np = self.beam.map      # (npix_beam, nfreq)
+        npix_beam = beam_map_np.shape[0]
+        beam_alms, beam_solid_angles = [], []
+        for fi in range(self.nfreqs):
+            bm = beam_map_np[:, fi].astype(np.float64)
+            beam_alms.append(healpy.map2alm(bm, lmax=lmax,
+                                            use_pixel_weights=False))
+            beam_solid_angles.append(
+                float(np.sum(bm) * (4.0 * np.pi / npix_beam))
+            )
+        return beam_alms, beam_solid_angles
+
+    # ------------------------------------------------------------------
+    # SH + FFT spin-sweep simulation (z-axis only)
+    # ------------------------------------------------------------------
+
+    def sim_spin(self, times, n_phi, Trx=50.0, bandpass=1.0,
                  S11=0.0, lmax=None):
         """
         Fast spin-sweep simulation using spherical harmonics + FFT.
 
-        For a pure rotation about the topocentric z-axis (constant altitude),
-        the Wigner D-matrix is diagonal, reducing the beam-weighted integral
-        for all N_phi spin angles to a single FFT per frequency per timestep.
-        This is orders of magnitude faster than the pixel-domain loop in
-        :meth:`sim` for large spin sweeps.
+        For a pure rotation about the topocentric z-axis the Wigner D-matrix
+        is diagonal, reducing the beam-weighted integral for all N_phi spin
+        angles to a single FFT per frequency per timestep.  This is orders of
+        magnitude faster than the pixel-domain loop in :meth:`sim`.
 
-        Limitations
-        -----------
-        * Horizon masking is applied per-timestep as a static map cut (pixels
-          below the horizon are zeroed in the sky map before decomposition),
-          but the mask itself does not rotate with the spin sweep.  For
-          orbital observers whose horizon changes slowly this is a good
-          approximation over one rotation period.
-        * Point sources and solar-system bodies are not included.
-        * The beam boresight altitude is fixed (no alt sweep).
+        For az+alt scans (e.g. a canyon antenna that tilts and spins) use
+        :meth:`sim_azalt_sh` instead.
 
         Parameters
         ----------
         times : array_like of `~astropy.time.Time`
             Observation epochs.
         n_phi : int
-            Number of equally-spaced spin (azimuth) angles over [0, 2π).
-        alt_rad : float
-            Beam boresight altitude above horizon [radians].  Default 0
-            (horizon-pointing, i.e. a purely equatorial spin sweep).
+            Number of equally-spaced spin angles over [0, 2π).
         Trx : float
             Receiver noise temperature [K].
         bandpass : float or array_like, shape (nfreq,)
@@ -598,12 +640,11 @@ class Simulator:
         S11 : float or array_like, shape (nfreq,)
             Reflection coefficient (power).  S12 = 1 − S11.
         lmax : int or None
-            Band-limit for the SH decomposition.  Defaults to 2 * nside.
+            SH band-limit.  Defaults to 2 * nside.
 
         Returns
         -------
         vis : ndarray, shape (ntimes, n_phi, nfreq), float32
-            Simulated antenna temperature [K] after bandpass and S11.
         """
         if lmax is None:
             lmax = 2 * self.nside
@@ -614,50 +655,19 @@ class Simulator:
         bandpass = np.asarray(bandpass, dtype=real_dtype)
 
         vis = np.empty((ntimes, n_phi, self.nfreqs), dtype=real_dtype)
-
-        # Precompute beam SH coefficients (fixed throughout simulation)
-        beam_map_np = self.beam.map  # (npix_beam, nfreq)
-        npix_beam = beam_map_np.shape[0]
-        beam_alms = []
-        beam_solid_angles = []
-        for fi in range(self.nfreqs):
-            bm = beam_map_np[:, fi].astype(np.float64)
-            alm = healpy.map2alm(bm, lmax=lmax, use_pixel_weights=False)
-            beam_alms.append(alm)
-            beam_solid_angles.append(float(np.sum(bm) * (4.0 * np.pi / npix_beam)))
-
-        # Altitude pre-rotation (fixed): R_alt rotates beam boresight to alt_rad
-        from .coord import rot_m as _rot_m
-        R_alt = _rot_m(alt_rad, np.array([1.0, 0.0, 0.0])).astype(real_dtype)
+        beam_alms, beam_solid_angles = self._beam_sh(lmax)
 
         for ti, t in enumerate(tqdm.tqdm(times)):
             t = Time(t)
             self.observer.set_time(t)
-
-            # Galactic → topocentric rotation
             R_gal2top = self.observer.rot_gal2top().astype(real_dtype)
 
-            # Sky in topocentric frame (horizon-masked, static for this timestep)
-            crds_top = R_gal2top @ self._crds_gal         # (3, npix)
-            mask = self._horizon_mask(crds_top)            # (npix,)
-            sky_top = self._sky_gal * mask[:, None]        # (npix, nfreq)
-            # Apply altitude pre-rotation to sky: sky as seen in the alt-tilted frame
-            # We rotate sky coordinates by R_alt^{-1} = R_alt.T (altitude tilt)
-            crds_alt = R_alt.T @ crds_top                  # (3, npix)
+            # Sky in topocentric HEALPix pixels (pull resample + mask)
+            sky_top = self._sky_topocentric(R_gal2top)  # (npix, nfreq)
 
-            # Reproject sky onto HEALPix at same nside (nearest-pixel assignment)
-            sky_alt_np = np.zeros_like(sky_top)
-            px_alt = healpy.vec2pix(self.nside, *crds_alt)
-            np.add.at(sky_alt_np, px_alt, sky_top)
-            # Average any duplicate-pixel assignments
-            counts = np.bincount(px_alt, minlength=self.npix)
-            counts = np.maximum(counts, 1)[:, None]
-            sky_alt_np = sky_alt_np / counts
-
-            # SH decompose sky (per frequency) and compute coupling modes C_m
             t_ant = np.zeros((n_phi, self.nfreqs), dtype=real_dtype)
             for fi in range(self.nfreqs):
-                sky_alm = healpy.map2alm(sky_alt_np[:, fi].astype(np.float64),
+                sky_alm = healpy.map2alm(sky_top[:, fi].astype(np.float64),
                                          lmax=lmax, use_pixel_weights=False)
                 C_pos = _sh_coupling_modes(beam_alms[fi], sky_alm, lmax)
                 t_ant[:, fi] = _sh_fft_spin(
@@ -665,5 +675,119 @@ class Simulator:
                 ).astype(real_dtype)
 
             vis[ti] = bandpass * (S12 * t_ant + Trx)
+
+        return vis
+
+    # ------------------------------------------------------------------
+    # SH + FFT az+alt simulation (canyon antenna)
+    # ------------------------------------------------------------------
+
+    def sim_azalt_sh(self, times, alts_rad, n_phi, east_vec=None,
+                     Trx=50.0, bandpass=1.0, S11=0.0, lmax=None):
+        """
+        Fast az+alt simulation using SH rotation + FFT.
+
+        For rotations R = R_z(az) · R_east(alt) the beam-weighted integral
+        reduces to one Wigner sky-rotation (O(lmax³)) followed by an FFT
+        (O(n_phi log n_phi)) per altitude per frequency, instead of n_phi
+        separate pixel-domain sums.
+
+        **Algorithm** — per timestep
+          1. Pull-resample galactic sky to topocentric HEALPix pixels, apply
+             horizon mask.  Cost: O(npix).
+          2. SH decompose the masked sky per frequency.  Cost: nfreq × map2alm.
+          3. For each altitude: rotate sky alm by R_east(+alt) using Wigner
+             D-matrices (healpy.rotate_alm), compute coupling modes C_m, FFT
+             over azimuth.  Cost: N_alt × nfreq × O(lmax³).
+          4. Total per timestep ≈ nfreq × (1 + N_alt) × map2alm, vs.
+             N_alt × n_phi × npix × nfreq for the pixel-domain approach.
+
+        **Accuracy** — the SH approximation is accurate for maps that are
+        bandlimited at *lmax* = 2 × nside.  Sharp horizon features may
+        require a larger *lmax* or prior smoothing.
+
+        **Further speedup** (not yet implemented) — for each altitude the
+        Wigner D-matrices are the same for all frequencies; applying them via
+        precomputed O(lmax³) block matrices across all frequencies at once
+        (batch BLAS) would reduce the per-altitude cost to O(lmax³) instead
+        of nfreq × O(lmax³).
+
+        Parameters
+        ----------
+        times : array_like of `~astropy.time.Time`
+            Observation epochs.
+        alts_rad : array_like, shape (N_alt,)
+            Altitude angles [radians] of the beam boresight.
+        n_phi : int
+            Number of equally-spaced azimuth angles over [0, 2π).
+        east_vec : array_like, shape (3,), optional
+            Altitude rotation axis in the topocentric frame.  Defaults to
+            [1, 0, 0] (topocentric east / x-axis).  Provide the exact axis
+            for non-ideal suspension geometry.
+        Trx : float
+            Receiver noise temperature [K].
+        bandpass : float or array_like, shape (nfreq,)
+            Bandpass response (multiplicative).
+        S11 : float or array_like, shape (nfreq,)
+            Reflection coefficient (power).  S12 = 1 − S11.
+        lmax : int or None
+            SH band-limit.  Defaults to 2 * nside.
+
+        Returns
+        -------
+        vis : ndarray, shape (ntimes, N_alt, n_phi, nfreq), float32
+            Simulated antenna temperature [K] after bandpass and S11.
+        """
+        from .coord import rot_m as _rot_m
+
+        if lmax is None:
+            lmax = 2 * self.nside
+        if east_vec is None:
+            east_vec = np.array([1.0, 0.0, 0.0])
+        east_vec = np.asarray(east_vec, dtype=np.float64)
+        east_vec /= np.linalg.norm(east_vec)
+
+        alts_rad = np.asarray(alts_rad, dtype=np.float64)
+        N_alt = len(alts_rad)
+
+        times = list(times) if not isinstance(times, (list, np.ndarray)) else times
+        ntimes = len(times)
+        S12 = 1.0 - np.asarray(S11, dtype=real_dtype)
+        bandpass = np.asarray(bandpass, dtype=real_dtype)
+
+        vis = np.empty((ntimes, N_alt, n_phi, self.nfreqs), dtype=real_dtype)
+
+        # Precompute beam SH and rotation matrices for each altitude
+        beam_alms, beam_solid_angles = self._beam_sh(lmax)
+        # R_east(+alt) rotation matrices — one per altitude
+        R_alts = [_rot_m(float(alt), east_vec) for alt in alts_rad]
+
+        for ti, t in enumerate(tqdm.tqdm(times)):
+            t = Time(t)
+            self.observer.set_time(t)
+            R_gal2top = self.observer.rot_gal2top().astype(real_dtype)
+
+            # Sky in topocentric HEALPix pixels (pull resample + mask)
+            sky_top = self._sky_topocentric(R_gal2top)  # (npix, nfreq)
+
+            # SH decompose sky per frequency (done once per timestep)
+            sky_alms = [
+                healpy.map2alm(sky_top[:, fi].astype(np.float64),
+                               lmax=lmax, use_pixel_weights=False)
+                for fi in range(self.nfreqs)
+            ]
+
+            # For each altitude: rotate sky alm → coupling modes → FFT
+            for ai, (alt, R_alt) in enumerate(zip(alts_rad, R_alts)):
+                t_ant = np.zeros((n_phi, self.nfreqs), dtype=real_dtype)
+                for fi in range(self.nfreqs):
+                    # Rotate sky by R_east(+alt): sky_rot(n) = sky(R_east(-alt) n)
+                    sky_alm_rot = sky_alms[fi].copy()
+                    healpy.rotate_alm(sky_alm_rot, matrix=R_alt)
+                    C_pos = _sh_coupling_modes(beam_alms[fi], sky_alm_rot, lmax)
+                    t_ant[:, fi] = _sh_fft_spin(
+                        C_pos, n_phi, beam_solid_angles[fi]
+                    ).astype(real_dtype)
+                vis[ti, ai] = bandpass * (S12 * t_ant + Trx)
 
         return vis
