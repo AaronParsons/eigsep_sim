@@ -1,5 +1,5 @@
 import numpy as np
-import eigsep_terrain.utils as etu
+import eigsep_terrain.reflectivity as etu
 
 from .coord import rot_m
 from .const import R_MOON
