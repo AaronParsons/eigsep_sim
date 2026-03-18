@@ -32,7 +32,7 @@ class SkyModel(HPM):
                     resolution='lo',
                     include_cmb=True)
         gsm_data = gsm.generate(self.freqs).astype(self.dtype).T
-        gsm_nside = healpy.npix2nside(gsm_data.shape[1])
+        gsm_nside = healpy.npix2nside(gsm_data.shape[0])
         if gsm_nside != self._nside:
             gsm_hpm = HPM(nside=gsm_nside)
             gsm_hpm.set_map(gsm_data)
