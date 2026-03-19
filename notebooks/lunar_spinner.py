@@ -315,13 +315,13 @@ def animate_x_spin(
 if __name__ == "__main__":
 
     opening_angle_deg = 90.0
-    arm_lengths = [1.0, 0.8]   # independent lengths for each dipole pair
-    arm_masses  = [1.0, 0.8]
+    arm_lengths = [6.0, 4.0]   # independent lengths for each dipole pair
+    arm_masses  = [1.0, 1.8]
 
     # Arbitrary inertial angular momentum vector
     #L_inertial = np.array([0.4, 0.9, 1.3])
     #L_inertial = np.array([0.45, 0, 0.45])
-    L_inertial = np.array([0.5, 0, np.sqrt(3)/2]) / 2
+    L_inertial = np.array([0.5, 0, np.sqrt(3)/2]) * 16
 
     I = make_x_inertia(
         arm_lengths=arm_lengths,
@@ -335,7 +335,7 @@ if __name__ == "__main__":
         t_final=40.0,
         dt_sim=0.001,
     )
-    #plot_diagnostics(sim)
+    plot_diagnostics(sim)
 
     animate_x_spin(
         sim,
