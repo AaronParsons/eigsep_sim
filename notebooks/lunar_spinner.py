@@ -191,32 +191,69 @@ def set_axes_equal(ax, lim=1.2):
     ax.set_box_aspect((1, 1, 1))
 
 
-def plot_diagnostics(sim):
+def cartesian_to_spherical_angles(v):
+    """
+    Convert vectors to spherical angles.
+
+    Returns
+    -------
+    theta_deg : polar angle from +z in degrees, in [0, 180]
+    phi_deg   : azimuth angle in degrees, in (-180, 180]
+    """
+    v = np.asarray(v, dtype=float)
+    r = np.linalg.norm(v, axis=-1)
+    z = np.clip(v[..., 2] / r, -1.0, 1.0)
+    theta = np.degrees(np.arccos(z))
+    phi = np.degrees(np.arctan2(v[..., 1], v[..., 0]))
+    return theta, phi
+
+
+
+def plot_diagnostics(sim, arm_lengths=1.0, opening_angle_deg=90.0, arm_axes=None, stride=None):
+    """
+    Plot the inertial-frame (theta, phi) orientation of the axis of each dipole
+    over time to visualize sky coverage.
+
+    Parameters
+    ----------
+    sim : dict
+        Output of simulate_torque_free.
+    arm_lengths, opening_angle_deg, arm_axes :
+        Passed to make_x_points() so the body-frame dipole axes are defined
+        consistently with the simulated hardware geometry.
+    stride : int or None
+        Optional decimation factor for plotting. If None, choose a value that
+        limits the number of plotted samples to roughly 4000.
+    """
     t = sim["t"]
-    Lb = sim["L_body"]
-    Li = sim["L_inert"]
-    wb = sim["omega_body"]
-    T = sim["T"]
+    rots = sim["rot"]
 
-    fig, axs = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
+    _, arm_axes = make_x_points(arm_lengths, opening_angle_deg, arm_axes)
+    body_axes = np.asarray([normalize(u) for u in arm_axes])
 
-    axs[0].plot(t, Lb[:, 0], label="Lx body")
-    axs[0].plot(t, Lb[:, 1], label="Ly body")
-    axs[0].plot(t, Lb[:, 2], label="Lz body")
-    axs[0].legend()
-    axs[0].set_ylabel("L_body")
+    n = len(t)
+    if stride is None:
+        stride = max(1, n // 4000)
 
-    axs[1].plot(t, wb[:, 0], label="ωx body")
-    axs[1].plot(t, wb[:, 1], label="ωy body")
-    axs[1].plot(t, wb[:, 2], label="ωz body")
-    axs[1].legend()
-    axs[1].set_ylabel("ω_body")
+    t_plot = t[::stride]
+    rots_plot = rots[::stride]
 
-    axs[2].plot(t, np.linalg.norm(Li, axis=1), label="|L|")
-    axs[2].plot(t, T, label="T")
-    axs[2].legend()
-    axs[2].set_ylabel("invariants")
-    axs[2].set_xlabel("time")
+    inertial_axes = np.empty((len(t_plot), len(body_axes), 3))
+    for i, R in enumerate(rots_plot):
+        inertial_axes[i] = np.array([R.apply(u) for u in body_axes])
+
+    theta_deg, phi_deg = cartesian_to_spherical_angles(inertial_axes)
+
+    plt.figure()
+    ax = plt.gca()
+
+    for j in range(len(body_axes)):
+        plt.plot(phi_deg[:, j], theta_deg[:, j], '.', ms=2, label=f"dipole {j + 1}")
+
+    ax.set_ylabel(r"$\theta$ [deg]")
+    #ax.set_ylim(0, 180)
+    ax.set_xlabel(r"$\phi$ [deg]")
+    #ax.set_xlim(-180, 180)
 
     plt.tight_layout()
     plt.show()
@@ -310,18 +347,29 @@ def animate_x_spin(
     return ani
 
 # -----------------------------
+# Default hardware parameters
+# -----------------------------
+OPENING_ANGLE_DEG = 90.0
+ARM_LENGTHS = [6.0, 4.0]   # m, full tip-to-tip length of each rod
+ARM_MASSES  = [1.0, 2.25]  # kg
+
+_eps = 0.2
+L_HAT = np.array([1.0, 0.0, _eps])
+L_HAT /= np.linalg.norm(L_HAT)
+
+
+# -----------------------------
 # Example usage
 # -----------------------------
 if __name__ == "__main__":
 
-    opening_angle_deg = 90.0
-    arm_lengths = [6.0, 4.0]   # independent lengths for each dipole pair
-    arm_masses  = [1.0, 1.8]
+    arm_lengths = ARM_LENGTHS
+    arm_masses  = ARM_MASSES
+    opening_angle_deg = OPENING_ANGLE_DEG
 
     # Arbitrary inertial angular momentum vector
-    #L_inertial = np.array([0.4, 0.9, 1.3])
-    #L_inertial = np.array([0.45, 0, 0.45])
-    L_inertial = np.array([0.5, 0, np.sqrt(3)/2]) * 16
+    L0 = 16
+    L_inertial = L0 * L_HAT
 
     I = make_x_inertia(
         arm_lengths=arm_lengths,
@@ -332,18 +380,17 @@ if __name__ == "__main__":
     sim = simulate_torque_free(
         I,
         L_inertial=L_inertial,
-        t_final=40.0,
-        dt_sim=0.001,
+        t_final=100.0,
+        dt_sim=0.0005,
     )
-    plot_diagnostics(sim)
+    plot_diagnostics(sim, arm_lengths=arm_lengths, opening_angle_deg=opening_angle_deg)
 
-    animate_x_spin(
-        sim,
-        arm_lengths=arm_lengths,
-        opening_angle_deg=opening_angle_deg,
-        frame_stride=20,
-        interval=120,
-        show_tip_trails=True,
-        trail_len=200,
-    )
-
+    #animate_x_spin(
+    #    sim,
+    #    arm_lengths=arm_lengths,
+    #    opening_angle_deg=opening_angle_deg,
+    #    frame_stride=20,
+    #    interval=120,
+    #    show_tip_trails=True,
+    #    trail_len=200,
+    #)
