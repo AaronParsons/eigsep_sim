@@ -238,6 +238,117 @@ def analytic_dipole_beam(
     raise ValueError(f"Unknown dipole_model {dipole_model!r}")
 
 
+def thin_dipole_pattern(kh, cos_theta, eps=1e-12):
+    """
+    Thin-dipole scalar power pattern given precomputed cos(theta) values.
+
+    Evaluates  B = [(cos(kh · cos θ) − cos kh) / sin θ]²,  the same formula
+    used by :func:`thin_dipole_beam`, but without fixing the dipole axis to a
+    HEALPix grid.  Use this when *cos_theta* has been precomputed externally
+    (e.g. after rotating the dipole axis into the inertial frame).
+
+    Parameters
+    ----------
+    kh : array_like
+        Electrical half-length(s) kL/2 = π f L / c.  Broadcast-compatible
+        with *cos_theta*.
+    cos_theta : array_like
+        Cosine of the angle between each direction and the dipole axis.
+    eps : float
+        Floor on sin²(θ) used both to avoid division by zero and as the
+        on-axis threshold below which the pattern is set to zero.
+
+    Returns
+    -------
+    pattern : ndarray
+        Unnormalised power beam pattern, same shape as the broadcast of
+        *kh* and *cos_theta*.  Exactly zero on the dipole axis.
+    """
+    kh = np.asarray(kh, dtype=float)
+    cos_theta = np.asarray(cos_theta, dtype=float)
+    sin2 = np.maximum(1.0 - cos_theta ** 2, eps)
+    numer = np.cos(kh * cos_theta) - np.cos(kh)
+    return np.where(sin2 > eps, numer ** 2 / sin2, 0.0)
+
+
+# ── Dipole reception physics ───────────────────────────────────────────────
+
+def gsm_like_tsky_K(freq_mhz):
+    """Crude average-sky model: ~1.9e4 K at 30 MHz, spectral index −2.55."""
+    return 1.9e4 * (np.asarray(freq_mhz, dtype=float) / 30.0) ** (-2.55)
+
+
+def short_dipole_radiation_resistance_ohm(length_m, freq_mhz):
+    """Radiation resistance Rrad ≈ 80 π² (L/λ)² (short-dipole approximation)."""
+    lam = C_LIGHT / (np.asarray(freq_mhz, dtype=float) * 1e6)
+    return 80.0 * np.pi ** 2 * (length_m / lam) ** 2
+
+
+def realized_efficiency(
+    length_m, freq_mhz,
+    r_loss_ohm=5.0, z_rx_ohm=50.0, x_scale=120.0,
+):
+    """
+    Approximate realised efficiency η = mismatch × Rrad / (Rrad + Rloss).
+
+    Models the impedance mismatch between the antenna and the receiver using
+    a short-dipole reactance approximation, then applies ohmic-loss
+    derating.
+
+    Parameters
+    ----------
+    length_m : float
+        Total dipole length [m].
+    freq_mhz : array_like
+        Frequency [MHz].
+    r_loss_ohm : float
+        Lumped antenna / lead resistance [Ω].
+    z_rx_ohm : float
+        Receiver input resistance [Ω].
+    x_scale : float
+        Reactance model scale factor.
+
+    Returns
+    -------
+    eta : ndarray
+        Realised efficiency ∈ [0, 1], same shape as *freq_mhz*.
+    """
+    f = np.asarray(freq_mhz, dtype=float)
+    elec = np.maximum(length_m * f * 1e6 / C_LIGHT, 1e-6)
+    rrad = short_dipole_radiation_resistance_ohm(length_m, f)
+    rtot = rrad + r_loss_ohm
+    zant = rtot - 1j * (x_scale / elec)
+    gamma = (zant - z_rx_ohm) / (zant + z_rx_ohm)
+    return np.clip((1.0 - np.abs(gamma) ** 2) * (rrad / rtot), 0.0, 1.0)
+
+
+def antenna_temperature_K(
+    length_m, freq_mhz,
+    r_loss_ohm=5.0, z_rx_ohm=50.0, x_scale=120.0,
+):
+    """Delivered sky temperature after antenna efficiency losses."""
+    return (
+        realized_efficiency(length_m, freq_mhz,
+                            r_loss_ohm=r_loss_ohm, z_rx_ohm=z_rx_ohm,
+                            x_scale=x_scale)
+        * gsm_like_tsky_K(freq_mhz)
+    )
+
+
+def receiver_margin_factor(
+    length_m, freq_mhz, trx_K=100.0,
+    r_loss_ohm=5.0, z_rx_ohm=50.0, x_scale=120.0,
+):
+    """Returns 2·Tant / Trx; criterion Trx < 2·Tant passes when result > 1."""
+    return (
+        2.0
+        * antenna_temperature_K(length_m, freq_mhz,
+                                r_loss_ohm=r_loss_ohm, z_rx_ohm=z_rx_ohm,
+                                x_scale=x_scale)
+        / trx_K
+    )
+
+
 class Beam(HPM):
     """
     Antenna beam pattern stored as a HEALPix map with rotation support.

@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import healpy
 from astropy.time import Time
 
-from eigsep_sim.sim import (
+from eigsep_sim.sim_jax import (
     _beam_sum, _src_sum, Simulator,
     _sh_coupling_modes, _sh_fft_spin,
 )
