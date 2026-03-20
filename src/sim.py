@@ -76,6 +76,53 @@ def compute_masks_and_beams(orbits, obs_times, rots_per_orbit, u_body, kh,
     return masks, beams, omega_B
 
 
+def compute_beams(rots_per_orbit, u_body, kh, nside):
+    """
+    Compute dipole beam patterns for new ``kh`` values, reusing existing
+    spacecraft attitudes without re-evaluating occultation masks.
+
+    Use this in the multi-frequency loop after calling
+    :func:`compute_masks_and_beams` once to obtain the masks.
+
+    Parameters
+    ----------
+    rots_per_orbit : list of scipy.spatial.transform.Rotation
+        rots_per_orbit[o] is a stacked Rotation of shape (n_obs,).
+    u_body : ndarray, shape (2, 3)
+        Dipole unit vectors in the body frame.
+    kh : ndarray, shape (2,)
+        Electrical half-lengths k·h = π·f·L/c for each dipole at the
+        new frequency.
+    nside : int
+        HEALPix resolution (must match the existing masks).
+
+    Returns
+    -------
+    beams : ndarray, shape (n_total, 2, npix), float32
+    omega_B : ndarray, shape (n_total, 2)
+        Beam solid angle (sum over pixels).
+    """
+    import healpy
+
+    n_orbits = len(rots_per_orbit)
+    n_obs = len(rots_per_orbit[0])
+    n_total = n_orbits * n_obs
+    npix = healpy.nside2npix(nside)
+
+    N_GAL = np.array(healpy.pix2vec(nside, np.arange(npix)))  # (3, npix)
+    beams = np.empty((n_total, 2, npix), dtype=np.float32)
+
+    for o, rots_obs in enumerate(rots_per_orbit):
+        for i in range(n_obs):
+            k = o * n_obs + i
+            D_gal = rots_obs[i].apply(u_body)          # (2, 3)
+            cos_t = D_gal @ N_GAL                       # (2, npix)
+            beams[k] = thin_dipole_pattern(kh[:, np.newaxis], cos_t).astype(np.float32)
+
+    omega_B = beams.sum(axis=2)
+    return beams, omega_B
+
+
 def simulate_observations(masks, beams, omega_B, gsm_map, t_regolith, t_sun,
                            J_SUN, sigma_noise, rng=None):
     """

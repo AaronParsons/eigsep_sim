@@ -185,9 +185,9 @@ if __name__ == "__main__":
     sim = _cfg.antenna.simulate(L_inertial=16.0 * _cfg.antenna.l_hat, t_final=100.0, dt_sim=0.0005)
     plot_diagnostics(sim, arm_lengths=_cfg.antenna.arm_lengths, opening_angle_deg=_cfg.antenna.opening_angle_deg)
 
-    #animate_x_spin(
-    #    sim,
-    #    arm_lengths=_cfg.antenna.arm_lengths,
-    #    opening_angle_deg=_cfg.antenna.opening_angle_deg,
-    #    frame_stride=20, interval=120, show_tip_trails=True, trail_len=200,
-    #)
+    animate_x_spin(
+        sim,
+        arm_lengths=_cfg.antenna.arm_lengths,
+        opening_angle_deg=_cfg.antenna.opening_angle_deg,
+        frame_stride=20, interval=120, show_tip_trails=True, trail_len=200,
+    )
