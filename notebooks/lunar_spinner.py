@@ -21,32 +21,6 @@ from eigsep_sim.lunar_orbit import (
     OrbiterMission,
 )
 
-_cfg = OrbiterMission(os.path.join(_HERE, "bloom_config.yaml"))
-
-__all__ = [
-    "normalize",
-    "rod_inertia_about_com",
-    "make_x_inertia",
-    "euler_rhs",
-    "simulate_torque_free",
-    "make_x_points",
-    "set_axes_equal",
-    "cartesian_to_spherical_angles",
-    "plot_diagnostics",
-    "animate_x_spin",
-    "OPENING_ANGLE_DEG",
-    "ARM_LENGTHS",
-    "ARM_MASSES",
-    "L_HAT",
-]
-
-# ── Hardware parameters (from bloom_config.yaml) ──────────────────────────
-OPENING_ANGLE_DEG = _cfg.antenna.opening_angle_deg
-ARM_LENGTHS       = _cfg.antenna.arm_lengths   # m, full tip-to-tip length of each rod
-ARM_MASSES        = _cfg.antenna.arm_masses    # kg
-L_HAT             = _cfg.antenna.l_hat
-del _cfg
-
 
 # ── Visualization geometry ─────────────────────────────────────────────────
 
@@ -206,9 +180,8 @@ def animate_x_spin(
     return ani
 
 
-# ── Example usage ─────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
+    _cfg = OrbiterMission(os.path.join(_HERE, "bloom_config.yaml"))
     sim = _cfg.antenna.simulate(L_inertial=16.0 * _cfg.antenna.l_hat, t_final=100.0, dt_sim=0.0005)
     plot_diagnostics(sim, arm_lengths=_cfg.antenna.arm_lengths, opening_angle_deg=_cfg.antenna.opening_angle_deg)
 
