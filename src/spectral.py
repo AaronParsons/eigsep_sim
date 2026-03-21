@@ -14,28 +14,48 @@ project_signal   — project a signal through the foreground-subtraction operato
 import numpy as np
 
 
-def gsm_eigenmodes(gsm_maps, n_modes):
+def gsm_eigenmodes(gsm_maps, n_modes, include_flat=True):
     """
     Compute the dominant spectral eigenmodes of the GSM.
 
     Performs a thin SVD of the pixel-by-frequency GSM map matrix and returns
-    the top ``n_modes`` right singular vectors, which span the dominant spectral
-    variation of the diffuse foreground.
+    the top ``n_modes`` right singular vectors.  When ``include_flat=True``
+    (the default), a spectrally flat (constant) mode is appended after
+    Gram-Schmidt orthogonalisation against the GSM modes.  This flat mode
+    spans the common-mode receiver-temperature degeneracy (T_rx adds a
+    frequency-independent offset to every measurement) and ensures it is
+    removed alongside the smooth synchrotron foreground.
 
     Parameters
     ----------
     gsm_maps : ndarray, shape (npix, N_FREQ)
         GSM brightness-temperature maps at each frequency [K].
     n_modes : int
-        Number of eigenmodes to retain.
+        Number of GSM spectral eigenmodes to retain.
+    include_flat : bool
+        If True (default), append a normalised flat mode (orthogonalised
+        against the GSM modes) to the returned array.
 
     Returns
     -------
-    modes : ndarray, shape (n_modes, N_FREQ)
-        Unit-norm row vectors; the top ``n_modes`` spectral eigenmodes.
+    modes : ndarray, shape (n_modes [+ 1], N_FREQ)
+        Unit-norm orthogonal row vectors.  The last row is the flat mode
+        when ``include_flat=True`` and it is not already spanned by the
+        GSM eigenmodes.
     """
     _, _, Vt = np.linalg.svd(gsm_maps, full_matrices=False)
-    return Vt[:n_modes]
+    modes = Vt[:n_modes]
+
+    if include_flat:
+        N_FREQ = gsm_maps.shape[1]
+        flat = np.ones(N_FREQ) / np.sqrt(N_FREQ)
+        # Remove the component already captured by the GSM eigenmodes
+        flat_orth = flat - modes.T @ (modes @ flat)
+        norm = np.linalg.norm(flat_orth)
+        if norm > 1e-10:
+            modes = np.vstack([modes, flat_orth / norm])
+
+    return modes
 
 
 def eigenmode_filter(spectrum, modes):

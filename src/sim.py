@@ -124,7 +124,7 @@ def compute_beams(rots_per_orbit, u_body, kh, nside):
 
 
 def simulate_observations(masks, beams, omega_B, gsm_map, t_regolith, t_sun,
-                           J_SUN, sigma_noise, rng=None):
+                           J_SUN, sigma_noise, rng=None, t_rx=None):
     """
     Forward model: simulate antenna temperature observations.
 
@@ -146,6 +146,9 @@ def simulate_observations(masks, beams, omega_B, gsm_map, t_regolith, t_sun,
         Per-dipole radiometer noise standard deviation [K].
     rng : numpy.random.Generator or None
         Random number generator for noise.  If None, uses default_rng(42).
+    t_rx : array_like, shape (2,) or None
+        Per-dipole receiver temperature [K].  Added as a constant offset to
+        every measurement.  If None, defaults to zero (backward-compatible).
 
     Returns
     -------
@@ -157,6 +160,7 @@ def simulate_observations(masks, beams, omega_B, gsm_map, t_regolith, t_sun,
     if rng is None:
         rng = np.random.default_rng(42)
     sigma_noise = np.asarray(sigma_noise)
+    t_rx = np.zeros(2) if t_rx is None else np.asarray(t_rx)
 
     n_total, npix = masks.shape
     n_obs = len(J_SUN)
@@ -177,7 +181,7 @@ def simulate_observations(masks, beams, omega_B, gsm_map, t_regolith, t_sun,
                     np.dot(B, T_sky)
                     + t_sun * B[J_SUN[i]] * sun_mask_i
                 ) / OmB
-                data[k, d] = T_ant + rng.normal(scale=sigma_noise[d])
+                data[k, d] = T_ant + t_rx[d] + rng.normal(scale=sigma_noise[d])
 
     y = data.ravel()
     return data, y
