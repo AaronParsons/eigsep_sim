@@ -56,24 +56,40 @@ def build_design_matrix(masks, beams, omega_B, J_SUN, npix, include_t_rx=True):
     n_rows = n_total * 2
     n_cols = npix + 4 if include_t_rx else npix + 2
 
-    A = np.zeros((n_rows, n_cols), dtype=np.float64)
+    # Cast inputs once to float64 to avoid repeated per-row casts.
+    m  = masks.astype(np.float64)       # (n_total, npix)
+    B  = beams.astype(np.float64)       # (n_total, 2, npix)
+    OB = omega_B.astype(np.float64)     # (n_total, 2)
 
-    for o in range(n_orbits):
-        for i in range(n_obs):
-            k = o * n_obs + i
-            m_i = masks[k].astype(np.float64)
-            sun_mask_i = m_i[J_SUN[i]]
+    # J_SUN has length n_obs; tile to n_total (orbits share the same time grid).
+    J_tile = np.tile(J_SUN, n_orbits)   # (n_total,)
 
-            for d in range(2):
-                r = 2 * k + d
-                B = beams[k, d].astype(np.float64)
-                OmB = omega_B[k, d]
+    # Row layout: rows [2k, 2k+1] correspond to dipoles [0, 1] of observation k.
+    # Vectorised over all k and d simultaneously.
 
-                A[r, :npix]    = B * m_i / OmB
-                A[r, npix]     = np.dot(B, 1.0 - m_i) / OmB
-                A[r, npix + 1] = B[J_SUN[i]] * sun_mask_i / OmB
-                if include_t_rx:
-                    A[r, npix + 2 + d] = 1.0   # T_rx for dipole d
+    # Sky pixel columns: A[2k+d, j] = B[k,d,j] * m[k,j] / OmB[k,d]
+    # Shape: (n_total, 2, npix) → (n_total*2, npix) via reshape (C-order gives
+    # the correct row ordering: d=0 then d=1 for each k).
+    sky_block = (B / OB[:, :, np.newaxis]) * m[:, np.newaxis, :]   # (n_total, 2, npix)
+
+    # Regolith column: sum_j B[k,d,j] * (1 - m[k,j]) / OmB[k,d]
+    reg_block = (B * (1.0 - m[:, np.newaxis, :])).sum(axis=2) / OB  # (n_total, 2)
+
+    # Sun column: B[k,d,J_SUN[i]] * m[k,J_SUN[i]] / OmB[k,d]
+    sun_beam = B[np.arange(n_total), :, J_tile]    # (n_total, 2)
+    sun_mask = m[np.arange(n_total), J_tile]        # (n_total,)
+    sun_block = sun_beam * sun_mask[:, np.newaxis] / OB   # (n_total, 2)
+
+    # Assemble A: interleave dipoles into rows.
+    A = np.empty((n_rows, n_cols), dtype=np.float64)
+    A[:, :npix]    = sky_block.reshape(n_rows, npix)
+    A[:, npix]     = reg_block.reshape(n_rows)
+    A[:, npix + 1] = sun_block.reshape(n_rows)
+    if include_t_rx:
+        A[:, npix + 2] = 0.0
+        A[:, npix + 3] = 0.0
+        A[0::2, npix + 2] = 1.0   # dipole-0 rows
+        A[1::2, npix + 3] = 1.0   # dipole-1 rows
 
     return A
 
