@@ -40,11 +40,18 @@ from eigsep_sim.sim import compute_masks_and_beams, compute_beams, simulate_obse
 from eigsep_sim.linear_solver import build_design_matrix, normal_solve
 from eigsep_sim.models import T21cmModel
 from eigsep_sim.spectral import gsm_eigenmodes, eigenmode_filter
+from sim_cache import (
+    config_fingerprint,
+    save_setup, try_load_setup,
+    save_multifreq, try_load_multifreq,
+)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 _YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bloom_config.yaml")
 cfg = OrbiterMission(_YAML)
 print(repr(cfg))
+FP = config_fingerprint(cfg)
+print(f"Config fingerprint: {FP}")
 
 # ── Frequency grid (from config) ──────────────────────────────────────────────
 FREQS_MHZ = np.linspace(
@@ -99,13 +106,18 @@ J_SUN = healpy.vec2pix(cfg.observation.nside,
                        np.cos(b_s)*np.sin(l_s),
                        np.sin(b_s))
 
-# ── Pre-compute frequency-independent masks ───────────────────────────────────
-print("Computing occultation masks …", flush=True)
-masks_mf, _, _ = compute_masks_and_beams(
-    orbits_list, obs_times, rots_per_orbit,
-    cfg.antenna.u_body, cfg.antenna.kh(FREQS_MHZ[0]),
-    cfg.observation.nside, verbose=False,
-)
+# ── Pre-compute frequency-independent masks (cached) ──────────────────────────
+_cached_setup = try_load_setup(FP)
+if _cached_setup is not None:
+    masks_mf, _ = _cached_setup
+else:
+    print("Computing occultation masks …", flush=True)
+    masks_mf, _, _ = compute_masks_and_beams(
+        orbits_list, obs_times, rots_per_orbit,
+        cfg.antenna.u_body, cfg.antenna.kh(FREQS_MHZ[0]),
+        cfg.observation.nside, verbose=False,
+    )
+    save_setup(masks_mf, J_SUN, FP)
 
 # ── GSM eigenmodes ────────────────────────────────────────────────────────────
 modes = gsm_eigenmodes(gsm_maps, N_EIG_MODES)   # includes flat mode
@@ -167,9 +179,14 @@ def run_multifreq(noise_seed_offset=0, noise_scale=1.0):
     return T_sky_mean_est, SIGMA_MONO
 
 
-# ── Noiseless run — foreground leakage ───────────────────────────────────────
+# ── Noiseless run — foreground leakage (cached) ───────────────────────────────
 print("\nNoiseless run …", flush=True)
-T_est_nl, _ = run_multifreq(noise_scale=0.0)
+_nl_cached = try_load_multifreq(FREQS_MHZ, 0.0, 0, FP)
+if _nl_cached is not None:
+    T_est_nl, _ = _nl_cached
+else:
+    T_est_nl, _sigma_nl = run_multifreq(noise_scale=0.0)
+    save_multifreq(FREQS_MHZ, T_est_nl, _sigma_nl, 0.0, 0, FP)
 resid_nl     = eigenmode_filter(T_est_nl, modes)
 FG_leakage   = resid_nl - T_21_filt
 print(f"  FG leakage rms  = {np.std(FG_leakage)*1e3:.4f} mK")
