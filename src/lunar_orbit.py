@@ -416,40 +416,63 @@ class Observation:
         t_sun: float,
         n_days: int,
         n_obs: int,
-        t_integration: float,
         band_low_mhz: float,
         band_high_mhz: float,
         nchan: int,
         fixed_spin: bool,
+        freq_min_mhz: float,
+        freq_max_mhz: float,
+        nchan_science: int,
+        duty_cycle: float,
+        attitude_knowledge_deg: float,
+        spin_period_s: float,
     ) -> None:
         # orbit
-        self.rot_orbit_vecs     = rot_orbit_vecs
+        self.rot_orbit_vecs      = rot_orbit_vecs
         self.orbit_normals_frame = orbit_normals_frame
-        self.altitude           = altitude
-        self.obs_epoch          = obs_epoch
-        self.n_orbits: int      = len(rot_orbit_vecs)
-        self.t_orbital: float   = circular_orbital_period(altitude)
+        self.altitude            = altitude
+        self.obs_epoch           = obs_epoch
+        self.n_orbits: int       = len(rot_orbit_vecs)
+        self.t_orbital: float    = circular_orbital_period(altitude)
         # sky / simulation truth
-        self.freq: float        = freq
-        self.freq_mhz: float    = freq / 1e6
-        self.nside: int         = nside
-        self.npix: int          = healpy.nside2npix(nside)
-        self.t_regolith: float  = t_regolith
-        self.t_sun: float       = t_sun
-        # radiometer schedule
-        self.n_days: int           = n_days
-        self.n_obs: int            = n_obs
-        self.t_integration: float  = t_integration
-        self.band_low_mhz: float   = band_low_mhz
-        self.band_high_mhz: float  = band_high_mhz
-        self.nchan: int            = nchan
-        self.fixed_spin: bool      = fixed_spin
-        # derived
+        self.freq: float         = freq
+        self.freq_mhz: float     = freq / 1e6
+        self.nside: int          = nside
+        self.npix: int           = healpy.nside2npix(nside)
+        self.t_regolith: float   = t_regolith
+        self.t_sun: float        = t_sun
+        # radiometer schedule — stored parameters
+        self.n_days: int             = n_days
+        self.n_obs: int              = n_obs
+        self.band_low_mhz: float     = band_low_mhz
+        self.band_high_mhz: float    = band_high_mhz
+        self.nchan: int              = nchan
+        self.fixed_spin: bool        = fixed_spin
+        # science frequency grid
+        self.freq_min_mhz: float     = freq_min_mhz
+        self.freq_max_mhz: float     = freq_max_mhz
+        self.nchan_science: int      = nchan_science
+        # duty cycle and attitude parameters
+        self.duty_cycle: float           = duty_cycle
+        self.attitude_knowledge_deg: float = attitude_knowledge_deg
+        self.spin_period_s: float        = spin_period_s
+        # derived — scheduling
         self.n_total: int           = self.n_orbits * n_obs
         self.n_rows: int            = self.n_total * 2
         self.bw_mhz: float          = band_high_mhz - band_low_mhz
-        self.delta_nu: float        = self.bw_mhz * 1e6 / nchan   # Hz/channel
+        self.delta_nu: float        = (freq_max_mhz - freq_min_mhz) * 1e6 / nchan_science
         self.channel_width_khz: float = self.delta_nu / 1e3
+        # derived — integration time
+        #   Effective integration time per simulation observation: total on-sky
+        #   time (n_days × duty_cycle) divided equally among all observations.
+        #   Each simulation "observation" collapses many short physical snapshots
+        #   with similar sky orientation into a single noise-averaged sample.
+        _n_obs_total = self.n_orbits * n_obs
+        self.t_integration: float = (n_days * 86400.0 * duty_cycle) / _n_obs_total
+        #   Per-snapshot coherence limit: the beam drifts by attitude_knowledge_deg
+        #   in this time due to the spacecraft spin.  t_integration should be much
+        #   larger than t_snapshot for the ergodic-averaging model to be valid.
+        self.t_snapshot: float = attitude_knowledge_deg / (360.0 / spin_period_s)
 
     def make_orbits(
         self,
@@ -539,21 +562,26 @@ class OrbiterMission:
             )
 
         self.observation = Observation(
-            rot_orbit_vecs    = rot_orbit_vecs,
-            orbit_normals_frame = _frame,
-            altitude          = obs["altitude_m"],
-            obs_epoch         = Time(obs["obs_epoch"]),
-            freq              = obs["freq_hz"],
-            nside             = obs["nside"],
-            t_regolith        = obs["t_regolith_K"],
-            t_sun             = obs["t_sun_K"],
-            n_days            = obs["n_days"],
-            n_obs             = obs["n_obs_per_orbit"],
-            t_integration     = obs["t_integration_s"],
-            band_low_mhz      = obs["band_low_mhz"],
-            band_high_mhz     = obs["band_high_mhz"],
-            nchan             = obs["nchan"],
-            fixed_spin        = obs["fixed_spin"],
+            rot_orbit_vecs         = rot_orbit_vecs,
+            orbit_normals_frame    = _frame,
+            altitude               = obs["altitude_m"],
+            obs_epoch              = Time(obs["obs_epoch"]),
+            freq                   = obs["freq_hz"],
+            nside                  = obs["nside"],
+            t_regolith             = obs["t_regolith_K"],
+            t_sun                  = obs["t_sun_K"],
+            n_days                 = obs["n_days"],
+            n_obs                  = obs["n_obs_per_orbit"],
+            band_low_mhz           = obs["band_low_mhz"],
+            band_high_mhz          = obs["band_high_mhz"],
+            nchan                  = obs["nchan"],
+            fixed_spin             = obs["fixed_spin"],
+            freq_min_mhz           = obs["freq_min_mhz"],
+            freq_max_mhz           = obs["freq_max_mhz"],
+            nchan_science          = obs["nchan_science"],
+            duty_cycle             = obs["duty_cycle"],
+            attitude_knowledge_deg = obs["attitude_knowledge_deg"],
+            spin_period_s          = obs["spin_period_s"],
         )
 
         # ── Mission / STM fields ───────────────────────────────────────────
@@ -562,7 +590,6 @@ class OrbiterMission:
         self.eff_geom_rate_deg_s: float         = mis["eff_geom_rate_deg_s"]
         self.science_band_low_mhz: float        = mis["science_band_low_mhz"]
         self.science_band_high_mhz: float       = mis["science_band_high_mhz"]
-        self.attitude_knowledge_deg: float      = mis["attitude_knowledge_deg"]
         self.mission_duration_days: float       = mis["mission_duration_days"]
         self.synodic_month_days: float          = mis["synodic_month_days"]
         self.modulation_min: float | None       = mis.get("modulation_min")

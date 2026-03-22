@@ -46,9 +46,19 @@ _YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bloom_config.y
 cfg = OrbiterMission(_YAML)
 print(repr(cfg))
 
-# ── Frequency grid ────────────────────────────────────────────────────────────
-FREQS_MHZ   = np.linspace(55.0, 115.0, 30)
+# ── Frequency grid (from config) ──────────────────────────────────────────────
+FREQS_MHZ = np.linspace(
+    cfg.observation.freq_min_mhz,
+    cfg.observation.freq_max_mhz,
+    cfg.observation.nchan_science,
+)
 N_FREQ      = len(FREQS_MHZ)
+print(f"Frequency grid: {FREQS_MHZ[0]:.1f} – {FREQS_MHZ[-1]:.1f} MHz  ({N_FREQ} channels)")
+print(f"delta_nu      = {cfg.observation.delta_nu/1e6:.4f} MHz  ({cfg.observation.channel_width_khz:.1f} kHz)")
+print(f"t_integration = {cfg.observation.t_integration:.2f} s  "
+      f"(duty={cfg.observation.duty_cycle}, n_days={cfg.observation.n_days})")
+print(f"t_snapshot    = {cfg.observation.t_snapshot:.3f} s  "
+      f"(attitude limit; ratio {cfg.observation.t_integration/cfg.observation.t_snapshot:.0f}× >> 1 ✓)")
 N_EIG_MODES = 5
 
 # ── Spacecraft attitudes ──────────────────────────────────────────────────────
@@ -191,6 +201,15 @@ if 0.3 < chi2_noise < 3.0:
     print(f"\n  PASS: noise-only chi²/dof = {chi2_noise:.3f}")
 else:
     print(f"\n  FAIL: noise-only chi²/dof = {chi2_noise:.3f} is outside [0.3, 3.0]")
+
+# ── Per-frequency and combined SNR ────────────────────────────────────────────
+SNR          = T_21_filt / SIGMA_MONO        # signed per-frequency SNR (N_FREQ,)
+SNR_combined = float(np.sqrt(np.sum(SNR**2)))
+print(f"\n  {'Freq [MHz]':>10}  {'T_21_filt [mK]':>15}  {'σ [mK]':>8}  {'SNR':>7}")
+print("  " + "-"*46)
+for f, s21, sig, snr in zip(FREQS_MHZ, T_21_filt*1e3, SIGMA_MONO*1e3, SNR):
+    print(f"  {f:10.1f}  {s21:15.3f}  {sig:8.3f}  {snr:7.3f}")
+print(f"\n  Combined SNR = sqrt(Σ SNR²) = {SNR_combined:.2f}")
 
 # ── Diagnostic plot ───────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
@@ -356,6 +375,16 @@ print(f"  {'PASS' if pass_rank  else 'FAIL'}: model-0 rank = {rank_model0}/{n_mo
 
 overall = pass_noise and pass_chi2 and pass_rank
 print(f"\n  OVERALL: {'PASS — signal recovery confirmed' if overall else 'FAIL — signal NOT recovered'}")
+
+# ── Per-frequency and combined SNR (scaled run) ───────────────────────────────
+SNR_s          = T_21_filt_opt / SIGMA_s
+SNR_combined_s = float(np.sqrt(np.sum(SNR_s**2)))
+print(f"\n  SNR table  [sigma_scale={sigma_scale:.4f}]:")
+print(f"  {'Freq [MHz]':>10}  {'T_21_filt [mK]':>15}  {'σ [mK]':>8}  {'SNR':>7}")
+print("  " + "-"*46)
+for f, s21, sig, snr in zip(FREQS_MHZ, T_21_filt_opt*1e3, SIGMA_s*1e3, SNR_s):
+    print(f"  {f:10.1f}  {s21:15.3f}  {sig:8.3f}  {snr:7.3f}")
+print(f"\n  Combined SNR = sqrt(Σ SNR²) = {SNR_combined_s:.2f}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step 4 summary — values to plug into the notebook
