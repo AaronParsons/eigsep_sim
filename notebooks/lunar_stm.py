@@ -103,6 +103,14 @@ SYNODIC_MONTH   = cfg.synodic_month_days                 # 29.53 days
 N_EIG_MODES     = 4   # established optimal (FG leakage sweet spot)
 ATT_ERR_DEG     = 1.0  # attitude perturbation for pointing-error simulation
 
+# --- Spectral modulation self-calibration (beam_cal_verify.py results) ---------
+#   Fixed rotation offset between star-tracker and dipole axes recovered from
+#   in-flight spectral residuals r_f = y_f − A_nom x̂_f.
+#   1,728,000 equations vs 3 unknowns (57,600 rows/freq × 30 science channels).
+SPEC_CAL_CRB_ARCSEC   = 0.039   # CRB 1-σ [arcsec], 30 science channels, physics-noise
+SPEC_CAL_CRB_5CH_ARCSEC = 0.103 # CRB 1-σ [arcsec], 5 channels, realistic noise
+SPEC_CAL_N_FREQ       = NCHAN_SCIENCE  # 30 science channels
+
 # --- Data-volume budget -------------------------------------------------------
 #   Raw data = 2 dipoles × N_ch_ext × 4 bytes × 1 Hz sample rate × 2 spacecraft
 SAMPLE_RATE_HZ     = 1.0 / T_ACCUM           # 1 Hz accumulation rate
@@ -783,11 +791,19 @@ if __name__ == "__main__":
          f"bias = {bias_rms*1e3:.0f} mK × σ_tracker / √N_readings < 10% σ_mono  →  "
          f"at 60s cadence: σ_tracker < 24'  |  at 1s cadence: σ_tracker < 183'",
          note="from tumbling_beam_verify.py; 1° tracker meets req at ≤10s cadence (bias 0.17→0.054 mK)")
+    req_sys_arcsec = 0.10 * np.mean(SIGMA_MONO) / bias_rms * 3600   # correct: K/K × 3600 → arcsec
     _row("   (B) Systematic cal req  (no averaging)",
-         f"δ_sys < {0.10 * np.mean(SIGMA_MONO) / (bias_rms) * 60 * 1e3:.2f} arcmin  "
-         f"= {0.10 * np.mean(SIGMA_MONO) / (bias_rms) * 3600 * 1e3:.0f} arcsec  (10% σ_mono budget)",
-         note="fixed boresight/calibration error; verified by pre-launch calibration campaign",
-         margin="pre-launch cal required")
+         f"δ_sys < {req_sys_arcsec/60:.4f} arcmin  "
+         f"= {req_sys_arcsec:.1f} arcsec  (10% σ_mono budget)",
+         note="fixed boresight/cal error never averages down — but superseded by in-flight spectral cal (C)",
+         margin="spectral cal (see C)")
+    spec_cal_margin = req_sys_arcsec / SPEC_CAL_CRB_ARCSEC
+    _row("   (C) In-flight spectral modulation cal  (beam_cal_verify.py)",
+         f"CRB 1-σ = {SPEC_CAL_CRB_ARCSEC:.3f} arcsec  ({SPEC_CAL_N_FREQ} science channels, "
+         f"physics-noise-limited)  →  {spec_cal_margin:.0f}× margin over pre-launch req",
+         note="residuals r_f = (I−H_f) J_f δ_true + noise; 1.73M eqs vs 3 unknowns; "
+              "recovery error = 0.05\" at 0.1° offset; CRB ∝ 1/√N_freq",
+         margin=f"spectral cal: {spec_cal_margin:.0f}× margin")
 
     # ─────────────────────────────────────────────────────────────────────────
     _section("SCIENCE GOAL 2 (SG-2): ALL-SKY SPECTRAL MAPS")
@@ -972,12 +988,17 @@ if __name__ == "__main__":
     _row("   Beam sensitivity ∂(|δA|/|A|)/∂θ",
          "≈ 1.98e-02 /°  (verified, tumbling_beam_verify.py Stage 3)",
          note="L-drift (0.02°) is negligible vs tracker noise; dominant error is single-reading noise ~σ_tracker")
-    _row("   Systematic calibration req  (does NOT average down)",
-         f"δ_sys < {0.10 * np.mean(SIGMA_MONO) / bias_rms * 60 * 1e3:.2f} arcmin"
-         f"  = {0.10 * np.mean(SIGMA_MONO) / bias_rms * 3600 * 1e3:.0f} arcsec  "
-         "(10% σ_mono; bias_sys = 122 mK × δ_sys / 1°)",
-         note="pre-launch calibration campaign determines boresight to sub-arcminute accuracy",
-         margin="pre-launch cal")
+    _row("   Systematic cal req  (no averaging, pre-launch)",
+         f"δ_sys < {req_sys_arcsec:.1f} arcsec  "
+         "(10% σ_mono; bias_sys = 122 mK × δ_sys / 1°)  — NOT binding; superseded by (C)",
+         note="pre-launch boresight calibration typically achieves 1–10 arcsec",
+         margin="NOT binding (spectral cal)")
+    _row("   (C) In-flight spectral modulation cal  (beam_cal_verify.py)",
+         f"CRB 1-σ = {SPEC_CAL_CRB_ARCSEC:.3f} arcsec  ({SPEC_CAL_N_FREQ} ch)  =  "
+         f"{spec_cal_margin:.0f}× margin;  recovery err = 0.05\" at 0.1° offset",
+         note="r_f = (I−H_f) J_f δ + noise; 1.73M eqs vs 3 unknowns; CRB ∝ 1/√N_freq; "
+              "5 ch with realistic noise: 0.10\", 47× margin",
+         margin=f"{spec_cal_margin:.0f}× margin")
 
     # ─────────────────────────────────────────────────────────────────────────
     _section("EXTENDED MISSION PROJECTIONS  (60 days → 1 year)")
@@ -1028,9 +1049,9 @@ if __name__ == "__main__":
         "SR-1.1: SNR > 15",
         "MR-1.3: σ_mono per channel",
         "",
-        f"MiR-1.3: cal δ<{0.10*np.mean(SIGMA_MONO)/bias_rms*60*1e3:.0f}\"",
-        f"1°sys→{bias_rms*1e3:.0f}mK={bias_vs_sigma:.0f}×σ; cal+cadence",
-        "pre-launch cal",
+        f"MiR-1.3: spec-cal {SPEC_CAL_CRB_ARCSEC:.3f}\" ({spec_cal_margin:.0f}×)",
+        f"1°sys→{bias_rms*1e3:.0f}mK={bias_vs_sigma:.0f}×σ; spec-cal dominant",
+        f"spec-cal ({spec_cal_margin:.0f}×)",
     )
     _stm_row(
         "",
@@ -1101,11 +1122,17 @@ if __name__ == "__main__":
          f"(A) RANDOM noise: bias = {bias_rms*1e3:.0f} mK × σ_tracker / √N_rdg;  "
          f"1° tracker at ≤10s cadence → bias ≈ 0.17 mK < 10% σ_mono  ✓",
          note="random errors average down within each day AND across 60 days; L-drift (0.02°) negligible")
-    _row("   (B) SYSTEMATIC calibration req",
-         f"δ_sys < {0.10*np.mean(SIGMA_MONO)/bias_rms*60*1e3:.0f} arcsec  "
-         f"(= {0.10*np.mean(SIGMA_MONO)/bias_rms*60*1e3/60:.2f} arcmin)  — pre-launch calibration",
-         note="fixed boresight/cal error never averages down; typical star-tracker cal is 1–10 arcsec",
-         margin="pre-launch cal required")
+    _row("   (B) SYSTEMATIC cal req  [NOT binding — superseded by spectral cal]",
+         f"Pre-launch req: δ_sys < {req_sys_arcsec:.1f} arcsec  "
+         f"— in-flight spectral cal achieves {SPEC_CAL_CRB_ARCSEC:.3f}\" ({spec_cal_margin:.0f}× better)",
+         note="fixed boresight/cal error never averages down, but beam_cal_verify.py shows it is recoverable",
+         margin="NOT binding")
+    _row("   (C) Spectral modulation self-cal  (beam_cal_verify.py)",
+         f"CRB 1-σ = {SPEC_CAL_CRB_ARCSEC:.3f} arcsec ({SPEC_CAL_N_FREQ} ch)  |  "
+         f"margin = {spec_cal_margin:.0f}×  |  recovery err = 0.05\" (0.07\" with noise)",
+         note="r_f = (I−H_f) J_f δ + noise; 1.73M eqs vs 3 unknowns; CRB ∝ 1/√N_freq; "
+              "5 ch with realistic noise: 0.10\", 47× margin",
+         margin=f"DOMINANT: {spec_cal_margin:.0f}× margin")
     print()
     _row("All-sky map l_max (SG-2)",
          f"l_max = {l_max_sci}  (< 10% error on a_lm, sensitivity-limited)",
