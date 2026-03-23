@@ -394,6 +394,40 @@ class Antenna:
         return simulate_torque_free(self.inertia, L_inertial, t_final, dt_sim)
 
 
+# ── Analysis sub-object ───────────────────────────────────────────────────
+
+class Analysis:
+    """
+    Pipeline analysis tuning parameters from the YAML ``analysis`` section.
+
+    All values are stored as plain Python scalars; no derived quantities.
+    An extra convenience attribute ``tracker_dt_s = 1 / tracker_hz`` is added.
+    """
+
+    def __init__(
+        self,
+        n_eig_modes: int,
+        snr_threshold: float,
+        tracker_hz: float,
+        t_accum_s: float,
+        bytes_per_sample: int,
+        downlink_mbperhr: float,
+        n_substeps: int,
+        n_windows: int,
+        ref_freq_mhz: float,
+    ) -> None:
+        self.n_eig_modes      = int(n_eig_modes)
+        self.snr_threshold    = float(snr_threshold)
+        self.tracker_hz       = float(tracker_hz)
+        self.tracker_dt_s     = 1.0 / self.tracker_hz
+        self.t_accum_s        = float(t_accum_s)
+        self.bytes_per_sample = int(bytes_per_sample)
+        self.downlink_mbperhr = float(downlink_mbperhr)
+        self.n_substeps       = int(n_substeps)
+        self.n_windows        = int(n_windows)
+        self.ref_freq_mhz     = float(ref_freq_mhz)
+
+
 # ── Observation sub-object ────────────────────────────────────────────────
 
 class Observation:
@@ -591,10 +625,26 @@ class OrbiterMission:
         self.science_band_low_mhz: float        = mis["science_band_low_mhz"]
         self.science_band_high_mhz: float       = mis["science_band_high_mhz"]
         self.mission_duration_days: float       = mis["mission_duration_days"]
+        self.mission_duration_ext_days: float   = mis.get("mission_duration_ext_days",
+                                                          mis["mission_duration_days"])
         self.synodic_month_days: float          = mis["synodic_month_days"]
         self.modulation_min: float | None       = mis.get("modulation_min")
         self.sky_frac_modulation: float | None  = mis.get("sky_fraction_meeting_modulation")
         self.trx_frac_of_tsky_max: float | None = mis.get("trx_frac_of_tsky_max")
+
+        # ── Analysis pipeline parameters ───────────────────────────────────
+        ana = raw.get("analysis", {})
+        self.analysis = Analysis(
+            n_eig_modes      = ana.get("n_eig_modes",      4),
+            snr_threshold    = ana.get("snr_threshold",    10.0),
+            tracker_hz       = ana.get("tracker_hz",       1.0),
+            t_accum_s        = ana.get("t_accum_s",        1.0),
+            bytes_per_sample = ana.get("bytes_per_sample", 4),
+            downlink_mbperhr = ana.get("downlink_mbperhr", 60.0),
+            n_substeps       = ana.get("n_substeps",       50),
+            n_windows        = ana.get("n_windows",        20),
+            ref_freq_mhz     = ana.get("ref_freq_mhz",    80.0),
+        )
 
     # ── Convenience bridges ────────────────────────────────────────────────
 

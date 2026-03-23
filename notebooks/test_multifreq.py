@@ -29,22 +29,14 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.spatial.transform import Rotation
-from astropy.coordinates import get_body
-import astropy.units as u
-import healpy
 
 from eigsep_sim.lunar_orbit import OrbiterMission
-from eigsep_sim.sky import SkyModel
-from eigsep_sim.sim import compute_masks_and_beams, compute_beams, simulate_observations
+from eigsep_sim.sim import compute_beams, simulate_observations
 from eigsep_sim.linear_solver import build_design_matrix, normal_solve
 from eigsep_sim.models import T21cmModel
 from eigsep_sim.spectral import gsm_eigenmodes, eigenmode_filter
-from sim_cache import (
-    config_fingerprint,
-    save_setup, try_load_setup,
-    save_multifreq, try_load_multifreq,
-)
+from sim_cache import config_fingerprint, save_multifreq, try_load_multifreq
+from bloom_setup import setup_simulation
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 _YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bloom_config.yaml")
@@ -66,58 +58,17 @@ print(f"t_integration = {cfg.observation.t_integration:.2f} s  "
       f"(duty={cfg.observation.duty_cycle}, n_days={cfg.observation.n_days})")
 print(f"t_snapshot    = {cfg.observation.t_snapshot:.3f} s  "
       f"(attitude limit; ratio {cfg.observation.t_integration/cfg.observation.t_snapshot:.0f}× >> 1 ✓)")
-N_EIG_MODES = 5
+N_EIG_MODES = cfg.analysis.n_eig_modes
 
-# ── Spacecraft attitudes ──────────────────────────────────────────────────────
-if cfg.observation.fixed_spin:
-    phi = np.linspace(0.0, 2.0 * np.pi, cfg.observation.n_obs, endpoint=False)
-    rot_fixed = Rotation.from_rotvec(np.outer(phi, cfg.antenna.l_hat))
-    rots_per_orbit = [rot_fixed for _ in range(cfg.observation.n_orbits)]
-else:
-    rots_per_orbit = [
-        Rotation.random(cfg.observation.n_obs, random_state=42 + o)
-        for o in range(cfg.observation.n_orbits)
-    ]
+# ── Simulation setup (attitudes, sky models, sun pixels, masks — all cached) ──
+rots_per_orbit, orbits_list, obs_times, gsm_maps, T_21_INJ, J_SUN, masks_mf = \
+    setup_simulation(cfg, FREQS_MHZ, FP)
 
-# ── Orbits and time grid ──────────────────────────────────────────────────────
-orbits_list = cfg.observation.make_orbits(rot_spin_vec=(0, 0, 1), spin_period=0.0)
-t_obs_s     = np.linspace(0.0, cfg.observation.n_days * 86400.0, cfg.observation.n_obs, endpoint=False)
-obs_times   = cfg.observation.obs_epoch + t_obs_s * u.s
-
-# ── Sky and signal models ─────────────────────────────────────────────────────
-print("Loading GSM …", flush=True)
-sky_mf   = SkyModel(FREQS_MHZ * 1e6, nside=cfg.observation.nside, srcs=None)
-gsm_maps = np.asarray(sky_mf.map)
-if gsm_maps.ndim == 1:
-    gsm_maps = gsm_maps[:, np.newaxis]
-
-models_21cm  = T21cmModel()
 INJ_MODEL_IDX = 0
-T_21_INJ = models_21cm(FREQS_MHZ * 1e6, model_index=INJ_MODEL_IDX)
 print(f"Injection model {INJ_MODEL_IDX}: peak = {T_21_INJ.min()*1e3:.1f} mK")
 
-# ── Sun positions ─────────────────────────────────────────────────────────────
-print("Querying Sun positions …", flush=True)
-sun_coords = get_body("sun", obs_times)
-sun_gal    = sun_coords.galactic
-l_s, b_s   = sun_gal.l.rad, sun_gal.b.rad
-J_SUN = healpy.vec2pix(cfg.observation.nside,
-                       np.cos(b_s)*np.cos(l_s),
-                       np.cos(b_s)*np.sin(l_s),
-                       np.sin(b_s))
-
-# ── Pre-compute frequency-independent masks (cached) ──────────────────────────
-_cached_setup = try_load_setup(FP)
-if _cached_setup is not None:
-    masks_mf, _ = _cached_setup
-else:
-    print("Computing occultation masks …", flush=True)
-    masks_mf, _, _ = compute_masks_and_beams(
-        orbits_list, obs_times, rots_per_orbit,
-        cfg.antenna.u_body, cfg.antenna.kh(FREQS_MHZ[0]),
-        cfg.observation.nside, verbose=False,
-    )
-    save_setup(masks_mf, J_SUN, FP)
+# Also load the full model set for chi² comparison
+models_21cm = T21cmModel()
 
 # ── GSM eigenmodes ────────────────────────────────────────────────────────────
 modes = gsm_eigenmodes(gsm_maps, N_EIG_MODES)   # includes flat mode

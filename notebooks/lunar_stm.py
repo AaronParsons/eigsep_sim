@@ -13,12 +13,12 @@ configuration in bloom_config.yaml and live simulations.  Three analyses are
 performed beyond the routine multi-frequency inversion:
 
   1. Physical-noise SNR  — run_multifreq(noise_scale=1.0) using the established
-     pipeline (N_EIG_MODES = 4 GSM modes + flat, noiseless FG leakage scan).
+     pipeline (N_EIG_MODES GSM modes + flat; see analysis.n_eig_modes in config).
 
   2. Pointing-error simulation — simulate observations with the TRUE spacecraft
      attitudes, then invert using an A matrix built from orientations perturbed
-     by 1° (the attitude knowledge requirement).  The recovered monopole bias
-     quantifies the sensitivity of science results to pointing knowledge errors.
+     by ATT_ERR_DEG (the attitude knowledge requirement).  The recovered monopole
+     bias quantifies the sensitivity of science results to pointing knowledge errors.
 
   3. All-sky map l_max — single-frequency per-pixel inversion yields per-pixel
      noise variances.  Comparing the resulting noise power spectrum to the GSM
@@ -34,8 +34,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
-from astropy.coordinates import get_body
-import astropy.units as u
 import healpy
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -49,10 +47,10 @@ from eigsep_sim.models import T21cmModel
 from eigsep_sim.spectral import gsm_eigenmodes, eigenmode_filter
 from sim_cache import (
     config_fingerprint,
-    save_setup, try_load_setup,
     save_multifreq, try_load_multifreq,
     save_pointing_error, try_load_pointing_error,
 )
+from bloom_setup import setup_simulation
 
 # ══════════════════════════════════════════════════════════════════════════════
 # A. Configuration & Derived Parameters
@@ -61,69 +59,68 @@ from sim_cache import (
 _YAML = os.path.join(_HERE, "bloom_config.yaml")
 cfg = OrbiterMission(_YAML)
 
-# --- Mission-level parameters ------------------------------------------------
-N_DAYS          = cfg.observation.n_days          # 60-day nominal mission
-N_DAYS_EXT      = 365                             # 1-year extended mission
-N_ORBITS        = cfg.observation.n_orbits        # 2 orbital planes
-N_OBS           = cfg.observation.n_obs           # time samples per orbit
-NSIDE           = cfg.observation.nside           # HEALPix nside = 8
-NPIX            = cfg.observation.npix            # 768 pixels (nside=8)
+# --- Mission-level parameters (all derived from config) ----------------------
+N_DAYS          = cfg.observation.n_days
+N_DAYS_EXT      = cfg.mission_duration_ext_days
+N_ORBITS        = cfg.observation.n_orbits
+N_OBS           = cfg.observation.n_obs
+NSIDE           = cfg.observation.nside
+NPIX            = cfg.observation.npix
 
-FREQ_MIN_MHZ    = cfg.observation.freq_min_mhz   # 55 MHz — primary band low
-FREQ_MAX_MHZ    = cfg.observation.freq_max_mhz   # 115 MHz — primary band high
-NCHAN_SCIENCE   = cfg.observation.nchan_science   # 30 science channels
+FREQ_MIN_MHZ    = cfg.observation.freq_min_mhz
+FREQ_MAX_MHZ    = cfg.observation.freq_max_mhz
+NCHAN_SCIENCE   = cfg.observation.nchan_science
 FREQS_MHZ       = np.linspace(FREQ_MIN_MHZ, FREQ_MAX_MHZ, NCHAN_SCIENCE)
 N_FREQ          = len(FREQS_MHZ)
 
-# Extended band (30–170 MHz)
-EXT_BAND_LOW    = 30.0    # MHz
-EXT_BAND_HIGH   = 170.0   # MHz
-DELTA_NU_MHZ    = cfg.observation.delta_nu / 1e6          # 2 MHz channel width
-NCHAN_EXT       = round((EXT_BAND_HIGH - EXT_BAND_LOW) / DELTA_NU_MHZ)  # 70
+# Extended science / data band
+EXT_BAND_LOW    = cfg.science_band_low_mhz
+EXT_BAND_HIGH   = cfg.science_band_high_mhz
+DELTA_NU_MHZ    = cfg.observation.delta_nu / 1e6
+NCHAN_EXT       = round((EXT_BAND_HIGH - EXT_BAND_LOW) / DELTA_NU_MHZ)
 
-DUTY_CYCLE      = cfg.observation.duty_cycle              # 0.917
-ATT_KNOW_DEG    = cfg.observation.attitude_knowledge_deg  # 1.0 deg
-SPIN_PERIOD_S   = cfg.observation.spin_period_s           # 600 s
+DUTY_CYCLE      = cfg.observation.duty_cycle
+ATT_KNOW_DEG    = cfg.observation.attitude_knowledge_deg
+SPIN_PERIOD_S   = cfg.observation.spin_period_s
 
-T_INTEGRATION   = cfg.observation.t_integration          # 165 s  (sensitivity-scaling; NOT hardware time)
-T_SNAPSHOT      = cfg.observation.t_snapshot             # 1.67 s (time for 1° beam shift at current spin rate)
+T_INTEGRATION   = cfg.observation.t_integration   # sensitivity-scaling; NOT hardware time
+T_SNAPSHOT      = cfg.observation.t_snapshot      # time for ATT_KNOW_DEG beam shift
 
 # Hardware accumulation time per transmitted spectrum
 # Beam rotation during one accumulation (at spin rate 360°/SPIN_PERIOD_S)
-BYTES_PER_SAMPLE   = 4              # float32
-T_ACCUM         = 1.0                  # 1.0 s at 1 Hz; limited by data budget
-THETA_SWEEP_ACCUM_DEG = T_ACCUM * 360.0 / SPIN_PERIOD_S  # 0.6°
+T_ACCUM               = cfg.analysis.t_accum_s
+BYTES_PER_SAMPLE      = cfg.analysis.bytes_per_sample
+THETA_SWEEP_ACCUM_DEG = T_ACCUM * 360.0 / SPIN_PERIOD_S
 
-T_RX_K          = cfg.antenna.t_rx                       # 100 K
-T_REGOLITH      = cfg.observation.t_regolith             # 300 K
-T_SUN           = cfg.observation.t_sun                  # 5000 K
+T_RX_K          = cfg.antenna.t_rx
+T_REGOLITH      = cfg.observation.t_regolith
+T_SUN           = cfg.observation.t_sun
 
-SYNODIC_MONTH   = cfg.synodic_month_days                 # 29.53 days
+SYNODIC_MONTH   = cfg.synodic_month_days
 
-N_EIG_MODES     = 4   # established optimal (FG leakage sweet spot)
-ATT_ERR_DEG     = 1.0  # attitude perturbation for pointing-error simulation
-SNR_THRESHOLD   = 10.0 # detection requirement SNR_combined > SNR_THRESHOLD
+N_EIG_MODES     = cfg.analysis.n_eig_modes       # FG eigenmode filter order (sweet spot)
+ATT_ERR_DEG     = cfg.observation.attitude_knowledge_deg  # pointing-error sim perturbation
+SNR_THRESHOLD   = cfg.analysis.snr_threshold     # detection requirement threshold
 
-# --- Star-tracker readout requirement ------------------------------------------
-TRACKER_HZ      = 1.0  # target star-tracker readout rate [Hz]
-TRACKER_DT_S    = 1.0 / TRACKER_HZ   # readout cadence [s]
+# --- Star-tracker readout requirement -----------------------------------------
+TRACKER_HZ      = cfg.analysis.tracker_hz
+TRACKER_DT_S    = cfg.analysis.tracker_dt_s
 
-# --- Spectral modulation self-calibration (beam_cal_verify.py results) ---------
+# --- Spectral modulation self-calibration (beam_cal_verify.py results) --------
 #   Fixed rotation offset between star-tracker and dipole axes recovered from
 #   in-flight spectral residuals r_f = y_f − A_nom x̂_f.
-#   1,728,000 equations vs 3 unknowns (57,600 rows/freq × 30 science channels).
-SPEC_CAL_CRB_ARCSEC   = 0.039   # CRB 1-σ [arcsec], 30 science channels, physics-noise
-SPEC_CAL_CRB_5CH_ARCSEC = 0.103 # CRB 1-σ [arcsec], 5 channels, realistic noise
-SPEC_CAL_N_FREQ       = NCHAN_SCIENCE  # 30 science channels
+#   N_FREQ × n_rows equations vs 3 unknowns — enormous overdetermination.
+SPEC_CAL_CRB_ARCSEC     = 0.039   # CRB 1-σ [arcsec], NCHAN_SCIENCE channels, physics-noise
+SPEC_CAL_CRB_5CH_ARCSEC = 0.103  # CRB 1-σ [arcsec], 5 channels, realistic noise
+SPEC_CAL_N_FREQ         = NCHAN_SCIENCE
 
 # --- Data-volume budget -------------------------------------------------------
-#   Raw data = 2 dipoles × N_ch_ext × 4 bytes × 1 Hz sample rate × 2 spacecraft
-SAMPLE_RATE_HZ     = 1.0 / T_ACCUM           # 1 Hz accumulation rate
-DATA_RATE_BPS      = (2 * NCHAN_EXT * BYTES_PER_SAMPLE * SAMPLE_RATE_HZ
-                      * N_ORBITS)           # bytes/s, both spacecraft
+#   Raw data = 2 dipoles × N_ch_ext × BYTES_PER_SAMPLE × (1/T_ACCUM) Hz × 2 spacecraft
+SAMPLE_RATE_HZ     = 1.0 / T_ACCUM
+DATA_RATE_BPS      = (2 * NCHAN_EXT * BYTES_PER_SAMPLE * SAMPLE_RATE_HZ * N_ORBITS)
 DATA_MBPERDAY      = DATA_RATE_BPS * 86400 / 1e6
-DOWNLINK_MBPERHR   = 60.0          # X-band downlink per spacecraft (MB/hr)
-DOWNLINK_HRS_DAY   = (1 - DUTY_CYCLE) * 24  # ≈ 2 hr/day contact window
+DOWNLINK_MBPERHR   = cfg.analysis.downlink_mbperhr
+DOWNLINK_HRS_DAY   = (1 - DUTY_CYCLE) * 24        # contact window per day [hr]
 DOWNLINK_MB_DAY    = DOWNLINK_MBPERHR * DOWNLINK_HRS_DAY * N_ORBITS
 DOWNLINK_MARGIN    = DOWNLINK_MB_DAY / DATA_MBPERDAY
 # Fastest allowed T_ACCUM within the downlink budget (full downlink, current format)
@@ -131,7 +128,7 @@ T_ACCUM_MIN_S   = (N_ORBITS * NCHAN_EXT * 2 * BYTES_PER_SAMPLE) / (DOWNLINK_MB_D
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# B. Simulation Setup  (identical to test_multifreq.py)
+# B. Simulation Setup
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _setup(fp):
@@ -140,60 +137,14 @@ def _setup(fp):
     print("BLOOM-21CM STM: simulation setup")
     print("─" * 70)
 
-    # Spacecraft attitudes — deterministic from seed, never cached
-    if cfg.observation.fixed_spin:
-        phi = np.linspace(0.0, 2.0 * np.pi, N_OBS, endpoint=False)
-        rot_fixed = Rotation.from_rotvec(np.outer(phi, cfg.antenna.l_hat))
-        rots = [rot_fixed for _ in range(N_ORBITS)]
-    else:
-        rots = [
-            Rotation.random(N_OBS, random_state=42 + o)
-            for o in range(N_ORBITS)
-        ]
+    rots, orbits_list, obs_times, gsm_maps, T_21_INJ, J_SUN, masks_mf = \
+        setup_simulation(cfg, FREQS_MHZ, fp)
 
-    # Orbits and time grid
-    orbits_list = cfg.observation.make_orbits(rot_spin_vec=(0, 0, 1), spin_period=0.0)
-    t_obs_s     = np.linspace(0.0, N_DAYS * 86400.0, N_OBS, endpoint=False)
-    obs_times   = cfg.observation.obs_epoch + t_obs_s * u.s
-
-    # GSM and 21cm models
-    print("Loading GSM …", flush=True)
-    sky_mf = SkyModel(FREQS_MHZ * 1e6, nside=NSIDE, srcs=None)
-    gsm_maps = np.asarray(sky_mf.map)
-    if gsm_maps.ndim == 1:
-        gsm_maps = gsm_maps[:, np.newaxis]
-
-    models_21cm = T21cmModel()
-    T_21_INJ = models_21cm(FREQS_MHZ * 1e6, model_index=0)
     print(f"  21cm model 0: peak = {T_21_INJ.min()*1e3:.1f} mK  "
           f"rms = {np.std(T_21_INJ)*1e3:.2f} mK")
 
-    # Sun positions
-    print("Querying Sun positions …", flush=True)
-    sun_coords = get_body("sun", obs_times)
-    sun_gal    = sun_coords.galactic
-    l_s, b_s   = sun_gal.l.rad, sun_gal.b.rad
-    J_SUN = healpy.vec2pix(NSIDE,
-                           np.cos(b_s)*np.cos(l_s),
-                           np.cos(b_s)*np.sin(l_s),
-                           np.sin(b_s))
-
-    # Occultation masks — try cache first
-    cached = try_load_setup(fp)
-    if cached is not None:
-        masks_mf, J_SUN_cached = cached
-        # J_SUN is derived from obs_times (deterministic), so use the recomputed one
-    else:
-        print("Computing occultation masks …", flush=True)
-        masks_mf, _, _ = compute_masks_and_beams(
-            orbits_list, obs_times, rots,
-            cfg.antenna.u_body, cfg.antenna.kh(FREQS_MHZ[N_FREQ // 2]),
-            NSIDE, verbose=False,
-        )
-        save_setup(masks_mf, J_SUN, fp)
-
-    print(f"  masks shape = {masks_mf.shape}  "
-          f"(mean open fraction = {masks_mf.mean():.2f})")
+    # Also load the full model set (all T21cm models) for chi² comparison
+    models_21cm = T21cmModel()
 
     return rots, orbits_list, obs_times, gsm_maps, models_21cm, T_21_INJ, J_SUN, masks_mf
 
@@ -586,7 +537,7 @@ if __name__ == "__main__":
     print(f"  chi²/dof model 0 : {chi2_model0:.3f}  (threshold {chi2_thresh:.3f})")
     print(f"  rank model 0     : {rank_model0}/{n_models}")
     print(f"  SNR_combined     : {SNR_60d:.1f}  (60-day nominal)")
-    print(f"  SNR_combined     : {SNR_1yr:.1f}  (1-year extended, ×√(365/60))")
+    print(f"  SNR_combined     : {SNR_1yr:.1f}  ({N_DAYS_EXT}-day extended, ×√({N_DAYS_EXT}/{N_DAYS}))")
 
     # ── E. Pointing-error simulation (Item 11) ────────────────────────────────
     ATT_SEED = 99
@@ -673,7 +624,7 @@ if __name__ == "__main__":
     print(f"  {'Primary science band':<30} {FREQ_MIN_MHZ:.0f}–{FREQ_MAX_MHZ:.0f} MHz")
     print(f"  {'Extended science band':<30} {EXT_BAND_LOW:.0f}–{EXT_BAND_HIGH:.0f} MHz")
     print(f"  {'Nominal mission duration':<30} {N_DAYS} days ({N_DAYS/SYNODIC_MONTH:.1f} synodic months)")
-    print(f"  {'Extended mission duration':<30} {N_DAYS_EXT} days (1 year)")
+    print(f"  {'Extended mission duration':<30} {N_DAYS_EXT} days ({N_DAYS_EXT/365:.1f} years)")
 
     # ─────────────────────────────────────────────────────────────────────────
     _section("SCIENCE GOAL 1 (SG-1): GLOBAL 21CM MONOPOLE DETECTION")
@@ -1023,20 +974,20 @@ if __name__ == "__main__":
          margin=f"{spec_cal_margin:.0f}× margin")
 
     # ─────────────────────────────────────────────────────────────────────────
-    _section("EXTENDED MISSION PROJECTIONS  (60 days → 1 year)")
+    _section(f"EXTENDED MISSION PROJECTIONS  ({N_DAYS} days → {N_DAYS_EXT} days)")
 
     _row("Sensitivity scaling",
          f"σ_noise ∝ 1/√t  →  SNR ∝ √t")
-    _row("Scaling factor (60d → 365d)",
-         f"√(365/60) = {np.sqrt(365/60):.2f}×")
-    _row("SNR_combined (60-day nominal)",
+    _row(f"Scaling factor ({N_DAYS}d → {N_DAYS_EXT}d)",
+         f"√({N_DAYS_EXT}/{N_DAYS}) = {np.sqrt(N_DAYS_EXT/N_DAYS):.2f}×")
+    _row(f"SNR_combined ({N_DAYS}-day nominal)",
          f"{SNR_60d:.1f}",
          margin=f"{SNR_60d/SNR_THRESHOLD:.1f}× above {SNR_THRESHOLD:.0f}σ threshold")
-    _row("SNR_combined (1-year extended)",
+    _row(f"SNR_combined ({N_DAYS_EXT}-day extended)",
          f"{SNR_1yr:.1f}",
          margin=f"{SNR_1yr/SNR_THRESHOLD:.1f}× above {SNR_THRESHOLD:.0f}σ threshold")
-    _row("SIGMA_MONO at 1 year (median)",
-         f"{np.median(SIGMA_MONO)*1e3 / np.sqrt(365/60):.3f} mK",
+    _row(f"SIGMA_MONO at {N_DAYS_EXT} days (median)",
+         f"{np.median(SIGMA_MONO)*1e3 / np.sqrt(N_DAYS_EXT/N_DAYS):.3f} mK",
          note="enables tighter model comparison and higher l_max on sky maps")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1049,18 +1000,18 @@ if __name__ == "__main__":
         "SG-1",
         "SO-1.1: Detect global 21cm absorption trough",
         f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
-        "MR-1.1: 55–115 MHz band",
-        "IR-1.1: Stacer dipole 30–170 MHz",
-        "MiR-1.1: 60-day mission",
-        f"60d SNR = {SNR_60d:.1f}",
+        f"MR-1.1: {FREQ_MIN_MHZ:.0f}–{FREQ_MAX_MHZ:.0f} MHz band",
+        f"IR-1.1: Stacer dipole {EXT_BAND_LOW:.0f}–{EXT_BAND_HIGH:.0f} MHz",
+        f"MiR-1.1: {N_DAYS}-day mission",
+        f"{N_DAYS}d SNR = {SNR_60d:.1f}",
         f"{SNR_60d/SNR_THRESHOLD:.1f}×",
     )
     _stm_row(
         "",
         "",
         f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
-        "MR-1.2: Δν ≤ 2 MHz",
-        "IR-1.2: T_rx < 100 K",
+        f"MR-1.2: Δν ≤ {DELTA_NU_MHZ:.0f} MHz",
+        f"IR-1.2: T_rx < {T_RX_K:.0f} K",
         "MiR-1.2: 2 non-cop. orbits",
         f"Δν = {DELTA_NU_MHZ:.1f} MHz",
         "meets",
@@ -1089,7 +1040,7 @@ if __name__ == "__main__":
         "",
         "",
         f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
-        "MR-1.4: m_min > 0.18",
+        f"MR-1.4: m_min > {cfg.modulation_min:.2f}",
         "",
         "",
         f"m_min = {cfg.modulation_min:.2f}",
@@ -1169,8 +1120,8 @@ if __name__ == "__main__":
     _row("All-sky map l_max (SG-2)",
          f"l_max = {l_max_sci}  (< 10% error on a_lm, sensitivity-limited)",
          note=f"σ_pix = {sigma_pix_K:.2f} K at repr. freq; nside=64 eval w/ pixel-window correction")
-    _row("Extended mission (1 year) SNR",
-         f"SNR_combined = {SNR_1yr:.1f}  (×√(365/60) = {np.sqrt(365/60):.2f}×)")
+    _row(f"Extended mission ({N_DAYS_EXT} days) SNR",
+         f"SNR_combined = {SNR_1yr:.1f}  (×√({N_DAYS_EXT}/{N_DAYS}) = {np.sqrt(N_DAYS_EXT/N_DAYS):.2f}×)")
 
     print()
     print("=" * _W)

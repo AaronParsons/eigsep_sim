@@ -37,19 +37,15 @@ import os
 import sys
 import numpy as np
 from scipy.spatial.transform import Rotation
-from astropy.coordinates import get_body
-import astropy.units as u
-import healpy
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "src"))
 
 from eigsep_sim.lunar_orbit import OrbiterMission
-from eigsep_sim.sky import SkyModel
-from eigsep_sim.sim import compute_masks_and_beams, compute_beams, simulate_observations
+from eigsep_sim.sim import compute_beams, simulate_observations
 from eigsep_sim.linear_solver import build_design_matrix, normal_solve
-from eigsep_sim.models import T21cmModel
-from sim_cache import config_fingerprint, try_load_setup
+from sim_cache import config_fingerprint
+from bloom_setup import setup_simulation, STM_BIAS_PER_DEG_MK, STM_SIGMA_MONO_MK
 
 _YAML = os.path.join(_HERE, "bloom_config.yaml")
 cfg = OrbiterMission(_YAML)
@@ -69,61 +65,18 @@ T_REGOLITH    = cfg.observation.t_regolith
 T_SUN         = cfg.observation.t_sun
 T_INTEGRATION = cfg.observation.t_integration
 
-# STM reference values (from pointing_error_deg1.0_seed99_8812aa07.npz)
-STM_BIAS_PER_DEG_MK = 122.29   # mK bias for 1° systematic offset (eigenmode-filtered)
-STM_SIGMA_MONO_MK   = 1.64     # mK per-channel σ_mono (mean over science band)
-REQ_SYS_DEG         = 0.10 * STM_SIGMA_MONO_MK / STM_BIAS_PER_DEG_MK
-REQ_SYS_ARCSEC      = REQ_SYS_DEG * 3600.0   # ≈ 5 arcsec
+# STM reference values: from bloom_setup (shared with tumbling_beam_verify.py)
+REQ_SYS_DEG    = 0.10 * STM_SIGMA_MONO_MK / STM_BIAS_PER_DEG_MK
+REQ_SYS_ARCSEC = REQ_SYS_DEG * 3600.0
 
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
 
 def _setup():
     """Return nominal attitudes, masks, sky models, and Sun pixels."""
-    if cfg.observation.fixed_spin:
-        phi = np.linspace(0.0, 2.0 * np.pi, N_OBS, endpoint=False)
-        rot_fixed = Rotation.from_rotvec(np.outer(phi, cfg.antenna.l_hat))
-        rots_nom = [rot_fixed for _ in range(N_ORBITS)]
-    else:
-        rots_nom = [
-            Rotation.random(N_OBS, random_state=42 + o)
-            for o in range(N_ORBITS)
-        ]
-
-    orbits_list = cfg.observation.make_orbits(rot_spin_vec=(0, 0, 1), spin_period=0.0)
-    t_obs_s     = np.linspace(0.0, N_DAYS * 86400.0, N_OBS, endpoint=False)
-    obs_times   = cfg.observation.obs_epoch + t_obs_s * u.s
-
-    print("Loading GSM …", flush=True)
-    sky_mf   = SkyModel(FREQS_MHZ * 1e6, nside=NSIDE, srcs=None)
-    gsm_maps = np.asarray(sky_mf.map)          # (npix, N_FREQ)
-    if gsm_maps.ndim == 1:
-        gsm_maps = gsm_maps[:, np.newaxis]
-
-    models_21cm = T21cmModel()
-    T_21_INJ = models_21cm(FREQS_MHZ * 1e6, model_index=0)
-
-    print("Querying Sun positions …", flush=True)
-    sun_coords = get_body("sun", obs_times)
-    sun_gal    = sun_coords.galactic
-    l_s, b_s   = sun_gal.l.rad, sun_gal.b.rad
-    J_SUN = healpy.vec2pix(NSIDE,
-                           np.cos(b_s) * np.cos(l_s),
-                           np.cos(b_s) * np.sin(l_s),
-                           np.sin(b_s))
-
-    fp     = config_fingerprint(cfg)
-    cached = try_load_setup(fp)
-    if cached is not None:
-        masks, _ = cached
-    else:
-        print("Computing occultation masks (not in cache) …", flush=True)
-        masks, _, _ = compute_masks_and_beams(
-            orbits_list, obs_times, rots_nom,
-            cfg.antenna.u_body, cfg.antenna.kh(FREQS_MHZ[N_FREQ // 2]),
-            NSIDE, verbose=False,
-        )
-
+    fp = config_fingerprint(cfg)
+    rots_nom, _, _, gsm_maps, T_21_INJ, J_SUN, masks = \
+        setup_simulation(cfg, FREQS_MHZ, fp)
     print(f"  n_total = {masks.shape[0]},  npix = {masks.shape[1]},  "
           f"n_rows/freq = {masks.shape[0] * 2}")
     return rots_nom, masks, gsm_maps, T_21_INJ, J_SUN

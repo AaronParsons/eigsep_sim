@@ -50,10 +50,22 @@ observation:
 mission:
   spin_rate_rpm: 0.5                # body rotation rate (RPM)
   eff_geom_rate_deg_s: 0.15        # effective beam / Moon / sky angular rate (deg/s)
-  science_band_low_mhz: 30.0       # low edge of science analysis band (MHz)
-  science_band_high_mhz: 200.0     # high edge of science analysis band (MHz)
-  mission_duration_days: 60        # total mission span for requirements checks (days)
+  science_band_low_mhz: 30.0       # low edge of extended science / data band (MHz)
+  science_band_high_mhz: 170.0     # high edge of extended science / data band (MHz)
+  mission_duration_days: 60        # nominal mission span for requirements checks (days)
+  mission_duration_ext_days: 365   # extended mission duration (days; 1 year)
   synodic_month_days: 29.53        # synodic lunar month (days)
   modulation_min: 0.18             # minimum sky modulation fraction over campaign
   sky_fraction_meeting_modulation: 0.95
   trx_frac_of_tsky_max: 0.30       # T_rx / <T_sky> over science band
+
+analysis:
+  n_eig_modes: 4           # GSM eigenmode filter order (FG leakage sweet spot)
+  snr_threshold: 10.0      # detection requirement: SNR_combined must exceed this value
+  tracker_hz: 1.0          # star-tracker readout rate [Hz]
+  t_accum_s: 1.0           # hardware accumulation time per transmitted spectrum [s]
+  bytes_per_sample: 4      # bytes per sample (float32)
+  downlink_mbperhr: 60.0   # X-band downlink capacity per spacecraft [MB/hr]
+  n_substeps: 50           # ODE sub-steps per T_ACCUM window (tumbling trajectory model)
+  n_windows: 20            # T_ACCUM windows sampled for statistics (trajectory model)
+  ref_freq_mhz: 80.0       # representative science frequency for single-freq analyses [MHz]

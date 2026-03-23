@@ -15,24 +15,23 @@ Pipeline stages
 Physical model
 --------------
 Torque-free rigid-body rotation (Euler equations).  L is conserved between
-comms passes.  For each T_ACCUM = 1s window, we estimate the local attitude
+comms passes.  For each T_ACCUM window, we estimate the local attitude
 by (i) finding the nearest star-tracker reading and (ii) propagating forward
 ≤ T_DT/2 seconds using L_fit.  This avoids the full-day L-drift problem while
 correctly capturing the single-reading noise as the dominant error.
 
 Science requirement derivation
 ------------------------------
-Two distinct error budgets from the STM pointing-error simulation:
+Two distinct error budgets from the STM pointing-error simulation (see
+bloom_setup.STM_BIAS_PER_DEG_MK and STM_SIGMA_MONO_MK for the scaling values):
 
   RANDOM noise (star-tracker readout noise, independent between readings):
-  • 1° systematic error → 122 mK bias  (= 74.4× σ_mono)
+  • 1° systematic error → STM_BIAS_PER_DEG_MK mK bias  (= BIAS_PER_DEG_SIGMA× σ_mono)
   • For N_readings independent readings, random errors average down: bias ∝ 1/sqrt(N_readings)
-  • Required:  σ_tracker × 122 mK / sqrt(N_readings/day × N_DAYS) < REQ_BIAS_SIGMA × σ_mono
-  • At 60s cadence:  σ_tracker < 0.39°;   at 1s cadence:  σ_tracker < 3.1°
+  • Required:  σ_tracker × STM_BIAS_PER_DEG_MK / sqrt(N_readings/day × N_DAYS) < REQ_BIAS_SIGMA × σ_mono
 
   SYSTEMATIC bias (absolute calibration, boresight alignment — does NOT average down):
-  • Required:  δ_sys < REQ_BIAS_SIGMA × σ_mono / 122 mK = 0.00134° = 0.08 arcmin
-  • For bias < 1× σ_mono:  δ_sys < 0.81 arcmin (original STM requirement)
+  • Required:  δ_sys < REQ_SYS_DEG  (= REQ_BIAS_SIGMA × STM_SIGMA_MONO_MK / STM_BIAS_PER_DEG_MK)
 
 Usage
 -----
@@ -52,43 +51,38 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, '..', 'src'))
 
 from eigsep_sim.lunar_orbit import OrbiterMission
-from eigsep_sim.sky import SkyModel
 from eigsep_sim.sim import compute_beams
+from bloom_setup import STM_BIAS_PER_DEG_MK, STM_SIGMA_MONO_MK
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 _YAML   = os.path.join(_HERE, 'bloom_config.yaml')
 cfg     = OrbiterMission(_YAML)
-I_DIAG  = np.diag(cfg.antenna.inertia)   # [3.0, 3.0, 6.0] kg m²
+I_DIAG  = np.diag(cfg.antenna.inertia)
 
 SPIN_PERIOD_S    = float(cfg.observation.spin_period_s)
 OMEGA_SPIN       = 2.0 * np.pi / SPIN_PERIOD_S
-T_ACCUM_S        = 1.0        # hardware accumulation time per spectrum (s)
-THETA_SWEEP_DEG  = T_ACCUM_S * 360.0 / SPIN_PERIOD_S   # 0.6° per accumulation
+T_ACCUM_S        = cfg.analysis.t_accum_s
+THETA_SWEEP_DEG  = T_ACCUM_S * 360.0 / SPIN_PERIOD_S
 DAY_S            = 86400.0
-N_DAYS           = int(cfg.observation.n_days)           # 60 mission days
-N_SUBSTEPS       = 50         # sub-steps within T_ACCUM for beam integral
-N_WINDOWS        = 20         # T_ACCUM windows sampled for statistics
-FREQ_MHZ         = 80.0       # representative science frequency
+N_DAYS           = int(cfg.observation.n_days)
+N_SUBSTEPS       = cfg.analysis.n_substeps
+N_WINDOWS        = cfg.analysis.n_windows
+FREQ_MHZ         = cfg.analysis.ref_freq_mhz
 NSIDE            = cfg.observation.nside
 NPIX             = healpy.nside2npix(NSIDE)
 
 # ── STM-derived bias scaling ───────────────────────────────────────────────────
-# From the STM pointing-error simulation (see lunar_stm.py):
-#   1° systematic offset in all observations → 122 mK bias after eigenmode filter
-#   σ_noise (per channel, 60-day) ≈ 20.9 mK at 80 MHz (physical noise run)
-# These values are hard-coded here to be self-contained.
-STM_BIAS_PER_DEG_MK   = 122.29   # mK bias for 1° systematic pointing error (eigenmode-filtered)
-STM_SIGMA_MONO_MK     = 1.64     # mK per-channel SIGMA_MONO (mean over science band, 60-day)
-                                  # Note: SIGMA_MONO is noise on sky monopole from inversion,
-                                  # NOT per-pixel radiometric noise (~20 mK per pixel).
-                                  # SIGMA_MONO = 1.64 mK  →  bias/sigma = 122.29/1.64 ≈ 74.4×
-BIAS_PER_DEG_SIGMA    = STM_BIAS_PER_DEG_MK / STM_SIGMA_MONO_MK   # ≈ 74×
+# From the STM pointing-error simulation (see lunar_stm.py and bloom_setup.py):
+#   STM_BIAS_PER_DEG_MK: mK bias for 1° systematic pointing error (eigenmode-filtered)
+#   STM_SIGMA_MONO_MK:   mK SIGMA_MONO mean over science band (noise on monopole,
+#                        NOT per-pixel radiometric noise)
+BIAS_PER_DEG_SIGMA    = STM_BIAS_PER_DEG_MK / STM_SIGMA_MONO_MK
 
 # Science requirement: bias < REQ_BIAS_SIGMA × σ_mono in the monopole channel
 REQ_BIAS_SIGMA        = 0.10     # 10% of σ_mono budget for pointing-induced bias
 
 # Systematic calibration requirement (fixed boresight / calibration error, no averaging):
-#   bias_sys = STM_BIAS_PER_DEG × δ_sys  →  δ_sys < REQ_BIAS_SIGMA × σ_mono / 122 mK
+#   bias_sys = STM_BIAS_PER_DEG × δ_sys  →  δ_sys < REQ_BIAS_SIGMA × σ_mono / STM_BIAS_PER_DEG_MK
 REQ_SYS_DEG           = REQ_BIAS_SIGMA * STM_SIGMA_MONO_MK / STM_BIAS_PER_DEG_MK
 
 # Random noise requirement (per-reading noise, averages as 1/sqrt(N_readings_total)):
