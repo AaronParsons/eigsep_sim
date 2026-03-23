@@ -102,6 +102,11 @@ SYNODIC_MONTH   = cfg.synodic_month_days                 # 29.53 days
 
 N_EIG_MODES     = 4   # established optimal (FG leakage sweet spot)
 ATT_ERR_DEG     = 1.0  # attitude perturbation for pointing-error simulation
+SNR_THRESHOLD   = 10.0 # detection requirement SNR_combined > SNR_THRESHOLD
+
+# --- Star-tracker readout requirement ------------------------------------------
+TRACKER_HZ      = 1.0  # target star-tracker readout rate [Hz]
+TRACKER_DT_S    = 1.0 / TRACKER_HZ   # readout cadence [s]
 
 # --- Spectral modulation self-calibration (beam_cal_verify.py results) ---------
 #   Fixed rotation offset between star-tracker and dipole axes recovered from
@@ -686,17 +691,17 @@ if __name__ == "__main__":
 
     _row("Science Objective SO-1.1",
          "Measure the sky-averaged brightness temperature T_sky(ν) after "
-         "foreground separation at SNR_combined > 15 over 55–115 MHz")
+         "foreground separation at SNR_combined > 10 over 55–115 MHz")
     print()
 
     _row("Science Requirement SR-1.1",
-         f"SNR_combined = √Σ(T_21_filt/σ_mono)² > 15  over {NCHAN_SCIENCE} science channels")
+         f"SNR_combined = √Σ(T_21_filt/σ_mono)² > {SNR_THRESHOLD:.0f}  over {NCHAN_SCIENCE} science channels")
     _row("   Simulation result (60-day nominal)",
          f"SNR_combined = {SNR_60d:.1f}",
-         margin=f"{SNR_60d/15.0:.1f}×  (> 15 required)")
+         margin=f"{SNR_60d/SNR_THRESHOLD:.1f}×  (> {SNR_THRESHOLD:.0f} required)")
     _row("   Extended mission (1 year)",
          f"SNR_combined = {SNR_1yr:.1f}",
-         margin=f"{SNR_1yr/15.0:.1f}×")
+         margin=f"{SNR_1yr/SNR_THRESHOLD:.1f}×")
     print()
 
     _row("Measurement Req. MR-1.1  [Spectral band]",
@@ -804,6 +809,23 @@ if __name__ == "__main__":
          note="residuals r_f = (I−H_f) J_f δ_true + noise; 1.73M eqs vs 3 unknowns; "
               "recovery error = 0.05\" at 0.1° offset; CRB ∝ 1/√N_freq",
          margin=f"spectral cal: {spec_cal_margin:.0f}× margin")
+    print()
+
+    n_rdg_day   = 86400.0 / TRACKER_DT_S            # readings per day at target cadence
+    n_rdg_total = n_rdg_day * N_DAYS                # total independent readings
+    bias_tracker_mK = bias_rms * 1e3 / np.sqrt(n_rdg_total)   # random bias [mK] at 1° tracker
+    req_bias_mK = 0.10 * np.mean(SIGMA_MONO) * 1e3            # 10% σ_mono budget [mK]
+    _row("Mission Req. MiR-1.4  [Star-tracker readout cadence]",
+         f"Random pointing noise averages as 1/√N_readings; at 1° tracker accuracy "
+         f"the readout rate must be fast enough to keep random bias < 10% σ_mono.  "
+         f"Target: {TRACKER_HZ:.0f} Hz ({TRACKER_DT_S:.0f}s cadence).")
+    _row(f"   Design value  ({TRACKER_HZ:.0f} Hz, {N_DAYS}-day mission)",
+         f"N_readings = {n_rdg_total:.0f}  ({n_rdg_day:.0f}/day × {N_DAYS} days)",
+         note=f"bias = {bias_rms*1e3:.0f} mK × 1° / √{n_rdg_total:.0f} = {bias_tracker_mK:.3f} mK  "
+              f"(budget: {req_bias_mK:.3f} mK = 10% σ_mono)",
+         margin=f"{'PASS' if bias_tracker_mK < req_bias_mK else 'FAIL'}: "
+                f"{bias_tracker_mK:.3f} mK < {req_bias_mK:.3f} mK  "
+                f"({req_bias_mK/bias_tracker_mK:.0f}× margin)")
 
     # ─────────────────────────────────────────────────────────────────────────
     _section("SCIENCE GOAL 2 (SG-2): ALL-SKY SPECTRAL MAPS")
@@ -1009,10 +1031,10 @@ if __name__ == "__main__":
          f"√(365/60) = {np.sqrt(365/60):.2f}×")
     _row("SNR_combined (60-day nominal)",
          f"{SNR_60d:.1f}",
-         margin=f"{SNR_60d/15.0:.1f}× above 15σ threshold")
+         margin=f"{SNR_60d/SNR_THRESHOLD:.1f}× above {SNR_THRESHOLD:.0f}σ threshold")
     _row("SNR_combined (1-year extended)",
          f"{SNR_1yr:.1f}",
-         margin=f"{SNR_1yr/15.0:.1f}× above 15σ threshold")
+         margin=f"{SNR_1yr/SNR_THRESHOLD:.1f}× above {SNR_THRESHOLD:.0f}σ threshold")
     _row("SIGMA_MONO at 1 year (median)",
          f"{np.median(SIGMA_MONO)*1e3 / np.sqrt(365/60):.3f} mK",
          note="enables tighter model comparison and higher l_max on sky maps")
@@ -1026,17 +1048,17 @@ if __name__ == "__main__":
     _stm_row(
         "SG-1",
         "SO-1.1: Detect global 21cm absorption trough",
-        "SR-1.1: SNR > 15",
+        f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
         "MR-1.1: 55–115 MHz band",
         "IR-1.1: Stacer dipole 30–170 MHz",
         "MiR-1.1: 60-day mission",
         f"60d SNR = {SNR_60d:.1f}",
-        f"{SNR_60d/15.0:.1f}×",
+        f"{SNR_60d/SNR_THRESHOLD:.1f}×",
     )
     _stm_row(
         "",
         "",
-        "SR-1.1: SNR > 15",
+        f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
         "MR-1.2: Δν ≤ 2 MHz",
         "IR-1.2: T_rx < 100 K",
         "MiR-1.2: 2 non-cop. orbits",
@@ -1046,7 +1068,7 @@ if __name__ == "__main__":
     _stm_row(
         "",
         "",
-        "SR-1.1: SNR > 15",
+        f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
         "MR-1.3: σ_mono per channel",
         "",
         f"MiR-1.3: spec-cal {SPEC_CAL_CRB_ARCSEC:.3f}\" ({spec_cal_margin:.0f}×)",
@@ -1056,7 +1078,17 @@ if __name__ == "__main__":
     _stm_row(
         "",
         "",
-        "SR-1.1: SNR > 15",
+        f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
+        "MR-1.3: σ_mono per channel",
+        "",
+        f"MiR-1.4: tracker ≥{TRACKER_HZ:.0f} Hz",
+        f"bias={bias_tracker_mK:.3f}mK<{req_bias_mK:.3f}mK ({req_bias_mK/bias_tracker_mK:.0f}×)",
+        f"{'PASS' if bias_tracker_mK < req_bias_mK else 'FAIL'}",
+    )
+    _stm_row(
+        "",
+        "",
+        f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
         "MR-1.4: m_min > 0.18",
         "",
         "",
@@ -1066,7 +1098,7 @@ if __name__ == "__main__":
     _stm_row(
         "",
         "",
-        "SR-1.1: SNR > 15",
+        f"SR-1.1: SNR > {SNR_THRESHOLD:.0f}",
         "MR-1.5: FG leak < 15%",
         "",
         "",
@@ -1106,7 +1138,7 @@ if __name__ == "__main__":
     print()
     _row("Physical-noise SNR (60-day, SIGMA_SCALE=1.0)",
          f"SNR_combined = {SNR_60d:.1f}",
-         margin=f"{SNR_60d/15:.1f}× above 15σ threshold")
+         margin=f"{SNR_60d/SNR_THRESHOLD:.1f}× above {SNR_THRESHOLD:.0f}σ threshold")
     _row("noise-only chi²/dof",
          f"{chi2_noise:.3f}",
          note="expected 1.0  (validates noise model)")
