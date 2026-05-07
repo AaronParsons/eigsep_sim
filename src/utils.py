@@ -2,7 +2,7 @@ import numpy as np
 import eigsep_terrain.reflectivity as etr
 
 from .coord import rot_m
-from .const import R_MOON
+from .const import R_MOON, h, c, k_B, eta_0, pi
 
 
 def moon_surface_distance(angle, d, r=R_MOON):
@@ -45,3 +45,22 @@ def sample_disk(pos, r_ang, nsamples):
     rot_angle = np.arccos(np.dot(z, pos))
     _rot_m = rot_m(rot_angle, rot_axis)
     return _rot_m @ samples
+
+def k_to_v_per_m_root_hz(temp_k, freq_hz):
+    """
+    Convert Brightness Temperature (K) to Spectral Field Strength (V/m/sqrt(Hz)).
+    
+    Parameters:
+    temp_k (float): Brightness temperature in Kelvin
+    freq_hz (float or np.array): Frequency in Hertz
+    
+    Returns:
+    float or np.array: Field strength in volts per meter per root Hz
+    """
+    #exponent = (h * freq_hz) / (k_B * temp_k)
+    #radiance = (2 * h * freq_hz**3) / (c**2 * (np.exp(exponent) - 1))
+    lam = c / freq_hz
+    radiance = 2 * k_B * temp_k / lam**2
+    flux_density = 4 * pi * radiance 
+    field_v_m_root_hz = np.sqrt(flux_density * eta_0)
+    return field_v_m_root_hz

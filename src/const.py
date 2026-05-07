@@ -17,7 +17,7 @@ h = const.h.value                 # Planck constant [J s]
 e = const.e.value                 # elementary charge [C]
 m_e = const.m_e.value             # electron mass [kg]
 m_p = const.m_p.value             # proton mass [kg]
-k = const.k_B.value               # Boltzmann constant [J / K]
+k_B = const.k_B.value             # Boltzmann constant [J / K]
 sigma_sb = const.sigma_sb.value   # Stefan-Boltzmann constant [W / m^2 / K^4]
 
 # Astronomical quantities
@@ -33,6 +33,7 @@ sidereal_day = u.sday.to(u.s)     # seconds in a sidereal day
 
 # Derived quantities
 len_ns = c * 1e-9                 # length of a nanosecond in meters
+eta_0 = 376.73                    # Impedance of free space (Ohms)
 deg = np.pi / 180.0               # degrees in radians
 sq_deg = deg ** 2                 # square degree in steradians
 arcmin = deg / 60.0               # arcminute in radians
@@ -60,7 +61,7 @@ def description():
         "e": "Elementary charge [C]",
         "m_e": "Electron mass [kg]",
         "m_p": "Proton mass [kg]",
-        "k": "Boltzmann constant [J/K]",
+        "k_B": "Boltzmann constant [J/K]",
         "sigma_sb": "Stefan-Boltzmann constant [W m^-2 K^-4]",
         "au": "meters in 1 AU",
         "r_sun": "radius of sun [m]",
@@ -70,6 +71,7 @@ def description():
         "s_per_yr": "seconds in a Julian year",
         "sidereal_day": "seconds in a sidereal day",
         "len_ns": "length of a nanosecond in meters",
+        "eta_0": "Impedance of free space (Ohms)",
         "deg": "degrees in radians",
         "sq_deg": "square degree in steradians",
         "arcmin": "arcminute in radians",
