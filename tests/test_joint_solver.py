@@ -13,18 +13,41 @@ import os
 import sys
 import numpy as np
 import healpy
+import pytest
+from scipy.spatial.transform import Rotation
 
-from eigsep_sim.lunar_orbit import OrbiterMission
 from eigsep_sim.spectral import beam_spectral_basis
 from eigsep_sim.joint_solver import AndersonAccelerator, build_A_from_model
 
-# For BLOOM-21cm config (if needed for tests)
+# For BLOOM-21cm config (if available)
 _YAML = os.path.join(os.path.dirname(__file__), "..", "bloom21cm", "src", "bloom_config.yaml")
+
+
+class MockOrbiterMission:
+    """Minimal mock config for testing without bloom21cm dependency."""
+    class Antenna:
+        u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])  # (2, 3) two orthogonal dipoles
+        def kh(self, freq_mhz):
+            # Thin dipole: kh ≈ π * freq_hz / c
+            c = 3e8
+            freq_hz = freq_mhz * 1e6
+            kh_nominal = np.pi * freq_hz / c
+            return np.array([kh_nominal, 0.75 * kh_nominal])  # (2,) per dipole
+    antenna = Antenna()
+
+
+def _get_cfg():
+    """Load config from BLOOM-21cm if available, else use mock."""
+    if os.path.exists(_YAML):
+        from eigsep_sim.lunar_orbit import OrbiterMission
+        return OrbiterMission(_YAML)
+    else:
+        return MockOrbiterMission()
 
 
 def test_spectral_basis():
     """Test that spectral basis computation works and produces reasonable modes."""
-    cfg = OrbiterMission(_YAML)
+    cfg = _get_cfg()
     freqs_mhz = np.array([50, 80, 110])
 
     basis = beam_spectral_basis(cfg, freqs_mhz, K=3, nside_beam=8)
@@ -71,7 +94,7 @@ def test_anderson_accelerator():
 
 def test_build_A_from_model():
     """Test that A-matrix construction works with HEALPix beam model."""
-    cfg = OrbiterMission(_YAML)
+    cfg = _get_cfg()
     freqs_mhz = np.array([50, 80])
     npix_sky = 8
 
