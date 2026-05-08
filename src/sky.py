@@ -13,7 +13,7 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord
 
 from .basis import SkyBasis
-from .const import c as C, k_B, Jy
+from .const import c as C, k_B, Jy, DTYPE_R_NPY
 
 
 class Sky:

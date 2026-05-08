@@ -19,6 +19,7 @@ from functools import partial
 import healpy
 
 from .healpix import interpolate_map, float_dtype
+from .const import DTYPE_R_NPY, DTYPE_R_JAX
 from .beam import Beam
 from .sky import Sky
 from .observer import Observer
@@ -119,7 +120,7 @@ class ForwardModel:
 
         # Cache static galactic coordinates
         self._crds_gal = np.array(
-            healpy.pix2vec(sky.nside, np.arange(sky.npix)), dtype=np.float32
+            healpy.pix2vec(sky.nside, np.arange(sky.npix)), dtype=DTYPE_R_NPY
         )  # (3, npix_sky)
 
         # Static JAX arrays (created on demand)
@@ -130,11 +131,11 @@ class ForwardModel:
     def _ensure_jax_arrays(self):
         """Convert and cache basis matrices as JAX arrays."""
         if self._beam_basis_A_jax is None:
-            self._beam_basis_A_jax = jnp.asarray(self.beam.basis.A, dtype=float_dtype)
+            self._beam_basis_A_jax = jnp.asarray(self.beam.basis.A, dtype=DTYPE_R_JAX)
         if self._sky_basis_A_jax is None:
-            self._sky_basis_A_jax = jnp.asarray(self.sky.basis.A, dtype=float_dtype)
+            self._sky_basis_A_jax = jnp.asarray(self.sky.basis.A, dtype=DTYPE_R_JAX)
         if self._crds_gal_jax is None:
-            self._crds_gal_jax = jnp.asarray(self._crds_gal, dtype=float_dtype)
+            self._crds_gal_jax = jnp.asarray(self._crds_gal, dtype=DTYPE_R_JAX)
 
     def precompute_geometry(self, times):
         """
@@ -242,8 +243,8 @@ class ForwardModel:
         nfreq = len(self.sky.freqs_hz)
 
         # Convert coefficients to JAX
-        sky_coeffs_jax = jnp.asarray(sky_coeffs, dtype=float_dtype)
-        beam_coeffs_jax = jnp.asarray(beam_coeffs, dtype=float_dtype)
+        sky_coeffs_jax = jnp.asarray(sky_coeffs, dtype=DTYPE_R_JAX)
+        beam_coeffs_jax = jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
 
         # Reconstruct sky: (npix_sky, nfreq)
         sky_recon_jax = jnp.matmul(sky_coeffs_jax, self._sky_basis_A_jax.T)
@@ -251,8 +252,8 @@ class ForwardModel:
         antenna_temp_list = []
         for ti in range(ntimes):
             # Apply mask and ground temperature
-            mask = jnp.asarray(geom['masks'][ti], dtype=float_dtype)
-            crds_top = jnp.asarray(geom['crds_top'][ti], dtype=float_dtype)
+            mask = jnp.asarray(geom['masks'][ti], dtype=DTYPE_R_JAX)
+            crds_top = jnp.asarray(geom['crds_top'][ti], dtype=DTYPE_R_JAX)
             sky_masked_jax = sky_recon_jax * mask[:, None] + T_gnd * (1.0 - mask[:, None])
 
             # Process each dipole
@@ -267,7 +268,7 @@ class ForwardModel:
                     beam_recon_jax,
                     sky_masked_jax,
                     crds_top,
-                    jnp.eye(3, dtype=float_dtype)[None, :, :],  # Identity rotation
+                    jnp.eye(3, dtype=DTYPE_R_JAX)[None, :, :],  # Identity rotation
                     npix_sky=self.sky.npix
                 )
                 dipole_temps.append(num[0] / den[0])

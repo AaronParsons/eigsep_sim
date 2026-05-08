@@ -8,6 +8,11 @@ See description() for a dictionary of constants and their descriptions.
 import numpy as np
 from astropy import constants as const
 from astropy import units as u
+import jax.numpy as jnp
+
+# Data types — use float32 throughout for memory efficiency
+DTYPE_R_NPY = np.float32  # NumPy dtype for real arrays
+DTYPE_R_JAX = jnp.float32  # JAX dtype for real arrays
 
 # Fundamental constants (SI)
 pi = np.pi

@@ -12,6 +12,8 @@ import healpy
 from scipy.interpolate import interp1d
 from abc import ABC, abstractmethod
 
+from .const import DTYPE_R_NPY
+
 try:
     import pygdsm
     HAS_GSM = True
@@ -45,13 +47,13 @@ class _SpectralBasis(ABC):
 
     def __init__(self, A, freqs_hz=None, svd_mean=None, svd_modes=None,
                  svd_svals=None, n_samples=None):
-        self.A = np.asarray(A, dtype=np.float32)
+        self.A = np.asarray(A, dtype=DTYPE_R_NPY)
         if self.A.ndim != 2:
             raise ValueError(f"A must be 2-D, got shape {self.A.shape}")
         self.freqs_hz = np.asarray(freqs_hz, dtype=np.float64) if freqs_hz is not None else None
-        self.svd_mean = np.asarray(svd_mean, dtype=np.float32) if svd_mean is not None else None
-        self.svd_modes = np.asarray(svd_modes, dtype=np.float32) if svd_modes is not None else None
-        self.svd_svals = np.asarray(svd_svals, dtype=np.float32) if svd_svals is not None else None
+        self.svd_mean = np.asarray(svd_mean, dtype=DTYPE_R_NPY) if svd_mean is not None else None
+        self.svd_modes = np.asarray(svd_modes, dtype=DTYPE_R_NPY) if svd_modes is not None else None
+        self.svd_svals = np.asarray(svd_svals, dtype=DTYPE_R_NPY) if svd_svals is not None else None
         self.n_samples = n_samples
 
     @property
@@ -175,7 +177,7 @@ class _SpectralBasis(ABC):
             Basis object with A, SVD metadata, and ensemble statistics.
         """
         freqs = np.asarray(freqs, dtype=np.float64)
-        spectra = np.asarray(spectra, dtype=np.float32)
+        spectra = np.asarray(spectra, dtype=DTYPE_R_NPY)
         n_samples = spectra.shape[0]
 
         # Center the data
@@ -231,12 +233,12 @@ class BeamBasis(_SpectralBasis):
         from .const import c as C_LIGHT
 
         freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
-        arm_length_m = np.atleast_1d(np.asarray(arm_length_m, dtype=np.float32))
+        arm_length_m = np.atleast_1d(np.asarray(arm_length_m, dtype=DTYPE_R_NPY))
         if arm_length_m.size == 1:
             arm_length_m = np.repeat(arm_length_m, 2)
 
         if u_body is None:
-            u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+            u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=DTYPE_R_NPY)
 
         # Compute cos(θ) for all beam pixels
         npix = healpy.nside2npix(nside)
@@ -244,7 +246,7 @@ class BeamBasis(_SpectralBasis):
         cos_theta = u_body @ N_GAL  # (2, npix)
 
         # Evaluate thin-dipole beam at all frequencies
-        nominal_beam = np.zeros((2, npix, len(freqs_hz)), dtype=np.float32)
+        nominal_beam = np.zeros((2, npix, len(freqs_hz)), dtype=DTYPE_R_NPY)
         for f_idx, f_hz in enumerate(freqs_hz):
             kh_f = arm_length_m * np.pi * f_hz / C_LIGHT
             nominal_beam[:, :, f_idx] = thin_dipole_pattern(kh_f[:, np.newaxis], cos_theta)
@@ -312,7 +314,7 @@ class SkyBasis(_SpectralBasis):
         # Optionally add flat mode
         if include_flat:
             nfreq = len(freqs_hz)
-            flat = np.ones(nfreq, dtype=np.float32) / np.sqrt(nfreq)
+            flat = np.ones(nfreq, dtype=DTYPE_R_NPY) / np.sqrt(nfreq)
             # Orthogonalize against GSM modes
             flat_orth = flat - modes @ (modes.T @ flat)
             norm = np.linalg.norm(flat_orth)
@@ -341,7 +343,7 @@ def _resample_basis(old_freqs, A_old, new_freqs):
         Resampled basis matrix.
     """
     nmodes = A_old.shape[1]
-    A_new = np.zeros((len(new_freqs), nmodes), dtype=np.float32)
+    A_new = np.zeros((len(new_freqs), nmodes), dtype=DTYPE_R_NPY)
     for m in range(nmodes):
         interp = interp1d(old_freqs, A_old[:, m], kind='linear',
                          bounds_error=False, fill_value=0.0)

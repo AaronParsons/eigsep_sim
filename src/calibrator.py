@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 from typing import Optional, Dict
 
+from .const import DTYPE_R_NPY, DTYPE_R_JAX
 from .simulate import ForwardModel
 from .linear_solver import normal_solve
 
@@ -161,11 +162,11 @@ class Calibrator:
             Sky regularization.
         """
         self.fwd = fwd
-        self._data = np.asarray(data, dtype=np.float32)
+        self._data = np.asarray(data, dtype=DTYPE_R_NPY)
         self._inv_noise_var = (
-            np.asarray(inv_noise_var, dtype=np.float32)
+            np.asarray(inv_noise_var, dtype=DTYPE_R_NPY)
             if inv_noise_var is not None
-            else np.ones_like(data, dtype=np.float32)
+            else np.ones_like(data, dtype=DTYPE_R_NPY)
         )
         self._lam_beam = float(lam_beam)
         self._lam_sky = float(lam_sky)
@@ -198,10 +199,10 @@ class Calibrator:
         """
         sky_npix = self.fwd.sky.npix
         sky_nmodes = self.fwd.sky.nmodes
-        beam_coeffs = self.fwd.beam.coeffs.astype(np.float32)
+        beam_coeffs = self.fwd.beam.coeffs.astype(DTYPE_R_NPY)
 
         params = {
-            'sky_coeffs': np.zeros((sky_npix, sky_nmodes), dtype=np.float32),
+            'sky_coeffs': np.zeros((sky_npix, sky_nmodes), dtype=DTYPE_R_NPY),
             'beam_coeffs': beam_coeffs.copy(),
         }
 

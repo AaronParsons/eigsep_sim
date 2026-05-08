@@ -19,11 +19,9 @@ import healpy
 import numpy as np
 from scipy.interpolate import interp1d
 
-from .const import c as C_LIGHT
+from .const import c as C_LIGHT, DTYPE_R_NPY
 
 BEAM_NPZ = os.path.join(os.path.dirname(__file__), "data", "eigsep_bowtie_v000.npz")
-
-_real_dtype = np.float32
 
 
 def load_beam_file(freqs, filename=BEAM_NPZ):
@@ -46,10 +44,10 @@ def load_beam_file(freqs, filename=BEAM_NPZ):
     mdl_interp = interp1d(
         npz["freqs"], bm, kind="cubic", fill_value=0, bounds_error=False
     )
-    return mdl_interp(freqs).astype(_real_dtype)
+    return mdl_interp(freqs).astype(DTYPE_R_NPY)
 
 
-def _normalize_vector(vec, dtype=_real_dtype):
+def _normalize_vector(vec, dtype=DTYPE_R_NPY):
     """Normalize a 3-vector."""
     vec = np.asarray(vec, dtype=dtype)
     norm = np.sqrt(np.sum(vec**2))
@@ -63,7 +61,7 @@ def short_dipole_beam(
     nside,
     dipole_axis=(1.0, 0.0, 0.0),
     horizon_clip=False,
-    dtype=_real_dtype,
+    dtype=DTYPE_R_NPY,
 ):
     """
     Generate an ideal short-dipole scalar power beam on a HEALPix grid.
@@ -113,7 +111,7 @@ def thin_dipole_beam(
     dipole_axis=(1.0, 0.0, 0.0),
     dipole_length=2.0,
     horizon_clip=False,
-    dtype=_real_dtype,
+    dtype=DTYPE_R_NPY,
     eps=1e-12,
 ):
     """
@@ -185,7 +183,7 @@ def analytic_dipole_beam(
     dipole_model="thin",
     dipole_length=2.0,
     horizon_clip=False,
-    dtype=_real_dtype,
+    dtype=DTYPE_R_NPY,
     eps=1e-12,
 ):
     """
@@ -375,11 +373,11 @@ class Beam:
         self.nside = int(nside)
         self.freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
         self.basis = basis
-        self.coeffs = np.asarray(coeffs, dtype=_real_dtype)
+        self.coeffs = np.asarray(coeffs, dtype=DTYPE_R_NPY)
 
         if u_body is None:
-            u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=_real_dtype)
-        self.u_body = np.asarray(u_body, dtype=_real_dtype)
+            u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=DTYPE_R_NPY)
+        self.u_body = np.asarray(u_body, dtype=DTYPE_R_NPY)
 
         # Validate shapes
         npix = healpy.nside2npix(self.nside)
@@ -417,12 +415,12 @@ class Beam:
         """
         from .basis import BeamBasis
 
-        arm_lengths_m = np.atleast_1d(np.asarray(arm_lengths_m, dtype=_real_dtype))
+        arm_lengths_m = np.atleast_1d(np.asarray(arm_lengths_m, dtype=DTYPE_R_NPY))
         if arm_lengths_m.size == 1:
             arm_lengths_m = np.repeat(arm_lengths_m, 2)
 
         if u_body is None:
-            u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=_real_dtype)
+            u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=DTYPE_R_NPY)
 
         freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
 
@@ -432,7 +430,7 @@ class Beam:
         cos_theta = u_body @ N_GAL  # (2, npix)
 
         # Evaluate thin-dipole beam at all frequencies
-        nominal_beam = np.zeros((2, npix, len(freqs_hz)), dtype=_real_dtype)
+        nominal_beam = np.zeros((2, npix, len(freqs_hz)), dtype=DTYPE_R_NPY)
         for f_idx, f_hz in enumerate(freqs_hz):
             kh_f = arm_lengths_m * np.pi * f_hz / C_LIGHT
             nominal_beam[:, :, f_idx] = thin_dipole_pattern(kh_f[:, np.newaxis], cos_theta)
@@ -441,7 +439,7 @@ class Beam:
         # Note: K is limited by min(npix, nfreq)
         max_rank = min(npix, len(freqs_hz))
         K_actual = min(K, max_rank)
-        coeffs = np.zeros((2, npix, K_actual), dtype=_real_dtype)
+        coeffs = np.zeros((2, npix, K_actual), dtype=DTYPE_R_NPY)
 
         for d in range(2):
             B_d = nominal_beam[d]  # (npix, nfreq)
@@ -522,7 +520,7 @@ class Beam:
 
         n_dipoles = self.coeffs.shape[0]
         npix = self.coeffs.shape[1]
-        beam = np.zeros((n_dipoles, npix), dtype=_real_dtype)
+        beam = np.zeros((n_dipoles, npix), dtype=DTYPE_R_NPY)
 
         for d in range(n_dipoles):
             # coeffs_d @ basis.A[freq_idx] → (npix,)
