@@ -5,6 +5,7 @@ from .basis import BeamBasis, SkyBasis
 from .beam import Beam
 from .terrain import Terrain, NullTerrain, HorizonTerrain, LunarDisk, DEMTerrain
 from .observer import Observer, EarthSurface, LunarSurface, LunarOrbit
+from .sky import Sky
 
 __all__ = [
     "BeamBasis",
@@ -19,4 +20,5 @@ __all__ = [
     "EarthSurface",
     "LunarSurface",
     "LunarOrbit",
+    "Sky",
 ]
