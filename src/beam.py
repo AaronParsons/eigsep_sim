@@ -19,8 +19,6 @@ import healpy
 import numpy as np
 from scipy.interpolate import interp1d
 
-from .healpix import HPM
-from .coord import rot_m
 from .const import c as C_LIGHT
 
 BEAM_NPZ = os.path.join(os.path.dirname(__file__), "data", "eigsep_bowtie_v000.npz")
@@ -349,134 +347,219 @@ def receiver_margin_factor(
     )
 
 
-class Beam(HPM):
+class Beam:
     """
-    Antenna beam pattern stored as a HEALPix map with rotation support.
+    Body-frame HEALPix beam model with spectral basis decomposition.
 
-    The beam is defined in a fixed antenna frame. Az/alt rotation matrices
-    are applied on every pixel access so the beam can be steered without
-    reloading the data.
+    Stores beam coefficients (n_dipoles, npix_beam, nmodes) per dipole in a
+    spectral basis, enabling compact representation of frequency-dependent
+    beam patterns. Evaluation reconstructs the full beam pattern at any frequency
+    via deprojection: B_d(f) = coeffs_d @ basis.A[f].T.
 
     Parameters
     ----------
-    freqs : array_like
-        Frequencies [Hz].
-    filename : str
-        Path to NPZ file containing the beam pattern.
-    peak_normalize : bool
-        If True, normalize the beam to its peak value across all pixels
-        and frequencies.
-    beam_type : {'file', 'dipole'}
-        Select whether to load the beam from file or generate an analytic
-        dipole beam.
-    nside : int or None
-        Required for beam_type='dipole'. Ignored for beam_type='file'.
-    dipole_axis : array_like, shape (3,)
-        Dipole axis for beam_type='dipole'.
-    dipole_model : {'short', 'thin'}
-        Analytic dipole model for beam_type='dipole'.
-    dipole_length : float
-        Total physical dipole length [m] for dipole_model='thin'.
-    horizon_clip : bool
-        If True, zero the analytic response below the horizon.
+    nside : int
+        HEALPix resolution of the body-frame beam map.
+    freqs_hz : ndarray, shape (nfreq,)
+        Frequencies [Hz] at which the beam is defined.
+    basis : BeamBasis
+        Spectral basis for beam decomposition.
+    coeffs : ndarray, shape (n_dipoles, npix_beam, nmodes)
+        Spatial coefficients per dipole in the spectral basis.
+    u_body : ndarray, shape (n_dipoles, 3), optional
+        Dipole axis unit vectors in body frame. Defaults to
+        standard orthogonal dipoles if None.
     """
 
-    def __init__(
-        self,
-        freqs,
-        filename=BEAM_NPZ,
-        peak_normalize=True,
-        beam_type="file",
-        nside=None,
-        dipole_axis=(1.0, 0.0, 0.0),
-        dipole_model="thin",
-        dipole_length=2.0,
-        horizon_clip=False,
-    ):
-        self.freqs = np.asarray(freqs, dtype=_real_dtype)
+    def __init__(self, nside, freqs_hz, basis, coeffs, u_body=None):
+        self.nside = int(nside)
+        self.freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
+        self.basis = basis
+        self.coeffs = np.asarray(coeffs, dtype=_real_dtype)
 
-        if beam_type == "file":
-            bm_data = load_beam_file(self.freqs, filename=filename)
+        if u_body is None:
+            u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=_real_dtype)
+        self.u_body = np.asarray(u_body, dtype=_real_dtype)
 
-        elif beam_type == "dipole":
-            if nside is None:
-                raise ValueError("nside required for analytic dipole beam")
+        # Validate shapes
+        npix = healpy.nside2npix(self.nside)
+        n_dipoles, nmodes_coeffs = self.coeffs.shape[0], self.coeffs.shape[2]
+        if self.coeffs.shape != (n_dipoles, npix, nmodes_coeffs):
+            raise ValueError(f"coeffs shape {self.coeffs.shape} inconsistent with "
+                           f"nside={nside} (npix={npix}) and basis nmodes={self.basis.nmodes}")
 
-            bm_data = analytic_dipole_beam(
-                self.freqs,
-                nside=nside,
-                dipole_axis=dipole_axis,
-                dipole_model=dipole_model,
-                dipole_length=dipole_length,
-                horizon_clip=horizon_clip,
-                dtype=_real_dtype,
-            )
+    @classmethod
+    def from_dipole(cls, nside, freqs_hz, arm_lengths_m, u_body=None, K=5):
+        """Initialize beam from thin-dipole analytic model.
 
-        else:
-            raise ValueError(f"Unknown beam_type {beam_type!r}")
-
-        if peak_normalize:
-            bmmax = bm_data.max()
-            if bmmax > 0:
-                bm_data = bm_data / bmmax
-
-        nside_beam = healpy.npix2nside(bm_data.shape[0])
-
-        self.set_az(0)
-        self.set_alt(0)
-
-        HPM.__init__(self, nside_beam, interp=True)
-        self.set_map(bm_data.astype(_real_dtype))
-
-    def set_az(self, theta, az_vec=None):
-        """Set the azimuth rotation angle (radians) about az_vec."""
-        if az_vec is None:
-            az_vec = np.array([0, 0, 1], dtype=_real_dtype)
-        self.az = theta
-        self.rot_az = rot_m(theta, az_vec)
-
-    def set_alt(self, theta, alt_vec=None):
-        """Set the altitude rotation angle (radians) about alt_vec."""
-        if alt_vec is None:
-            alt_vec = np.array([1, 0, 0], dtype=_real_dtype)
-        self.alt = theta
-        self.rot_alt = rot_m(theta, alt_vec)
-
-    def get_rotation_matrices(self, azs, alts):
-        """
-        Compute combined az/alt rotation matrices for arrays of angles.
+        Evaluates the thin-dipole power pattern at all frequencies on a HEALPix
+        grid, then performs SVD per dipole to extract K dominant spectral modes.
+        The coefficients are initialized from the SVD decomposition.
 
         Parameters
         ----------
-        azs, alts : ndarray
-            Azimuth and altitude angles (radians), same shape.
+        nside : int
+            HEALPix resolution for body-frame beam.
+        freqs_hz : ndarray, shape (nfreq,)
+            Frequencies [Hz].
+        arm_lengths_m : float or ndarray, shape (2,)
+            Dipole arm length(s) [m]. If float, used for both dipoles;
+            if (2,), per-dipole arm lengths.
+        u_body : ndarray, shape (2, 3), optional
+            Dipole axes in body frame. Defaults to standard orthogonal pair.
+        K : int
+            Number of spectral modes to retain (default 5).
 
         Returns
         -------
-        rot_ms : ndarray, shape (*azs.shape, 3, 3)
+        Beam
+            New beam object initialized from thin-dipole model.
         """
-        azs = np.asarray(azs)
-        alts = np.asarray(alts)
-        n_rots = azs.size
-        rot_ms = np.empty((n_rots, 3, 3), dtype=_real_dtype)
+        from .basis import BeamBasis
 
-        for i in range(n_rots):
-            self.set_az(azs.flat[i])
-            self.set_alt(alts.flat[i])
-            rot_ms[i] = self.rot_az.dot(self.rot_alt)
+        arm_lengths_m = np.atleast_1d(np.asarray(arm_lengths_m, dtype=_real_dtype))
+        if arm_lengths_m.size == 1:
+            arm_lengths_m = np.repeat(arm_lengths_m, 2)
 
-        return rot_ms.reshape(azs.shape + (3, 3))
+        if u_body is None:
+            u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=_real_dtype)
 
-    def __getitem__(self, crd_top):
-        """
-        Interpolate the beam at topocentric directions *crd_top*, applying
-        the current az/alt rotation before lookup.
+        freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
+
+        # Compute cos(θ) for all beam pixels
+        npix = healpy.nside2npix(nside)
+        N_GAL = np.array(healpy.pix2vec(nside, np.arange(npix)))  # (3, npix)
+        cos_theta = u_body @ N_GAL  # (2, npix)
+
+        # Evaluate thin-dipole beam at all frequencies
+        nominal_beam = np.zeros((2, npix, len(freqs_hz)), dtype=_real_dtype)
+        for f_idx, f_hz in enumerate(freqs_hz):
+            kh_f = arm_lengths_m * np.pi * f_hz / C_LIGHT
+            nominal_beam[:, :, f_idx] = thin_dipole_pattern(kh_f[:, np.newaxis], cos_theta)
+
+        # SVD along frequency axis for each dipole
+        # Note: K is limited by min(npix, nfreq)
+        max_rank = min(npix, len(freqs_hz))
+        K_actual = min(K, max_rank)
+        coeffs = np.zeros((2, npix, K_actual), dtype=_real_dtype)
+
+        for d in range(2):
+            B_d = nominal_beam[d]  # (npix, nfreq)
+            U, s, Vt = np.linalg.svd(B_d, full_matrices=False)
+            coeffs[d] = (U[:, :K_actual] * s[:K_actual])  # (npix, K_actual)
+
+        # Build shared basis from averaged dipole
+        B_avg = (nominal_beam[0] + nominal_beam[1]) / 2
+        U, s, Vt = np.linalg.svd(B_avg, full_matrices=False)
+        basis_A = Vt[:K_actual].T  # (nfreq, K_actual)
+        basis = BeamBasis(basis_A, freqs_hz=freqs_hz)
+
+        return cls(nside, freqs_hz, basis, coeffs, u_body=u_body)
+
+    @classmethod
+    def from_file(cls, path, new_freqs=None):
+        """Load beam from npz file, optionally resampling to new frequencies.
 
         Parameters
         ----------
-        crd_top : array_like, shape (3, N)
-            Topocentric unit vectors.
+        path : str
+            Path to npz file with keys: nside, freqs_hz, coeffs, basis_A, u_body.
+        new_freqs : ndarray, shape (nfreq_new,), optional
+            If provided, resample basis to these frequencies.
+
+        Returns
+        -------
+        Beam
+            Loaded (and optionally resampled) beam object.
         """
-        rot = self.rot_az.dot(self.rot_alt)
-        bx, by, bz = rot.dot(crd_top)
-        return HPM.__getitem__(self, (bx, by, bz))
+        from .basis import BeamBasis
+
+        npz = np.load(path, allow_pickle=False)
+        nside = int(npz['nside'])
+        freqs_hz = npz['freqs_hz']
+        coeffs = npz['coeffs']
+        basis_A = npz['basis_A']
+        u_body = npz['u_body'] if 'u_body' in npz else None
+
+        # Create basis
+        basis = BeamBasis(basis_A, freqs_hz=freqs_hz)
+
+        # Resample if requested
+        if new_freqs is not None:
+            from .basis import _resample_basis
+            basis_A_new = _resample_basis(freqs_hz, basis_A, new_freqs)
+            basis = BeamBasis(basis_A_new, freqs_hz=new_freqs)
+            freqs_hz = new_freqs
+
+        return cls(nside, freqs_hz, basis, coeffs, u_body=u_body)
+
+    def save(self, path):
+        """Save beam to npz file.
+
+        Parameters
+        ----------
+        path : str
+            Output npz file path.
+        """
+        np.savez(path, nside=self.nside, freqs_hz=self.freqs_hz,
+                coeffs=self.coeffs, basis_A=self.basis.A, u_body=self.u_body)
+
+    def evaluate(self, freq_idx):
+        """Reconstruct (n_dipoles, npix) beam at frequency index.
+
+        Parameters
+        ----------
+        freq_idx : int
+            Frequency index (0 <= freq_idx < nfreq).
+
+        Returns
+        -------
+        ndarray, shape (n_dipoles, npix)
+            Beam power pattern for each dipole at the given frequency.
+        """
+        if not (0 <= freq_idx < self.basis.nfreq):
+            raise IndexError(f"freq_idx {freq_idx} out of range [0, {self.basis.nfreq})")
+
+        n_dipoles = self.coeffs.shape[0]
+        npix = self.coeffs.shape[1]
+        beam = np.zeros((n_dipoles, npix), dtype=_real_dtype)
+
+        for d in range(n_dipoles):
+            # coeffs_d @ basis.A[freq_idx] → (npix,)
+            beam[d] = self.coeffs[d] @ self.basis.A[freq_idx]
+
+        return beam
+
+    def solid_angle(self, freq_idx):
+        """Compute (n_dipoles,) beam solid angles at frequency index.
+
+        Solid angle for each dipole: Ω = 4π / npix * sum(beam_pattern).
+
+        Parameters
+        ----------
+        freq_idx : int
+            Frequency index.
+
+        Returns
+        -------
+        ndarray, shape (n_dipoles,)
+            Beam solid angle (steradians) for each dipole.
+        """
+        beam = self.evaluate(freq_idx)
+        npix = healpy.nside2npix(self.nside)
+        return 4.0 * np.pi / npix * np.sum(beam, axis=1)
+
+    @property
+    def npix(self):
+        """Number of HEALPix pixels."""
+        return healpy.nside2npix(self.nside)
+
+    @property
+    def n_dipoles(self):
+        """Number of dipoles."""
+        return self.coeffs.shape[0]
+
+    @property
+    def nmodes(self):
+        """Number of spectral modes."""
+        return self.coeffs.shape[2]
