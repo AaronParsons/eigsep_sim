@@ -138,7 +138,7 @@ class Sky:
         gsm = pygdsm.GlobalSkyModel16(freq_unit='MHz', resolution='lo')
         gsm_maps = []
         for f_mhz in freqs_mhz:
-            m = gsm.query(f_mhz)
+            m = gsm.generate(f_mhz)  # Returns map at nside=1024
             m_hp = healpy.ud_grade(m, self.nside)
             gsm_maps.append(m_hp)
         gsm_maps = np.array(gsm_maps).T  # (npix, nfreq)
