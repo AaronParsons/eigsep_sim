@@ -1,17 +1,22 @@
 """
-Spectral foreground filtering for global 21cm analysis.
+Spectral foreground filtering and beam analysis for global 21cm radiometry.
 
 Functions
 ---------
-gsm_eigenmodes   — compute dominant spectral eigenmodes from GSM sky maps
-eigenmode_filter — project GSM eigenmodes out of a spectrum or array of spectra
+gsm_eigenmodes       — compute dominant spectral eigenmodes from GSM sky maps
+eigenmode_filter     — project GSM eigenmodes out of a spectrum or array of spectra
+beam_spectral_basis  — compute spectral eigenmode basis for HEALPix beam model
 
-log_poly_basis   — design matrix for log-polynomial foreground fits
-fit_foreground   — fit and subtract a log-polynomial from a spectrum
-project_signal   — project a signal through the foreground-subtraction operator
+log_poly_basis       — design matrix for log-polynomial foreground fits
+fit_foreground       — fit and subtract a log-polynomial from a spectrum
+project_signal       — project a signal through the foreground-subtraction operator
 """
 
 import numpy as np
+import healpy
+from scipy.spatial.transform import Rotation
+
+from .sim import thin_dipole_pattern
 
 
 def gsm_eigenmodes(gsm_maps, n_modes, include_flat=True):
@@ -84,6 +89,71 @@ def eigenmode_filter(spectrum, modes):
     #   coeffs = (..., n_modes) = spectrum @ modes.T
     #   projection = (..., N_FREQ) = coeffs @ modes
     return spectrum - (spectrum @ modes.T) @ modes
+
+
+def beam_spectral_basis(cfg, freqs_mhz, K=5, nside_beam=8):
+    """
+    Compute spectral eigenmode basis for HEALPix antenna beam model.
+
+    Decomposes the nominal thin-dipole beam's frequency evolution into K
+    dominant spectral eigenmodes (via SVD), enabling a low-rank parameterization
+    of chromatic beam errors.  Per-dipole spatial coefficients are initialized
+    from the nominal beam.
+
+    Parameters
+    ----------
+    cfg : OrbiterMission
+        Mission config with antenna parameters (u_body, kh, etc.)
+    freqs_mhz : array_like, shape (N_FREQ,)
+        Science band frequencies [MHz]
+    K : int
+        Number of spectral modes to retain (default 5)
+    nside_beam : int
+        HEALPix resolution for body-frame beam model (default 8; ~7° resolution)
+
+    Returns
+    -------
+    dict with keys:
+        'psi'        : ndarray (2, K, N_FREQ) — spectral modes per dipole
+        'c_init'     : ndarray (2, K, npix_beam) — initial beam coefficients
+        'u_body'     : ndarray (2, 3) — dipole axes in body frame
+        'kh_func'    : callable kh(freq_mhz) → (2,) electrical half-lengths
+        'nside'      : int — nside_beam value
+    """
+    N_freq = len(freqs_mhz)
+    npix_beam = healpy.nside2npix(nside_beam)
+    u_body = cfg.antenna.u_body
+
+    # Compute cos(θ) for all beam pixels
+    N_GAL = np.array(healpy.pix2vec(nside_beam, np.arange(npix_beam)))  # (3, npix_beam)
+    cos_theta_body = u_body @ N_GAL    # (2, npix_beam)
+
+    # Nominal thin-dipole beam spectrum: (2, npix_beam, N_freq)
+    nominal_beam = np.zeros((2, npix_beam, N_freq), dtype=np.float32)
+    for f_idx, f_mhz in enumerate(freqs_mhz):
+        kh_f = cfg.antenna.kh(f_mhz)
+        nominal_beam[:, :, f_idx] = thin_dipole_pattern(
+            kh_f[:, np.newaxis], cos_theta_body
+        )
+
+    # SVD per dipole along frequency axis
+    psi = np.zeros((2, K, N_freq), dtype=np.float32)
+    c_init = np.zeros((2, K, npix_beam), dtype=np.float32)
+
+    for d in range(2):
+        B_d = nominal_beam[d]  # (npix_beam, N_freq)
+        U, s, Vt = np.linalg.svd(B_d, full_matrices=False)
+
+        psi[d] = Vt[:K]  # (K, N_freq)
+        c_init[d] = (U[:, :K] * s[:K]).T  # (K, npix_beam)
+
+    return {
+        'psi': psi,
+        'c_init': c_init,
+        'u_body': u_body,
+        'kh_func': cfg.antenna.kh,
+        'nside': nside_beam,
+    }
 
 
 def log_poly_basis(freqs_mhz, n_terms, f_ref=None):

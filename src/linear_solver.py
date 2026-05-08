@@ -1,14 +1,17 @@
 """
-Linear inversion tools for BLOOM-21cm sky recovery.
+Linear inversion tools for global 21cm radiometry.
 
 build_design_matrix          — per-pixel observation matrix A (npix + 2 or npix + 4 columns)
 build_monopole_design_matrix — 4-column matrix for direct monopole recovery
+build_A_from_model           — design matrix from parameterized HEALPix beam model
 normal_solve                 — fast least-squares via normal equations (A^T A eigh)
 svd_solve                    — thin-SVD least-squares for the per-pixel system
 monopole_lstsq               — least-squares solve for (T_mono, T_reg, T_sun)
 """
 
 import numpy as np
+import healpy
+from scipy.spatial.transform import Rotation
 
 
 def build_design_matrix(masks, beams, omega_B, J_SUN, npix, include_t_rx=True):
@@ -327,3 +330,84 @@ def svd_solve(A, y, npix, rcond=1e-6):
         "rank":       rank,
         "unobserved": unobserved,
     }
+
+
+def build_A_from_model(rots_per_orbit, masks, spectral_basis, c, delta_phi,
+                       J_SUN, npix_sky, freq_idx, nside_beam=8):
+    """
+    Construct design matrix from parameterized HEALPix beam model.
+
+    Evaluates a beam model specified via spectral decomposition (K spectral
+    eigenmodes) and spatial coefficients at a given frequency, applies a
+    rotation offset to all observations, interpolates the body-frame beam
+    to sky coordinates via nearest-neighbor at the beam nside resolution,
+    then calls :func:`build_design_matrix` to construct A.
+
+    Parameters
+    ----------
+    rots_per_orbit : list of Rotation
+        Spacecraft attitudes per observation (from eigsep_sim.lunar_orbit).
+    masks : ndarray, shape (n_obs, npix_sky), float32
+        Binary masks (1 = sky, 0 = regolith).
+    spectral_basis : dict
+        Output from :func:`eigsep_sim.spectral.beam_spectral_basis`.
+        Keys: 'psi' (2, K, N_freq), 'c_init' (2, K, npix_beam), 'nside'.
+    c : ndarray, shape (2, K, npix_beam)
+        Beam spatial coefficients (per dipole, per spectral mode, per pixel).
+    delta_phi : ndarray, shape (3,)
+        Rotation offset vector [rad] (applied to all observations uniformly).
+    J_SUN : ndarray, shape (n_obs,), int
+        HEALPix sun pixel per observation.
+    npix_sky : int
+        Sky resolution (nside value).
+    freq_idx : int
+        Index into spectral_basis['psi'] for the current frequency.
+    nside_beam : int
+        HEALPix resolution of the beam model (default 8; ~7° resolution).
+
+    Returns
+    -------
+    A : ndarray, shape (n_obs*2, npix_sky + 2)
+        Design matrix [sky_map_1..npix_sky | T_regolith | T_sun].
+    omega_B : ndarray, shape (n_obs, 2)
+        Beam solid angles per observation and dipole.
+    """
+    n_obs = len(rots_per_orbit)
+    npix_beam = healpy.nside2npix(nside_beam)
+    K = c.shape[1]
+
+    # Apply rotation offset to attitudes
+    R_offset = Rotation.from_rotvec(delta_phi)
+    rots_eff = [R_offset * rot for rot in rots_per_orbit]
+
+    # Evaluate body-frame beam at current frequency
+    # psi: (2, K, N_freq), c: (2, K, npix_beam)
+    psi_f = spectral_basis['psi'][:, :, freq_idx]  # (2, K)
+    B_body_f = np.zeros((2, npix_beam), dtype=np.float32)
+    for d in range(2):
+        B_body_f[d] = np.einsum('k,kp->p', psi_f[d], c[d])  # (npix_beam,)
+
+    # Rotate beam to galactic frame for each observation
+    N_GAL = np.array(healpy.pix2vec(npix_sky, np.arange(healpy.nside2npix(npix_sky))))
+
+    beams_gal = np.zeros((n_obs, 2, healpy.nside2npix(npix_sky)), dtype=np.float32)
+    omega_B = np.zeros((n_obs, 2), dtype=np.float32)
+
+    for k, rot_eff in enumerate(rots_eff):
+        # Transform sky directions to body frame
+        N_BODY = rot_eff.inv().apply(N_GAL.T).T  # (3, npix_sky)
+
+        # Find nearest beam pixel for each sky pixel
+        body_pix_idx = healpy.vec2pix(nside_beam, N_BODY[0], N_BODY[1], N_BODY[2])
+
+        # Evaluate beam
+        for d in range(2):
+            beams_gal[k, d] = B_body_f[d, body_pix_idx]
+
+        omega_B[k] = beams_gal[k].sum(axis=1)
+
+    # Build design matrix with interpolated beams
+    A = build_design_matrix(masks, beams_gal, omega_B, J_SUN,
+                           healpy.nside2npix(npix_sky), include_t_rx=False)
+
+    return A, omega_B
