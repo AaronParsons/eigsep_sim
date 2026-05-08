@@ -7,6 +7,7 @@ from .terrain import Terrain, NullTerrain, HorizonTerrain, LunarDisk, DEMTerrain
 from .observer import Observer, EarthSurface, LunarSurface, LunarOrbit
 from .sky import Sky
 from .simulate import ForwardModel
+from .calibrator import Calibrator
 
 __all__ = [
     "BeamBasis",
@@ -23,4 +24,5 @@ __all__ = [
     "LunarOrbit",
     "Sky",
     "ForwardModel",
+    "Calibrator",
 ]

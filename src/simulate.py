@@ -226,7 +226,7 @@ class ForwardModel:
 
         Returns
         -------
-        antenna_temp : ndarray, shape (ntimes, n_dipoles, nfreq)
+        antenna_temp : jnp.ndarray, shape (ntimes, n_dipoles, nfreq)
             Antenna temperature [K] at each time and dipole orientation.
         """
         self._ensure_jax_arrays()
@@ -241,8 +241,6 @@ class ForwardModel:
         n_dipoles = beam_coeffs.shape[0]
         nfreq = len(self.sky.freqs_hz)
 
-        antenna_temp = np.zeros((ntimes, n_dipoles, nfreq), dtype=np.float32)
-
         # Convert coefficients to JAX
         sky_coeffs_jax = jnp.asarray(sky_coeffs, dtype=float_dtype)
         beam_coeffs_jax = jnp.asarray(beam_coeffs, dtype=float_dtype)
@@ -250,15 +248,15 @@ class ForwardModel:
         # Reconstruct sky: (npix_sky, nfreq)
         sky_recon_jax = jnp.matmul(sky_coeffs_jax, self._sky_basis_A_jax.T)
 
+        antenna_temp_list = []
         for ti in range(ntimes):
             # Apply mask and ground temperature
-            mask = geom['masks'][ti]
-            crds_top = geom['crds_top'][ti]
-            sky_masked = sky_recon_jax * mask[:, None] + T_gnd * (1.0 - mask[:, None])
-            sky_masked_jax = jnp.asarray(sky_masked, dtype=float_dtype)
-            crds_top_jax = jnp.asarray(crds_top, dtype=float_dtype)
+            mask = jnp.asarray(geom['masks'][ti], dtype=float_dtype)
+            crds_top = jnp.asarray(geom['crds_top'][ti], dtype=float_dtype)
+            sky_masked_jax = sky_recon_jax * mask[:, None] + T_gnd * (1.0 - mask[:, None])
 
             # Process each dipole
+            dipole_temps = []
             for di in range(n_dipoles):
                 # Reconstruct beam for this dipole: (npix_beam, nfreq)
                 beam_recon_jax = jnp.matmul(beam_coeffs_jax[di], self._beam_basis_A_jax.T)
@@ -268,12 +266,14 @@ class ForwardModel:
                     self.beam.nside,
                     beam_recon_jax,
                     sky_masked_jax,
-                    crds_top_jax,
+                    crds_top,
                     jnp.eye(3, dtype=float_dtype)[None, :, :],  # Identity rotation
                     npix_sky=self.sky.npix
                 )
-                antenna_temp[ti, di, :] = np.asarray(num[0] / den[0])
+                dipole_temps.append(num[0] / den[0])
+            antenna_temp_list.append(jnp.stack(dipole_temps))
 
+        antenna_temp = jnp.stack(antenna_temp_list)
         return antenna_temp
 
 
