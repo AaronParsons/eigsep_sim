@@ -288,8 +288,6 @@ class Calibrator:
         params_new : dict
             Updated parameters with optimized sky_coeffs.
         """
-        from scipy.sparse.linalg import LinearOperator, cg as scipy_cg
-
         def loss_sky(sky_coeffs):
             p = {'sky_coeffs': sky_coeffs, 'beam_coeffs': params['beam_coeffs']}
             return self._loss(p)
@@ -299,38 +297,32 @@ class Calibrator:
         grad_val = grad_fn(sky_jax)
         loss_before = float(loss_sky(sky_jax))
 
-        n = sky_jax.size
         lam_abs = lam * float(jnp.mean(jnp.abs(grad_val))) + 1e-12
 
-        def hvp(v):
-            v_jax = jnp.asarray(v.astype(np.float32)).reshape(sky_jax.shape)
-            _, h = jax.jvp(grad_fn, (sky_jax,), (v_jax,))
-            return np.asarray(h, dtype=np.float32).ravel()
+        # Fully JAX-native HVP: compiled as single XLA kernel by jax.scipy CG
+        def hvp_flat(v):
+            _, h = jax.jvp(grad_fn, (sky_jax,), (v.reshape(sky_jax.shape),))
+            return h.ravel() + lam_abs * v
 
-        A = LinearOperator(
-            (n, n),
-            matvec=lambda v: hvp(np.asarray(v, dtype=np.float32)) + lam_abs * np.asarray(v, dtype=np.float32),
-            dtype=np.float32,
-        )
-        b = -np.asarray(grad_val, dtype=np.float32).ravel()
-        delta, _ = scipy_cg(A, b, maxiter=n_cg, rtol=1e-3)
+        b = -grad_val.ravel()
+        delta, _ = jax.scipy.sparse.linalg.cg(hvp_flat, b, maxiter=n_cg, tol=1e-3)
 
-        sky_new = np.asarray(sky_jax, dtype=np.float32) + delta.reshape(sky_jax.shape)
-        loss_new = float(loss_sky(jnp.asarray(sky_new)))
+        sky_new = (sky_jax.ravel() + delta).reshape(sky_jax.shape)
+        loss_new = float(loss_sky(sky_new))
 
         if loss_new < loss_before:
             params_new = params.copy()
-            params_new['sky_coeffs'] = sky_new.astype(DTYPE_R_NPY)
+            params_new['sky_coeffs'] = np.asarray(sky_new, dtype=DTYPE_R_NPY)
             return params_new
 
         # CG failed to improve; fall back to gradient descent with line search
         current_lr = 1.0
         for _ in range(20):
-            sky_new = np.asarray(sky_jax - current_lr * grad_val)
-            loss_new = float(loss_sky(jnp.asarray(sky_new)))
+            sky_new = sky_jax - current_lr * grad_val
+            loss_new = float(loss_sky(sky_new))
             if loss_new <= loss_before:
                 params_new = params.copy()
-                params_new['sky_coeffs'] = sky_new.astype(DTYPE_R_NPY)
+                params_new['sky_coeffs'] = np.asarray(sky_new, dtype=DTYPE_R_NPY)
                 return params_new
             current_lr *= 0.5
 

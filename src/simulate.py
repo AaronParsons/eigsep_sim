@@ -129,13 +129,60 @@ class ForwardModel:
         self._crds_gal_jax = None
 
     def _ensure_jax_arrays(self):
-        """Convert and cache basis matrices as JAX arrays."""
+        """Convert and cache basis matrices as JAX arrays; build JIT-compiled sim kernel."""
         if self._beam_basis_A_jax is None:
             self._beam_basis_A_jax = jnp.asarray(self.beam.basis.A, dtype=DTYPE_R_JAX)
         if self._sky_basis_A_jax is None:
             self._sky_basis_A_jax = jnp.asarray(self.sky.basis.A, dtype=DTYPE_R_JAX)
         if self._crds_gal_jax is None:
             self._crds_gal_jax = jnp.asarray(self._crds_gal, dtype=DTYPE_R_JAX)
+        if not hasattr(self, '_sim_jit'):
+            self._sim_jit = self._build_sim_fn()
+
+    def _build_sim_fn(self):
+        """Build and JIT-compile the inner simulation kernel.
+
+        Returns a function ``sim(sky_coeffs, beam_coeffs, masks, crds_top, T_gnd)``
+        that is fully JAX-traceable: basis matrices, nside, and pixel counts are
+        captured as compile-time constants so the XLA kernel is compiled once and
+        reused across every call with the same array shapes.
+        """
+        A_sky = self._sky_basis_A_jax        # (nfreq, nmodes_sky)
+        A_beam = self._beam_basis_A_jax      # (nfreq, nmodes_beam)
+        beam_nside = self.beam.nside         # static int
+        npix_beam = self.beam.npix           # static int
+        npix_sky = self.sky.npix             # static int
+        scale = float(npix_sky) / float(npix_beam)
+
+        @jax.jit
+        def _sim(sky_coeffs, beam_coeffs, masks, crds_top, T_gnd):
+            """
+            sky_coeffs  : (npix_sky, nmodes_sky)
+            beam_coeffs : (n_dipoles, npix_beam, nmodes_beam)
+            masks       : (ntimes, npix_sky)       float32  1=visible 0=blocked
+            crds_top    : (ntimes, 3, npix_sky)    float32  topocentric unit vecs
+            T_gnd       : scalar [K]
+            Returns     : (ntimes, n_dipoles, nfreq)
+            """
+            sky_recon = sky_coeffs @ A_sky.T          # (npix_sky, nfreq)
+            beam_recon_all = beam_coeffs @ A_beam.T   # (n_dipoles, npix_beam, nfreq)
+
+            def one_time(_, args):
+                mask, crds = args              # (npix_sky,), (3, npix_sky)
+                sky_masked = sky_recon * mask[:, None] + T_gnd * (1.0 - mask[:, None])
+
+                def one_dipole(beam_recon):   # (npix_beam, nfreq)
+                    wgt = interpolate_map(beam_nside, beam_recon, *crds)  # (npix_sky, nfreq)
+                    num = jnp.sum(wgt * sky_masked, axis=0)               # (nfreq,)
+                    den = jnp.sum(beam_recon, axis=0) * scale             # (nfreq,)
+                    return num / den
+
+                return None, jax.vmap(one_dipole)(beam_recon_all)  # (n_dipoles, nfreq)
+
+            _, antenna_temp = jax.lax.scan(one_time, None, (masks, crds_top))
+            return antenna_temp  # (ntimes, n_dipoles, nfreq)
+
+        return _sim
 
     def precompute_geometry(self, times):
         """
@@ -178,6 +225,13 @@ class ForwardModel:
             mask = self._compute_mask(crds_top)
             geom['masks'].append(mask)
 
+        # Stacked JAX arrays for JIT-compiled simulation kernel
+        geom['masks_jax'] = jnp.stack(
+            [jnp.asarray(m, dtype=DTYPE_R_JAX) for m in geom['masks']]
+        )  # (ntimes, npix_sky)
+        geom['crds_top_jax'] = jnp.stack(
+            [jnp.asarray(c, dtype=DTYPE_R_JAX) for c in geom['crds_top']]
+        )  # (ntimes, 3, npix_sky)
         return geom
 
     def _compute_mask(self, crds_top):
@@ -238,44 +292,27 @@ class ForwardModel:
                 raise ValueError("Either times or geom must be provided")
             geom = self.precompute_geometry(times)
 
-        ntimes = len(geom['rot_gal2top'])
-        n_dipoles = beam_coeffs.shape[0]
-        nfreq = len(self.sky.freqs_hz)
-
         # Convert coefficients to JAX
         sky_coeffs_jax = jnp.asarray(sky_coeffs, dtype=DTYPE_R_JAX)
         beam_coeffs_jax = jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
 
-        # Reconstruct sky: (npix_sky, nfreq)
-        sky_recon_jax = jnp.matmul(sky_coeffs_jax, self._sky_basis_A_jax.T)
+        # Get stacked geometry (cached by precompute_geometry, or build lazily)
+        masks_jax = geom.get('masks_jax')
+        crds_top_jax = geom.get('crds_top_jax')
+        if masks_jax is None:
+            masks_jax = jnp.stack(
+                [jnp.asarray(m, dtype=DTYPE_R_JAX) for m in geom['masks']]
+            )
+        if crds_top_jax is None:
+            crds_top_jax = jnp.stack(
+                [jnp.asarray(c, dtype=DTYPE_R_JAX) for c in geom['crds_top']]
+            )
 
-        antenna_temp_list = []
-        for ti in range(ntimes):
-            # Apply mask and ground temperature
-            mask = jnp.asarray(geom['masks'][ti], dtype=DTYPE_R_JAX)
-            crds_top = jnp.asarray(geom['crds_top'][ti], dtype=DTYPE_R_JAX)
-            sky_masked_jax = sky_recon_jax * mask[:, None] + T_gnd * (1.0 - mask[:, None])
-
-            # Process each dipole
-            dipole_temps = []
-            for di in range(n_dipoles):
-                # Reconstruct beam for this dipole: (npix_beam, nfreq)
-                beam_recon_jax = jnp.matmul(beam_coeffs_jax[di], self._beam_basis_A_jax.T)
-
-                # Compute antenna temperature via beam-weighted sum
-                num, den = _beam_sum(
-                    self.beam.nside,
-                    beam_recon_jax,
-                    sky_masked_jax,
-                    crds_top,
-                    jnp.eye(3, dtype=DTYPE_R_JAX)[None, :, :],  # Identity rotation
-                    npix_sky=self.sky.npix
-                )
-                dipole_temps.append(num[0] / den[0])
-            antenna_temp_list.append(jnp.stack(dipole_temps))
-
-        antenna_temp = jnp.stack(antenna_temp_list)
-        return antenna_temp
+        # Single JIT-compiled call: scan over time, vmap over dipoles
+        return self._sim_jit(
+            sky_coeffs_jax, beam_coeffs_jax, masks_jax, crds_top_jax,
+            jnp.asarray(T_gnd, dtype=DTYPE_R_JAX)
+        )
 
 
 class SourceCatalog:
