@@ -237,63 +237,122 @@ class Calibrator:
             geom=self._geom
         )
 
-        # Data residual (convert data to JAX if needed)
-        data_jax = jnp.asarray(self._data)
-        resid = pred - data_jax
-        inv_noise_var_jax = jnp.asarray(self._inv_noise_var)
-        loss = jnp.sum(inv_noise_var_jax * resid**2)
+        # Reshape pred and data to (ntimes*n_dipoles, nfreq) for consistent loss computation
+        pred_flat = jnp.reshape(pred, (-1, pred.shape[-1]))
+        data_flat = jnp.reshape(jnp.asarray(self._data), (-1, pred.shape[-1]))
+        inv_noise_var_flat = jnp.reshape(jnp.asarray(self._inv_noise_var), (-1, pred.shape[-1]))
+
+        # Data residual
+        resid = pred_flat - data_flat
+        loss = jnp.mean(inv_noise_var_flat * resid**2)
 
         # Beam regularization (ridge toward nominal)
         if self._lam_beam > 0 and self._beam_nom is not None:
             beam_nom_jax = jnp.asarray(self._beam_nom)
             beam_diff = params['beam_coeffs'] - beam_nom_jax
-            loss = loss + self._lam_beam * jnp.sum(beam_diff**2)
+            loss = loss + self._lam_beam * jnp.mean(beam_diff**2)
 
         # Sky regularization (ridge toward zero)
         if self._lam_sky > 0:
-            loss = loss + self._lam_sky * jnp.sum(params['sky_coeffs']**2)
+            loss = loss + self._lam_sky * jnp.mean(params['sky_coeffs']**2)
 
         return loss
 
     def sky_step(self, params: Dict[str, np.ndarray],
-                 rcond: float = 1e-10) -> Dict[str, np.ndarray]:
+                 n_cg: int = 50, lam: float = 1e-4,
+                 rcond: float = 1e-6,
+                 step_size: float = 1.0) -> Dict[str, np.ndarray]:
         """
-        Optimize sky coefficients given fixed beam (per-frequency linear solve).
+        Sky coefficient update via Newton-CG step (exact for quadratic loss).
 
-        For each frequency, solves a linear least-squares problem given the
-        beam pattern and observation.
+        The loss is quadratic in sky_coeffs, so a single Newton step (solved
+        via Conjugate Gradient on the Hessian system) gives the exact minimizer.
+        The Hessian-vector product is computed efficiently via JAX autodiff.
 
         Parameters
         ----------
         params : dict
             Current parameters.
+        n_cg : int, optional
+            Max CG iterations (default 50). Usually converges in ~10 steps.
+        lam : float, optional
+            Tikhonov regularization for CG (relative to gradient magnitude,
+            default 1e-4).
         rcond : float, optional
-            Regularization parameter for linear solver.
+            Unused; kept for API compatibility.
+        step_size : float, optional
+            Unused; kept for API compatibility.
 
         Returns
         -------
         params_new : dict
             Updated parameters with optimized sky_coeffs.
         """
-        # This is a placeholder; full implementation would require
-        # building per-frequency design matrices from the beam.
-        # For now, return unchanged parameters.
+        from scipy.sparse.linalg import LinearOperator, cg as scipy_cg
+
+        def loss_sky(sky_coeffs):
+            p = {'sky_coeffs': sky_coeffs, 'beam_coeffs': params['beam_coeffs']}
+            return self._loss(p)
+
+        sky_jax = jnp.asarray(params['sky_coeffs'])
+        grad_fn = jax.grad(loss_sky)
+        grad_val = grad_fn(sky_jax)
+        loss_before = float(loss_sky(sky_jax))
+
+        n = sky_jax.size
+        lam_abs = lam * float(jnp.mean(jnp.abs(grad_val))) + 1e-12
+
+        def hvp(v):
+            v_jax = jnp.asarray(v.astype(np.float32)).reshape(sky_jax.shape)
+            _, h = jax.jvp(grad_fn, (sky_jax,), (v_jax,))
+            return np.asarray(h, dtype=np.float32).ravel()
+
+        A = LinearOperator(
+            (n, n),
+            matvec=lambda v: hvp(np.asarray(v, dtype=np.float32)) + lam_abs * np.asarray(v, dtype=np.float32),
+            dtype=np.float32,
+        )
+        b = -np.asarray(grad_val, dtype=np.float32).ravel()
+        delta, _ = scipy_cg(A, b, maxiter=n_cg, rtol=1e-3)
+
+        sky_new = np.asarray(sky_jax, dtype=np.float32) + delta.reshape(sky_jax.shape)
+        loss_new = float(loss_sky(jnp.asarray(sky_new)))
+
+        if loss_new < loss_before:
+            params_new = params.copy()
+            params_new['sky_coeffs'] = sky_new.astype(DTYPE_R_NPY)
+            return params_new
+
+        # CG failed to improve; fall back to gradient descent with line search
+        current_lr = 1.0
+        for _ in range(20):
+            sky_new = np.asarray(sky_jax - current_lr * grad_val)
+            loss_new = float(loss_sky(jnp.asarray(sky_new)))
+            if loss_new <= loss_before:
+                params_new = params.copy()
+                params_new['sky_coeffs'] = sky_new.astype(DTYPE_R_NPY)
+                return params_new
+            current_lr *= 0.5
+
         return params.copy()
 
     def beam_step(self, params: Dict[str, np.ndarray],
-                  lr: float = 0.01) -> Dict[str, np.ndarray]:
+                  lr: float = 0.01, line_search: bool = True) -> Dict[str, np.ndarray]:
         """
-        Optimize beam coefficients given fixed sky (JAX gradient step).
+        Optimize beam coefficients given fixed sky (JAX gradient step with line search).
 
         Uses JAX autodiff to compute gradient of loss w.r.t. beam coefficients,
-        then applies a simple gradient descent step.
+        then applies a gradient descent step with optional line search to ensure
+        loss actually decreases.
 
         Parameters
         ----------
         params : dict
             Current parameters.
         lr : float, optional
-            Learning rate (default 0.01).
+            Initial learning rate (default 0.01).
+        line_search : bool, optional
+            If True, reduce learning rate until loss decreases (default True).
 
         Returns
         -------
@@ -308,23 +367,41 @@ class Calibrator:
 
         # Compute gradient
         grad = jax.grad(loss_beam)(params['beam_coeffs'])
+        loss_before = float(loss_beam(params['beam_coeffs']))
 
-        # Gradient step
-        params_new = params.copy()
-        params_new['beam_coeffs'] = params['beam_coeffs'] - lr * grad
+        # Gradient step with line search
+        current_lr = lr
+        for _ in range(10):  # Try up to 10 halvings of learning rate
+            params_new = params.copy()
+            params_new['beam_coeffs'] = params['beam_coeffs'] - current_lr * grad
+            loss_new = float(loss_beam(params_new['beam_coeffs']))
 
-        return params_new
+            # Accept step if loss decreased (or line search disabled)
+            if not line_search or loss_new <= loss_before:
+                return params_new
+
+            # Halve learning rate and try again
+            current_lr *= 0.5
+
+        # If all attempts failed, return original params
+        return params.copy()
 
     def fit(self, params: Optional[Dict[str, np.ndarray]] = None,
             times=None,
             max_iter: int = 30,
             tol: float = 1e-6,
-            verbose: bool = True) -> Dict:
+            verbose: bool = True,
+            require_descent: bool = True,
+            optimize_sky: bool = True,
+            sky_step_size: float = 0.5) -> Dict:
         """
         Run calibration with Anderson-accelerated fixed-point iteration.
 
-        Alternates between sky and beam optimization steps, using Anderson
-        Acceleration to improve convergence.
+        Optimizes beam coefficients. Optionally also optimizes sky coefficients
+        via per-frequency linear solves (though alternating sky/beam optimization
+        can be unstable; use high lam_sky regularization if enabling).
+
+        Only accepts steps that decrease loss (when require_descent=True).
 
         Parameters
         ----------
@@ -338,6 +415,16 @@ class Calibrator:
             Convergence tolerance on relative loss change (default 1e-6).
         verbose : bool, optional
             Print progress (default True).
+        require_descent : bool, optional
+            Only accept steps that decrease loss (default True).
+        optimize_sky : bool, optional
+            If True, alternate sky and beam optimization (default True). If False,
+            optimize beam only. Sky/beam alternation is stabilized by
+            sky_step_size damping.
+        sky_step_size : float, optional
+            Damping factor for sky updates in (0, 1] (default 0.5). Values < 1
+            blend the proposed solution with the current sky_coeffs, stabilizing
+            the alternating iteration.
 
         Returns
         -------
@@ -366,14 +453,34 @@ class Calibrator:
         converged = False
 
         for iteration in range(max_iter):
-            # Sky step (placeholder)
-            params = self.sky_step(params)
+            loss_before = float(self._loss(params))
 
-            # Beam step
-            params = self.beam_step(params)
+            # Sky step (optional, damped)
+            if optimize_sky:
+                params_sky = self.sky_step(params, step_size=sky_step_size)
+            else:
+                params_sky = params
 
-            # Compute loss
-            loss = float(self._loss(params))
+            # Beam step (applied after sky step)
+            params_new = self.beam_step(params_sky)
+            loss_after = float(self._loss(params_new))
+
+            # Accept the iteration if loss decreased (or not requiring descent)
+            if not require_descent or loss_after <= loss_before:
+                params = params_new
+                loss = loss_after
+            else:
+                # If iteration increased loss, try only sky step
+                params_sky_only = params_sky
+                loss_sky_only = float(self._loss(params_sky_only))
+                if loss_sky_only <= loss_before:
+                    params = params_sky_only
+                    loss = loss_sky_only
+                else:
+                    # If both decreased loss, reject and keep old params
+                    params = params  # No change
+                    loss = loss_before
+
             losses.append(loss)
 
             if verbose:

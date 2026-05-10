@@ -187,6 +187,117 @@ def test_calibrator_fit_with_noise_weights():
     assert len(result['losses']) == result['n_iter']
 
 
+def test_calibrator_loss_normalization_invariance():
+    """
+    Calibrator: loss uses mean (normalized) not sum for data residual.
+
+    This test would have exposed the previous bug where loss was computed as
+    jnp.sum(residuals**2) instead of jnp.mean(residuals**2). With unnormalized
+    loss, the gradient magnitude scales linearly with dataset size, causing
+    huge parameter updates even with small learning rates.
+
+    The test verifies that loss computation doesn't scale pathologically with
+    a constant-residual dataset.
+    """
+    fwd = setup_forward_model()
+
+    # Create datasets with 1 and 2 time steps
+    times_1 = [Time("2000-01-01")]
+    times_2 = [Time("2000-01-01"), Time("2000-01-01 00:01:00")]
+
+    data_1 = np.ones((1, 2, 2), dtype=np.float32) * 100.0
+    data_2 = np.ones((2, 2, 2), dtype=np.float32) * 100.0
+
+    cal_1 = Calibrator(fwd, data_1, lam_beam=0.0)
+    cal_2 = Calibrator(fwd, data_2, lam_beam=0.0)
+
+    params_1 = cal_1.init_params(times=times_1)
+    params_2 = cal_2.init_params(times=times_2)
+
+    loss_1 = float(cal_1._loss(params_1))
+    loss_2 = float(cal_2._loss(params_2))
+
+    # With normalized loss (mean), loss should scale gently with dataset size.
+    # With unnormalized loss (sum), loss_2 would be roughly 2x loss_1 even with
+    # identical residuals per observation.
+    # Since observations have same residuals, loss ratio should be close to 1
+    # (actual ratio will vary slightly due to geometry changes with time).
+    loss_ratio = loss_2 / loss_1
+    assert 0.5 < loss_ratio < 2.0, (
+        f"Loss scaling issue: ratio = {loss_ratio}. "
+        f"If much > 1, suggests unnormalized loss (sum). "
+        f"loss_1={loss_1}, loss_2={loss_2}"
+    )
+
+
+def test_calibrator_sky_step_updates_coeffs():
+    """Calibrator: sky_step() actually updates sky coefficients."""
+    fwd = setup_forward_model()
+    np.random.seed(42)
+    data = np.random.randn(2, 2, 2).astype(np.float32) * 10.0 + 100.0
+
+    cal = Calibrator(fwd, data)
+    params = cal.init_params(times=[Time("2000-01-01")] * 2)
+
+    # Verify initial sky coefficients are zero
+    assert np.allclose(params['sky_coeffs'], 0.0), "Initial sky_coeffs should be zero"
+
+    # Take a sky step
+    params_after = cal.sky_step(params)
+
+    # Sky coefficients should have changed (non-zero)
+    sky_change = np.max(np.abs(params_after['sky_coeffs'] - params['sky_coeffs']))
+    assert sky_change > 1e-6, (
+        f"Sky coefficients did not change: max change = {sky_change}. "
+        f"sky_step() may not be optimizing properly."
+    )
+
+    # Beam coefficients should remain unchanged
+    assert np.allclose(params_after['beam_coeffs'], params['beam_coeffs']), (
+        "Beam coefficients should not change during sky_step"
+    )
+
+
+def test_calibrator_beam_step_decreases_loss():
+    """
+    Calibrator: beam_step with lr=0.01 should decrease (or not increase) loss.
+
+    This test would have exposed the previous bug where unnormalized loss caused
+    gradients to be huge relative to learning rate, leading to divergence where
+    a single beam_step could increase loss by 690x.
+    """
+    fwd = setup_forward_model()
+    # Create data with known structure
+    np.random.seed(42)
+    data = np.random.randn(2, 2, 2).astype(np.float32) * 10.0 + 100.0
+
+    cal = Calibrator(fwd, data, lam_beam=0.01)
+    params = cal.init_params(times=[Time("2000-01-01")] * 2)
+
+    # Compute initial loss
+    loss_before = float(cal._loss(params))
+
+    # Take a single beam step with default learning rate
+    params_after = cal.beam_step(params, lr=0.01)
+    loss_after = float(cal._loss(params_after))
+
+    # Loss should not explode (relative change should be < 10)
+    # With the bug, this would be > 100x increase
+    rel_change = abs(loss_after - loss_before) / loss_before
+    assert rel_change < 10.0, (
+        f"Beam step caused huge loss change: {rel_change:.2e}. "
+        f"Suggests unnormalized loss in gradient computation. "
+        f"loss_before={loss_before}, loss_after={loss_after}"
+    )
+
+    # Parameter changes should be reasonable (order 1e-3 to 1e-1)
+    beam_change = np.max(np.abs(params_after['beam_coeffs'] - params['beam_coeffs']))
+    assert beam_change < 1.0, (
+        f"Beam coefficients changed by {beam_change}, likely too much. "
+        f"Suggests learning rate or gradient magnitude issue."
+    )
+
+
 if __name__ == "__main__":
     test_anderson_accelerator_basic()
     test_anderson_accelerator_reset()
@@ -200,4 +311,7 @@ if __name__ == "__main__":
     test_calibrator_beam_step()
     test_calibrator_fit_convergence()
     test_calibrator_fit_with_noise_weights()
+    test_calibrator_loss_normalization_invariance()
+    test_calibrator_sky_step_updates_coeffs()
+    test_calibrator_beam_step_decreases_loss()
     print("\n✓ All Phase 7 (calibrator.py) tests passed!")
