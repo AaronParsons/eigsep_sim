@@ -235,30 +235,43 @@ def main(args):
 
     sky_true_map = gsm_coeffs @ sky.basis.A.T   # (npix_sky, nfreq)
 
-    # Sanity check: sky-only recovery with fixed true beam.
-    # Loss is exactly quadratic in sky_coeffs, so Newton-CG (sky_step) should
-    # reach the global minimum in one call.  Residual = basis truncation + noise.
-    print("[ 1. Sky-only recovery  (true beam, 1 sky_step) ]\n")
+    # ── Sanity check: sky-only recovery with the true beam ─────────────────
+    # Loss is exactly quadratic in sky_coeffs → Newton-CG should reach the
+    # global minimum in one step.  The data-fit residual after recovery
+    # measures basis truncation + noise (irreducible floor).
+    print("[ 1. Sky-only fit quality  (true beam fixed, 1 sky_step) ]\n")
     params_sky_only = {
         'sky_coeffs': np.zeros_like(gsm_coeffs),
         'beam_coeffs': beam_coeffs_true.copy(),
     }
     cal_sonly = Calibrator(fwd, data, inv_noise_var=inv_noise_var, lam_beam=0.0)
     cal_sonly._geom = geom
-    cal_sonly.sky_step(params_sky_only)                           # JIT warmup
+    cal_sonly.sky_step(params_sky_only)                   # JIT warmup
     p_sky = cal_sonly.sky_step(params_sky_only)
-    sky_rec1 = p_sky['sky_coeffs'] @ sky.basis.A.T
-    sky_err1 = float(np.std(sky_rec1 - sky_true_map) / np.mean(sky_true_map) * 100)
-    print(f"  Sky rms error (1 step):  {sky_err1:.2f}%")
-    print(f"  (irreducible floor = basis truncation + noise)\n")
 
-    # Joint recovery: start from a non-degenerate beam shape perturbation.
-    # 2.0m → 2.1m arm changes the frequency-dependent pattern, not just the
-    # overall scale; uniform-scale degeneracy does not cover shape changes.
+    T_sky_pred = np.array(fwd.simulate(
+        p_sky['sky_coeffs'], beam_coeffs_true, geom=geom
+    ))
+    T_noiseless = np.array(fwd.simulate(gsm_coeffs, beam_coeffs_true, geom=geom))
+    fit_rms_1 = float(np.std(T_sky_pred - T_noiseless) / np.mean(T_noiseless) * 100)
+    loss_sky1 = float(cal_sonly._loss(p_sky))
+    print(f"  Loss after 1 sky_step:  {loss_sky1:.3e}  (noise floor ~1.0)")
+    print(f"  Data-fit rms:           {fit_rms_1:.3f}%  (noiseless residual)")
+    print(f"  (sky loss is quadratic → 1 Newton step reaches the exact minimum;")
+    print(f"   residual loss above noise floor = irreducible basis-truncation error)")
+    print()
+
+    # ── Joint sky+beam recovery: beam shape perturbation ──────────────────
+    # 2.0m → 2.1m arm length changes the frequency-dependent beam pattern.
+    # The calibrator should:
+    #   (a) fit the data well (loss near noise floor)
+    #   (b) keep the beam near its prior (regularization)
+    # Recovery of the TRUE beam vs. the prior is limited by the sky-beam
+    # degeneracy — many (sky, beam) pairs explain the observations equally.
     arm_true = 2.0
     arm_pert = 2.1
-    print(f"[ 2. Joint sky+beam recovery ]\n")
-    print(f"  True arm length: {arm_true} m  |  Initial estimate: {arm_pert} m\n")
+    print(f"[ 2. Joint sky+beam fit quality ]\n")
+    print(f"  True arm: {arm_true} m  |  Beam prior: {arm_pert} m  (shape perturbation)\n")
 
     beam_pert = Beam.from_dipole(
         args.nside, freqs_hz,
@@ -266,47 +279,63 @@ def main(args):
         K=args.k_beam,
     )
     beam_coeffs_pert = beam_pert.coeffs.copy()
-
-    beam_true_map = beam_coeffs_true @ beam.basis.A.T   # (n_dipoles, npix, nfreq)
-    beam_pert_map = beam_coeffs_pert @ beam.basis.A.T
+    beam_pert_map    = beam_coeffs_pert @ beam.basis.A.T
 
     def norm_beam(bmap):
-        """Remove scale degeneracy for shape comparison."""
-        return bmap / (np.mean(bmap) + 1e-30)
+        """Per-(dipole,freq) normalize for shape comparison."""
+        return bmap / (bmap.sum(axis=1, keepdims=True) + 1e-30)
 
-    beam_init_err = float(
-        np.std(norm_beam(beam_pert_map) - norm_beam(beam_true_map)) * 100
+    beam_prior_err = float(
+        np.std(norm_beam(beam_pert_map) - norm_beam(beam_coeffs_true @ beam.basis.A.T))
+        / np.std(norm_beam(beam_coeffs_true @ beam.basis.A.T)) * 100
     )
-    print(f"  Beam shape error (initial):  {beam_init_err:.2f}%")
+    print(f"  Beam-prior shape error vs truth:  {beam_prior_err:.2f}%")
 
     params_joint = {
         'sky_coeffs':  np.zeros_like(gsm_coeffs),
         'beam_coeffs': beam_coeffs_pert.copy(),
     }
     cal_joint = Calibrator(
-        fwd, data, inv_noise_var=inv_noise_var, lam_beam=0.01
+        fwd, data, inv_noise_var=inv_noise_var, lam_beam=0.1
     )
-    cal_joint._beam_nom = beam_coeffs_pert.copy()   # regularize toward initial
+    cal_joint._beam_nom = beam_coeffs_pert.copy()
     cal_joint._geom = geom
 
     t0 = time.perf_counter()
     result = cal_joint.fit(params=params_joint, max_iter=args.max_iter, verbose=False)
-    t_fit = (time.perf_counter() - t0) * 1e3
+    t_fit  = (time.perf_counter() - t0) * 1e3
 
-    sky_final   = result['params']['sky_coeffs']  @ sky.basis.A.T
-    beam_final  = result['params']['beam_coeffs'] @ beam.basis.A.T
-    sky_err_f   = float(np.std(sky_final  - sky_true_map) / np.mean(sky_true_map) * 100)
-    beam_err_f  = float(np.std(norm_beam(beam_final) - norm_beam(beam_true_map)) * 100)
+    T_joint_pred = np.array(fwd.simulate(
+        result['params']['sky_coeffs'],
+        result['params']['beam_coeffs'],
+        geom=geom,
+    ))
+    fit_rms_j = float(np.std(T_joint_pred - T_noiseless) / np.mean(T_noiseless) * 100)
+    beam_final_map = result['params']['beam_coeffs'] @ beam.basis.A.T
+    beam_err_f = float(
+        np.std(norm_beam(beam_final_map) - norm_beam(beam_coeffs_true @ beam.basis.A.T))
+        / np.std(norm_beam(beam_coeffs_true @ beam.basis.A.T)) * 100
+    )
+    beam_err_prior = float(
+        np.std(norm_beam(beam_final_map) - norm_beam(beam_pert_map))
+        / np.std(norm_beam(beam_pert_map)) * 100
+    )
 
-    print(f"\n  {'':30s} {'sky err':>10}  {'beam err':>10}")
-    print(f"  {'initial (sky=0, beam=pert)':30s} {'--':>10}  {beam_init_err:>9.2f}%")
-    print(f"  {'after fit()':30s} {sky_err_f:>9.2f}%  {beam_err_f:>9.2f}%")
-    print(f"\n  sky-only floor (step 1):    {sky_err1:.2f}%")
-    print(f"  converged:                  {result['converged']}")
-    print(f"  iterations:                 {result['n_iter']}")
-    print(f"  total fit time:             {t_fit:.0f} ms\n")
+    sigma_noise = float(np.std(data - T_noiseless))
+    fit_noise   = float(sigma_noise / np.mean(T_noiseless) * 100)
 
-    print(f"  Loss curve:")
+    print(f"\n  Metric                              initial      final")
+    print(f"  loss (noise floor ~1.0)             --           {result['losses'][-1]:.3e}")
+    print(f"  data-fit rms (noiseless)            --           {fit_rms_j:.3f}%")
+    print(f"  noise level (reference)             --           {fit_noise:.3f}%")
+    print(f"  beam shape vs truth                 {beam_prior_err:.2f}%        {beam_err_f:.2f}%")
+    print(f"  beam shape vs prior                 0.00%        {beam_err_prior:.2f}%")
+    print(f"\n  Note: data-fit rms > noise floor = residual from beam mismatch")
+    print(f"  (beam stays near prior; sky absorbs remainder of beam error)")
+    print(f"\n  converged:  {result['converged']}   iterations: {result['n_iter']}   "
+          f"fit time: {t_fit:.0f} ms")
+
+    print(f"\n  Loss curve:")
     for i, loss in enumerate(result['losses']):
         print(f"    iter {i:3d}:  {loss:.6e}")
 

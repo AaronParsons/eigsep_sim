@@ -314,7 +314,13 @@ class Calibrator:
         b = -grad_val.ravel()
         delta, _ = jax.scipy.sparse.linalg.cg(hvp_flat, b, maxiter=n_cg, tol=1e-3)
 
-        sky_new = (sky_jax.ravel() + delta).reshape(sky_jax.shape)
+        # Apply step_size damping before checking improvement.
+        # step_size < 1 is intentional for joint sky+beam recovery: a full
+        # Newton sky step brings sky to its optimal point given the current
+        # beam, making the beam gradient (data term) near-zero and preventing
+        # beam calibration.  A partial step leaves residual signal for the beam
+        # step to act on, enabling convergence of the joint problem.
+        sky_new = (sky_jax.ravel() + step_size * delta).reshape(sky_jax.shape)
         loss_new = float(loss_sky(sky_new))
 
         if loss_new < loss_before:
@@ -323,9 +329,9 @@ class Calibrator:
             return params_new
 
         # CG failed to improve; fall back to gradient descent with line search
-        current_lr = 1.0
+        current_lr = step_size
         for _ in range(20):
-            sky_new = sky_jax - current_lr * grad_val
+            sky_new = (sky_jax.ravel() - current_lr * grad_val.ravel()).reshape(sky_jax.shape)
             loss_new = float(loss_sky(sky_new))
             if loss_new <= loss_before:
                 params_new = params.copy()
@@ -411,7 +417,7 @@ class Calibrator:
     def joint_step(self, params: Dict[str, np.ndarray],
                    n_cg: int = 100, lam: float = 1e-4) -> Dict[str, np.ndarray]:
         """
-        Joint sky+beam Newton-CG step.
+        Joint sky+beam Newton-CG step with block-diagonal preconditioner.
 
         Treats sky_coeffs and beam_coeffs as a single flat parameter vector and
         applies one Newton step via conjugate gradient on the joint Hessian system.
@@ -423,9 +429,12 @@ class Calibrator:
         This breaks the trap where a converged sky absorbs beam error and makes
         beam updates appear loss-increasing.
 
-        The loss is quadratic in sky_coeffs but nonlinear in beam_coeffs, so CG
-        acts as the inner solver of a truncated Newton method.  Convergence is
-        superlinear in the outer loop (one call = one Newton iteration).
+        The sky Hessian diagonal (O(1e-5)) and beam Hessian diagonal (O(1e4))
+        differ by ~9 orders of magnitude.  A single joint Rademacher probe averages
+        these, yielding a lam_abs that catastrophically over-regularizes sky while
+        under-regularizing beam.  Two separate probes (one per block) give
+        block-appropriate regularization: lam_abs_sky ≈ lam × H_sky and
+        lam_abs_beam ≈ lam × H_beam.
 
         Parameters
         ----------
@@ -434,7 +443,7 @@ class Calibrator:
         n_cg : int, optional
             Max CG iterations per Newton step (default 100).
         lam : float, optional
-            Tikhonov regularization relative to gradient magnitude (default 1e-4).
+            Tikhonov regularization relative to per-block H-diagonal (default 1e-4).
 
         Returns
         -------
@@ -445,6 +454,7 @@ class Calibrator:
         beam_jax = jnp.asarray(params['beam_coeffs'])
         sky_shape, beam_shape = sky_jax.shape, beam_jax.shape
         n_sky = sky_jax.size
+        n_beam = beam_jax.size
 
         def pack(sky, beam):
             return jnp.concatenate([sky.ravel(), beam.ravel()])
@@ -461,15 +471,32 @@ class Calibrator:
         loss_before = float(loss_joint(theta))
         grad_val = grad_fn(theta)
 
+        # Block-diagonal Rademacher probes: separate H-diagonal estimates for sky
+        # and beam.  The sky and beam Hessian diagonals differ by ~9 orders of
+        # magnitude so a single joint probe would give wildly inappropriate lam_abs
+        # for one of the two blocks.  Two probes cost two HVP evaluations (same as
+        # one probe + one fallback) but give block-appropriate regularization.
+        zeros_beam = jnp.zeros(n_beam, dtype=theta.dtype)
+        zeros_sky  = jnp.zeros(n_sky,  dtype=theta.dtype)
+
         rng_key = jax.random.PRNGKey(0)
-        v_probe = jax.random.rademacher(rng_key, theta.shape, dtype=theta.dtype)
-        _, h_probe = jax.jvp(grad_fn, (theta,), (v_probe,))
-        h_diag_est = float(jnp.sum(h_probe * v_probe) / jnp.sum(v_probe * v_probe))
-        lam_abs = lam * max(abs(h_diag_est), 1e-12) + 1e-12
+        v_sky = jax.random.rademacher(rng_key, (n_sky,), dtype=theta.dtype)
+        v_probe_sky = jnp.concatenate([v_sky, zeros_beam])
+        _, h_probe_sky = jax.jvp(grad_fn, (theta,), (v_probe_sky,))
+        h_sky_est = float(jnp.sum(h_probe_sky[:n_sky] * v_sky) / n_sky)
+        lam_abs_sky = lam * max(abs(h_sky_est), 1e-12) + 1e-12
+
+        rng_key2 = jax.random.PRNGKey(1)
+        v_beam = jax.random.rademacher(rng_key2, (n_beam,), dtype=theta.dtype)
+        v_probe_beam = jnp.concatenate([zeros_sky, v_beam])
+        _, h_probe_beam = jax.jvp(grad_fn, (theta,), (v_probe_beam,))
+        h_beam_est = float(jnp.sum(h_probe_beam[n_sky:] * v_beam) / n_beam)
+        lam_abs_beam = lam * max(abs(h_beam_est), 1e-12) + 1e-12
 
         def hvp_flat(v):
             _, h = jax.jvp(grad_fn, (theta,), (v,))
-            return h + lam_abs * v
+            reg = jnp.concatenate([lam_abs_sky * v[:n_sky], lam_abs_beam * v[n_sky:]])
+            return h + reg
 
         delta, _ = jax.scipy.sparse.linalg.cg(
             hvp_flat, -grad_val, maxiter=n_cg, tol=1e-3
@@ -561,13 +588,15 @@ class Calibrator:
             max_iter: int = 30,
             tol: float = 1e-6,
             verbose: bool = True,
-            use_cg: bool = True) -> Dict:
+            use_cg: bool = False,
+            use_joint: bool = False,
+            sky_step_size: float = 1.0) -> Dict:
         """
         Run calibration with Anderson-accelerated alternating sky/beam iteration.
 
         Each iteration:
           1. sky_step  — near-exact Newton-CG solve (quadratic in sky_coeffs)
-          2. beam_cg_step (use_cg=True) or beam_step (use_cg=False)
+          2. beam_cg_step (use_cg=True), joint_step (use_joint=True), or beam_step
           3. Anderson Acceleration on the beam coefficients
 
         Parameters
@@ -583,9 +612,19 @@ class Calibrator:
         verbose : bool, optional
             Print per-iteration progress (default True).
         use_cg : bool, optional
-            If True (default), use beam_cg_step (Newton-CG with curvature
-            information). If False, use beam_step (gradient descent with
-            line search) — cheaper per iteration but slower to converge.
+            If True, use beam_cg_step (Newton-CG) for the beam step. Default
+            False: use beam_step (gradient descent with line search), which is
+            more stable for joint sky+beam recovery.
+        use_joint : bool, optional
+            If True, replace sky_step + beam_step with a single joint_step that
+            optimizes sky and beam simultaneously via Newton-CG with block-diagonal
+            regularization.  This uses the off-diagonal Hessian coupling to avoid
+            the alternating trap (sky absorbing beam error), enabling beam
+            convergence even when the alternating steps stall.
+            Overrides use_cg when True.
+        sky_step_size : float, optional
+            Damping factor for the sky Newton step in alternating mode (default
+            1.0 = full step). Ignored when use_joint=True.
 
         Returns
         -------
@@ -610,14 +649,18 @@ class Calibrator:
         for iteration in range(max_iter):
             beam_old = params['beam_coeffs'].copy()
 
-            # Sky step: near-exact linear solve (always improves sky given beam)
-            params = self.sky_step(params)
-
-            # Beam step: Newton-CG (with GD fallback) or plain gradient descent
-            if use_cg:
-                params = self.beam_cg_step(params)
+            if use_joint:
+                # Joint Newton-CG: sky + beam updated simultaneously.
+                # Block-diagonal regularization prevents the sky Hessian (O(1e-5))
+                # and beam Hessian (O(1e4)) from interfering with each other.
+                params = self.joint_step(params)
             else:
-                params = self.beam_step(params)
+                # Alternating: sky first (near-exact quadratic solve), then beam.
+                params = self.sky_step(params, step_size=sky_step_size)
+                if use_cg:
+                    params = self.beam_cg_step(params)
+                else:
+                    params = self.beam_step(params)
 
             # Anderson Acceleration on beam coefficients.
             # The fixed-point residual is (new_beam - old_beam); AA extrapolates

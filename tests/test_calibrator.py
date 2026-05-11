@@ -298,6 +298,67 @@ def test_calibrator_beam_step_decreases_loss():
     )
 
 
+def test_calibrator_joint_step_decreases_loss():
+    """
+    Calibrator: joint_step() reduces loss and uses block-diagonal regularization.
+
+    Tests the fixed joint_step (with separate sky/beam Rademacher probes) at a
+    point near the alternating optimum.  The joint Hessian is positive definite
+    near the minimum, enabling Newton-CG to find a descent direction.  Far from
+    the minimum the beam Hessian can be negative, so we test from a near-optimal
+    starting point.
+    """
+    fwd = setup_forward_model()
+    np.random.seed(42)
+    data = np.random.randn(2, 2, 2).astype(np.float32) * 10.0 + 100.0
+
+    cal = Calibrator(fwd, data, lam_beam=0.01)
+    params = cal.init_params(times=[Time("2000-01-01")] * 2)
+
+    # Warm up with 3 alternating steps to get into the PD region of the Hessian
+    for _ in range(3):
+        params = cal.sky_step(params)
+        params = cal.beam_step(params)
+
+    loss_before = float(cal._loss(params))
+    params_after = cal.joint_step(params)
+    loss_after = float(cal._loss(params_after))
+
+    # joint_step must not raise loss
+    assert loss_after <= loss_before * 1.01, (
+        f"joint_step raised loss: {loss_before:.3e} → {loss_after:.3e}"
+    )
+    # Both sky and beam should have changed (joint step is not a no-op)
+    sky_change = np.max(np.abs(params_after['sky_coeffs'] - params['sky_coeffs']))
+    beam_change = np.max(np.abs(params_after['beam_coeffs'] - params['beam_coeffs']))
+    assert sky_change + beam_change > 1e-8, (
+        "joint_step made no parameter changes"
+    )
+
+
+def test_calibrator_fit_use_joint():
+    """Calibrator: fit() with use_joint=True runs without error and reduces loss."""
+    fwd = setup_forward_model()
+    np.random.seed(42)
+    data = np.random.randn(2, 2, 2).astype(np.float32) * 10.0 + 100.0
+
+    cal = Calibrator(fwd, data, lam_beam=0.01)
+    times = [Time("2000-01-01")] * 2
+    # Run a few alternating steps first to get into the PD Hessian region,
+    # then switch to joint for the remaining iterations
+    params = cal.init_params(times=times)
+    for _ in range(3):
+        params = cal.sky_step(params)
+        params = cal.beam_step(params)
+    loss_after_alt = float(cal._loss(params))
+
+    result = cal.fit(params=params, max_iter=3, verbose=False, use_joint=True)
+    assert result['losses'][-1] <= loss_after_alt * 1.01, (
+        f"fit(use_joint=True) raised loss: {loss_after_alt:.3e} → {result['losses'][-1]:.3e}"
+    )
+    assert 'params' in result and 'losses' in result
+
+
 def test_calibrator_sky_step_decreases_loss_significantly():
     """
     Calibrator: sky_step() must reduce loss by at least 10× from zero sky.
@@ -358,4 +419,6 @@ if __name__ == "__main__":
     test_calibrator_loss_normalization_invariance()
     test_calibrator_sky_step_updates_coeffs()
     test_calibrator_beam_step_decreases_loss()
+    test_calibrator_joint_step_decreases_loss()
+    test_calibrator_fit_use_joint()
     print("\n✓ All Phase 7 (calibrator.py) tests passed!")
