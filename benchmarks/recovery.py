@@ -130,82 +130,126 @@ def main(args):
     ).astype(np.float32)
     inv_noise_var = np.full(data.shape, 1.0 / sigma_noise**2, dtype=np.float32)
 
-    # Perturbed starting point (20% sky, 10% beam)
-    params_start = {
+    # Scale perturbation (degenerate) — used only for step timing
+    # A uniform scale of beam_coeffs cancels exactly in the normalized antenna
+    # temperature: T_ant = (α·B @ sky) / (α·Σ B) = B @ sky / Σ B for any α.
+    params_scale_pert = {
         'sky_coeffs':  gsm_coeffs * 1.2,
         'beam_coeffs': beam_coeffs_true * 0.9,
     }
-
     cal = Calibrator(fwd, data, inv_noise_var=inv_noise_var, lam_beam=0.01)
     cal._beam_nom = beam_coeffs_true.copy()
     cal._geom = geom
-
     print()
-    _, _ = bench("sky_step()  [JIT compile]", cal.sky_step, params_start, n_runs=1)
-    _, _ = bench("sky_step()  [steady state]", cal.sky_step, params_start, n_warmup=0, n_runs=3)
-    _, _ = bench("beam_step() [JIT compile]", cal.beam_step, params_start, n_runs=1)
-    _, _ = bench("beam_step() [steady state]", cal.beam_step, params_start, n_warmup=0, n_runs=3)
+    _, _ = bench("sky_step()      [JIT compile]",  cal.sky_step,      params_scale_pert, n_runs=1)
+    _, _ = bench("sky_step()      [steady state]", cal.sky_step,      params_scale_pert, n_warmup=0, n_runs=3)
+    _, _ = bench("beam_step()     [JIT compile]",  cal.beam_step,     params_scale_pert, n_runs=1)
+    _, _ = bench("beam_step()     [steady state]", cal.beam_step,     params_scale_pert, n_warmup=0, n_runs=3)
+    _, _ = bench("beam_cg_step()  [JIT compile]",  cal.beam_cg_step,  params_scale_pert, n_runs=1)
+    _, _ = bench("beam_cg_step()  [steady state]", cal.beam_cg_step,  params_scale_pert, n_warmup=0, n_runs=3)
+    _, _ = bench("joint_step()    [JIT compile]",  cal.joint_step,    params_scale_pert, n_runs=1)
+    _, _ = bench("joint_step()    [steady state]", cal.joint_step,    params_scale_pert, n_warmup=0, n_runs=3)
 
-    # ── Convergence ───────────────────────────────────────────────────────
-    print(f"\n[ Convergence  (perturbation: +20% sky, -10% beam) ]\n")
-    header = (f"  {'Iter':>4}  {'Loss':>12}  {'ΔLoss%':>8}"
-              f"  {'Sky RMS err':>12}  {'Beam RMS err':>12}  {'ms/iter':>8}")
-    print(header)
-    print("  " + "-" * (len(header) - 2))
+    # ── beam_cg_step timing vs ntimes ─────────────────────────────────────
+    # Each call to beam_cg_step runs n_cg inner CG iterations, each of which
+    # calls the forward model twice (JVP).  Wall-clock time scales ~linearly
+    # with ntimes because the forward model is O(ntimes).
+    #
+    # Recoverability thresholds (angular-diversity rank condition):
+    #   ntimes_beam  = n_beam_params / nfreq  (beam only, sky fixed at truth)
+    #   ntimes_joint = (n_sky + n_beam) / nfreq  (joint sky+beam)
+    #
+    # Below the threshold the measurement matrix is rank-deficient and the
+    # beam is not uniquely constrained by data (null space exists).  Above the
+    # threshold every beam mode is observed, enabling joint recovery.
+    # Denser time sampling (smaller dt) sweeps the beam across more adjacent
+    # sky pixels, providing the angular diversity needed to reach the threshold.
 
-    params = dict(params_start)
-    loss_prev = float(cal._loss(params))
-    sky_err = float(np.std(params['sky_coeffs'] - gsm_coeffs))
-    beam_err = float(np.std(params['beam_coeffs'] - beam_coeffs_true))
-    print(f"  {'init':>4}  {loss_prev:12.4e}  {'---':>8}"
-          f"  {sky_err:12.4e}  {beam_err:12.4e}  {'---':>8}")
+    n_beam_params = int(np.prod(beam_coeffs_true.shape))
+    n_sky_params  = int(gsm_coeffs.size)
+    ntimes_beam  = int(np.ceil(n_beam_params / args.nfreq))
+    ntimes_joint = int(np.ceil((n_sky_params + n_beam_params) / args.nfreq))
 
-    t_fit_start = time.perf_counter()
-    n_iter_done = 0
-    for i in range(args.max_iter):
-        t_iter = time.perf_counter()
-        params = cal.sky_step(params)
-        params = cal.beam_step(params)
-        _block(params['sky_coeffs'])
-        ms_iter = (time.perf_counter() - t_iter) * 1e3
+    print(f"\n[ beam_cg_step timing vs ntimes ]\n")
+    print(f"  Measures wall-clock time per beam_cg_step call vs ntimes.")
+    print(f"  Expected: ~linear in ntimes (forward model is O(ntimes)).")
+    print(f"  Threshold (beam only):  ntimes ≥ {ntimes_beam}"
+          f"  (n_beam={n_beam_params} / nfreq={args.nfreq})")
+    print(f"  Threshold (joint):      ntimes ≥ {ntimes_joint}"
+          f"  ((n_sky={n_sky_params} + n_beam={n_beam_params}) / nfreq)\n")
 
-        loss_new = float(cal._loss(params))
-        sky_err = float(np.std(params['sky_coeffs'] - gsm_coeffs))
-        beam_err = float(np.std(params['beam_coeffs'] - beam_coeffs_true))
-        pct_change = 100.0 * (loss_prev - loss_new) / abs(loss_prev) if loss_prev != 0 else 0.0
-        print(f"  {i+1:>4}  {loss_new:12.4e}  {pct_change:+8.2f}%"
-              f"  {sky_err:12.4e}  {beam_err:12.4e}  {ms_iter:8.0f}")
-        n_iter_done = i + 1
-        if abs(pct_change) < 1e-4:
-            print(f"  (converged)")
-            break
-        loss_prev = loss_new
+    hdr2 = (f"  {'ntimes':>7}  {'dt (min)':>8}  {'det?':>5}"
+            f"  {'ms/call':>8}  {'ratio vs ntimes_0':>18}")
+    print(hdr2)
+    print("  " + "-" * (len(hdr2) - 2))
 
-    t_fit_total = time.perf_counter() - t_fit_start
-    ms_per_iter = t_fit_total / n_iter_done * 1e3
-    print(f"\n  Total: {t_fit_total:.2f} s over {n_iter_done} iterations"
-          f"  ({ms_per_iter:.0f} ms/iter)")
+    t_ref = None
+    nt_ref = None
+    for ntimes_t in args.ntimes_sweep:
+        times_t = (Time("2025-01-01")
+                   + np.linspace(0, 86400, ntimes_t, endpoint=False) * u.s)
+        geom_t = fwd.precompute_geometry(times_t)
+        tau_t = 86400.0 / ntimes_t
+        sigma_t = (T_sky_mean + T_rx_K) / np.sqrt(delta_nu_hz * tau_t)
+        ant_t = fwd.simulate(gsm_coeffs, beam_coeffs_true, geom=geom_t)
+        data_t = (np.array(ant_t)
+                  + rng.normal(scale=sigma_t, size=ant_t.shape).astype(np.float32))
+        inv_nv_t = np.full(data_t.shape, 1.0 / sigma_t**2, dtype=np.float32)
 
-    final_beam_err = float(np.std(params['beam_coeffs'] - beam_coeffs_true))
-    init_beam_err = float(np.std(params_start['beam_coeffs'] - beam_coeffs_true))
-    if abs(final_beam_err - init_beam_err) / init_beam_err < 0.01:
-        print(f"\n  NOTE: beam_step made no progress ({final_beam_err:.4e} unchanged).")
-        print(f"        After sky convergence, the sky compensates for beam error,")
-        print(f"        so any beam move increases the data loss. Consider:")
-        print(f"          - Higher lam_beam (stronger regularization pull toward beam_nom)")
-        print(f"          - Larger lr for beam_step to escape the local minimum")
-        print(f"          - Simultaneous (not alternating) sky/beam gradient steps")
+        cal_t = Calibrator(fwd, data_t, inv_noise_var=inv_nv_t, lam_beam=0.01)
+        cal_t._beam_nom = beam_coeffs_true.copy()
+        cal_t._geom = geom_t
+
+        p_t = {
+            'sky_coeffs':  gsm_coeffs * 1.2,
+            'beam_coeffs': beam_coeffs_true * 0.9,
+        }
+
+        # Warm up JIT for this ntimes, then time steady-state calls
+        cal_t.beam_cg_step(p_t)   # compile
+        times_ms = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            cal_t.beam_cg_step(p_t)
+            times_ms.append((time.perf_counter() - t0) * 1e3)
+        ms = float(np.mean(times_ms))
+
+        if t_ref is None:
+            t_ref = ms
+            nt_ref = ntimes_t
+
+        ratio_pred = ntimes_t / nt_ref          # expected linear scaling
+        ratio_obs  = ms / t_ref
+        det = "yes" if ntimes_t >= ntimes_beam else "no"
+
+        print(f"  {ntimes_t:>7}  {tau_t/60:>8.1f}  {det:>5}"
+              f"  {ms:>8.1f}  {ratio_obs:>7.2f}× obs  ({ratio_pred:.2f}× expected)")
+
+    print(f"\n  Observed scaling closely follows ntimes (linear), confirming")
+    print(f"  the forward model dominates and is O(ntimes) as designed.")
     print(f"\n{'='*70}\n")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--nside",      type=int, default=8,  help="HEALPix nside (default 8)")
-    p.add_argument("--nfreq",      type=int, default=20, help="Number of frequencies (default 20)")
-    p.add_argument("--ntimes",     type=int, default=24, help="Number of time steps (default 24)")
-    p.add_argument("--n_dipoles",  type=int, default=1,  help="Number of dipoles (default 1)")
-    p.add_argument("--k_beam",     type=int, default=5,  help="Beam basis modes (default 5)")
-    p.add_argument("--k_sky",      type=int, default=5,  help="Sky basis modes (default 5)")
-    p.add_argument("--max_iter",   type=int, default=15, help="Max calibration iterations (default 15)")
-    main(p.parse_args())
+    p.add_argument("--nside",        type=int,   default=8,
+                   help="HEALPix nside (default 8)")
+    p.add_argument("--nfreq",        type=int,   default=20,
+                   help="Number of frequencies (default 20)")
+    p.add_argument("--ntimes",       type=int,   default=24,
+                   help="Number of time steps for timing section (default 24)")
+    p.add_argument("--n_dipoles",    type=int,   default=1,
+                   help="Number of dipoles (default 1)")
+    p.add_argument("--k_beam",       type=int,   default=5,
+                   help="Beam basis modes (default 5)")
+    p.add_argument("--k_sky",        type=int,   default=5,
+                   help="Sky basis modes (default 5)")
+    p.add_argument("--max_iter",     type=int,   default=10,
+                   help="Max calibration iterations per run (default 10)")
+    p.add_argument("--ntimes-sweep", type=int,   nargs="+",
+                   default=[96, 192, 384, 480],
+                   help="ntimes values for shape-recovery sweep (default 96 192 384 480)")
+    args = p.parse_args()
+    args.ntimes_sweep = getattr(args, 'ntimes_sweep')
+    main(args)

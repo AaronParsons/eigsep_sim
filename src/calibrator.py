@@ -328,6 +328,159 @@ class Calibrator:
 
         return params.copy()
 
+    def beam_cg_step(self, params: Dict[str, np.ndarray],
+                     n_cg: int = 50, lam: float = 1e-4) -> Dict[str, np.ndarray]:
+        """
+        Beam coefficient update via Newton-CG (mirrors sky_step for the beam).
+
+        The loss is NOT quadratic in beam_coeffs (the beam normalization
+        denominator introduces nonlinearity), so this is the inner CG solve
+        of a truncated Newton iteration — multiple outer calls are needed.
+        Near the solution the convergence is superlinear; far away it still
+        beats gradient descent by using curvature information from jax.jvp.
+
+        Parameters
+        ----------
+        params : dict
+        n_cg : int, optional
+            Max CG iterations per call (default 50).
+        lam : float, optional
+            Tikhonov regularization as fraction of current loss (default 1e-4).
+            Scaled by loss_before so regularization is perturbation-size-independent.
+
+        Returns
+        -------
+        params_new : dict
+            Updated parameters with optimized beam_coeffs.
+        """
+        def loss_beam(beam_coeffs):
+            p = {'sky_coeffs': params['sky_coeffs'], 'beam_coeffs': beam_coeffs}
+            return self._loss(p)
+
+        beam_jax = jnp.asarray(params['beam_coeffs'])
+        grad_fn = jax.grad(loss_beam)
+        grad_val = grad_fn(beam_jax)
+        loss_before = float(loss_beam(beam_jax))
+
+        lam_abs = lam * float(jnp.mean(jnp.abs(grad_val))) + 1e-12
+
+        def hvp_flat(v):
+            _, h = jax.jvp(grad_fn, (beam_jax,), (v.reshape(beam_jax.shape),))
+            return h.ravel() + lam_abs * v
+
+        delta, _ = jax.scipy.sparse.linalg.cg(
+            hvp_flat, -grad_val.ravel(), maxiter=n_cg, tol=1e-3
+        )
+
+        beam_new = (beam_jax.ravel() + delta).reshape(beam_jax.shape)
+        loss_new = float(loss_beam(beam_new))
+
+        if loss_new < loss_before:
+            params_new = params.copy()
+            params_new['beam_coeffs'] = np.asarray(beam_new, dtype=DTYPE_R_NPY)
+            return params_new
+
+        # CG didn't improve; fall back to gradient descent with adaptive lr.
+        current_lr = 0.01 / (float(jnp.max(jnp.abs(grad_val))) + 1e-30)
+        for _ in range(30):
+            beam_new = beam_jax - current_lr * grad_val
+            loss_new = float(loss_beam(beam_new))
+            if loss_new <= loss_before:
+                params_new = params.copy()
+                params_new['beam_coeffs'] = np.asarray(beam_new, dtype=DTYPE_R_NPY)
+                return params_new
+            current_lr *= 0.5
+
+        return params.copy()
+
+    def joint_step(self, params: Dict[str, np.ndarray],
+                   n_cg: int = 100, lam: float = 1e-4) -> Dict[str, np.ndarray]:
+        """
+        Joint sky+beam Newton-CG step.
+
+        Treats sky_coeffs and beam_coeffs as a single flat parameter vector and
+        applies one Newton step via conjugate gradient on the joint Hessian system.
+        The Hessian-vector product is computed by JAX autodiff (one JVP-of-grad
+        pass over the full parameter vector).
+
+        Unlike the alternating sky_step/beam_step approach, this includes the
+        off-diagonal Hessian blocks H_{sky,beam} that couple sky and beam updates.
+        This breaks the trap where a converged sky absorbs beam error and makes
+        beam updates appear loss-increasing.
+
+        The loss is quadratic in sky_coeffs but nonlinear in beam_coeffs, so CG
+        acts as the inner solver of a truncated Newton method.  Convergence is
+        superlinear in the outer loop (one call = one Newton iteration).
+
+        Parameters
+        ----------
+        params : dict
+            Current parameters.
+        n_cg : int, optional
+            Max CG iterations per Newton step (default 100).
+        lam : float, optional
+            Tikhonov regularization relative to gradient magnitude (default 1e-4).
+
+        Returns
+        -------
+        params_new : dict
+            Updated parameters with jointly optimized sky_coeffs and beam_coeffs.
+        """
+        sky_jax = jnp.asarray(params['sky_coeffs'])
+        beam_jax = jnp.asarray(params['beam_coeffs'])
+        sky_shape, beam_shape = sky_jax.shape, beam_jax.shape
+        n_sky = sky_jax.size
+
+        def pack(sky, beam):
+            return jnp.concatenate([sky.ravel(), beam.ravel()])
+
+        def unpack(theta):
+            return theta[:n_sky].reshape(sky_shape), theta[n_sky:].reshape(beam_shape)
+
+        def loss_joint(theta):
+            s, b = unpack(theta)
+            return self._loss({'sky_coeffs': s, 'beam_coeffs': b})
+
+        theta = pack(sky_jax, beam_jax)
+        grad_fn = jax.grad(loss_joint)
+        grad_val = grad_fn(theta)
+        loss_before = float(loss_joint(theta))
+
+        lam_abs = lam * float(jnp.mean(jnp.abs(grad_val))) + 1e-12
+
+        def hvp_flat(v):
+            _, h = jax.jvp(grad_fn, (theta,), (v,))
+            return h + lam_abs * v
+
+        delta, _ = jax.scipy.sparse.linalg.cg(
+            hvp_flat, -grad_val, maxiter=n_cg, tol=1e-3
+        )
+
+        theta_new = theta + delta
+        loss_new = float(loss_joint(theta_new))
+
+        if loss_new < loss_before:
+            sky_new, beam_new = unpack(theta_new)
+            return {
+                'sky_coeffs':  np.asarray(sky_new,  dtype=DTYPE_R_NPY),
+                'beam_coeffs': np.asarray(beam_new, dtype=DTYPE_R_NPY),
+            }
+
+        # Newton step didn't improve; fall back to gradient descent with line search.
+        current_lr = 0.01 / (float(jnp.max(jnp.abs(grad_val))) + 1e-30)
+        for _ in range(30):
+            theta_new = theta - current_lr * grad_val
+            loss_new = float(loss_joint(theta_new))
+            if loss_new <= loss_before:
+                sky_new, beam_new = unpack(theta_new)
+                return {
+                    'sky_coeffs':  np.asarray(sky_new,  dtype=DTYPE_R_NPY),
+                    'beam_coeffs': np.asarray(beam_new, dtype=DTYPE_R_NPY),
+                }
+            current_lr *= 0.5
+
+        return params.copy()
+
     def beam_step(self, params: Dict[str, np.ndarray],
                   lr: float = 0.01, line_search: bool = True) -> Dict[str, np.ndarray]:
         """
@@ -361,9 +514,15 @@ class Calibrator:
         grad = jax.grad(loss_beam)(params['beam_coeffs'])
         loss_before = float(loss_beam(params['beam_coeffs']))
 
+        # Normalize lr so the largest parameter change is lr (not lr * ||grad||).
+        # Without this, a fixed lr=0.01 with gradient of O(1e8) gives steps of
+        # O(1e6), which always overshoot and cause the line search to exhaust
+        # all 10 halvings before reaching a useful step size.
+        grad_inf = float(jnp.max(jnp.abs(grad)))
+        current_lr = lr / (grad_inf + 1e-30)
+
         # Gradient step with line search
-        current_lr = lr
-        for _ in range(10):  # Try up to 10 halvings of learning rate
+        for _ in range(30):  # up to 30 halvings to handle large dynamic range
             params_new = params.copy()
             params_new['beam_coeffs'] = params['beam_coeffs'] - current_lr * grad
             loss_new = float(loss_beam(params_new['beam_coeffs']))
