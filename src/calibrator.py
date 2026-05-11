@@ -542,110 +542,95 @@ class Calibrator:
             max_iter: int = 30,
             tol: float = 1e-6,
             verbose: bool = True,
-            require_descent: bool = True,
-            optimize_sky: bool = True,
-            sky_step_size: float = 0.5) -> Dict:
+            use_cg: bool = True) -> Dict:
         """
-        Run calibration with Anderson-accelerated fixed-point iteration.
+        Run calibration with Anderson-accelerated alternating sky/beam iteration.
 
-        Optimizes beam coefficients. Optionally also optimizes sky coefficients
-        via per-frequency linear solves (though alternating sky/beam optimization
-        can be unstable; use high lam_sky regularization if enabling).
-
-        Only accepts steps that decrease loss (when require_descent=True).
+        Each iteration:
+          1. sky_step  — near-exact Newton-CG solve (quadratic in sky_coeffs)
+          2. beam_cg_step (use_cg=True) or beam_step (use_cg=False)
+          3. Anderson Acceleration on the beam coefficients
 
         Parameters
         ----------
         params : dict, optional
             Initial parameters. If None, calls init_params().
         times : list of Time, optional
-            Observation times. Required if params is None.
+            Observation times. Required if geometry not yet precomputed.
         max_iter : int, optional
-            Maximum number of iterations (default 30).
+            Maximum iterations (default 30).
         tol : float, optional
             Convergence tolerance on relative loss change (default 1e-6).
         verbose : bool, optional
-            Print progress (default True).
-        require_descent : bool, optional
-            Only accept steps that decrease loss (default True).
-        optimize_sky : bool, optional
-            If True, alternate sky and beam optimization (default True). If False,
-            optimize beam only. Sky/beam alternation is stabilized by
-            sky_step_size damping.
-        sky_step_size : float, optional
-            Damping factor for sky updates in (0, 1] (default 0.5). Values < 1
-            blend the proposed solution with the current sky_coeffs, stabilizing
-            the alternating iteration.
+            Print per-iteration progress (default True).
+        use_cg : bool, optional
+            If True (default), use beam_cg_step (Newton-CG with curvature
+            information). If False, use beam_step (gradient descent with
+            line search) — cheaper per iteration but slower to converge.
 
         Returns
         -------
         result : dict
-            Convergence result with keys:
-            - 'params': Final optimized parameters
-            - 'losses': Loss history
-            - 'converged': Whether convergence criterion was met
-            - 'n_iter': Number of iterations run
+            - 'params': final optimized parameters
+            - 'losses': loss at each iteration
+            - 'converged': whether tolerance was met
+            - 'n_iter': iterations completed
         """
-        # Initialize if needed
         if params is None:
             params = self.init_params(times=times)
-        else:
-            # Precompute geometry if times provided
-            if times is not None and self._geom is None:
-                self._geom = self.fwd.precompute_geometry(times)
+        elif times is not None and self._geom is None:
+            self._geom = self.fwd.precompute_geometry(times)
 
         if self._geom is None:
-            raise ValueError("Either provide times or pre-computed geometry")
+            raise ValueError("Provide times or call init_params(times=...) first")
 
-        # Reset Anderson accelerator
         self._aa.reset()
-
         losses = []
         converged = False
 
         for iteration in range(max_iter):
-            loss_before = float(self._loss(params))
+            beam_old = params['beam_coeffs'].copy()
 
-            # Sky step (optional, damped)
-            if optimize_sky:
-                params_sky = self.sky_step(params, step_size=sky_step_size)
+            # Sky step: near-exact linear solve (always improves sky given beam)
+            params = self.sky_step(params)
+
+            # Beam step: Newton-CG (with GD fallback) or plain gradient descent
+            if use_cg:
+                params = self.beam_cg_step(params)
             else:
-                params_sky = params
+                params = self.beam_step(params)
 
-            # Beam step (applied after sky step)
-            params_new = self.beam_step(params_sky)
-            loss_after = float(self._loss(params_new))
+            # Anderson Acceleration on beam coefficients.
+            # The fixed-point residual is (new_beam - old_beam); AA extrapolates
+            # toward the fixed point using the history of residuals.
+            beam_new = params['beam_coeffs']
+            beam_res = beam_new - beam_old
+            beam_acc = self._aa.apply(beam_old, beam_res)
+            params_aa = params.copy()
+            params_aa['beam_coeffs'] = np.asarray(beam_acc, dtype=DTYPE_R_NPY)
 
-            # Accept the iteration if loss decreased (or not requiring descent)
-            if not require_descent or loss_after <= loss_before:
-                params = params_new
-                loss = loss_after
+            # Accept AA point only if it doesn't raise the loss
+            loss_step = float(self._loss(params))
+            loss_aa   = float(self._loss(params_aa))
+            if loss_aa <= loss_step:
+                params = params_aa
+                loss = loss_aa
             else:
-                # If iteration increased loss, try only sky step
-                params_sky_only = params_sky
-                loss_sky_only = float(self._loss(params_sky_only))
-                if loss_sky_only <= loss_before:
-                    params = params_sky_only
-                    loss = loss_sky_only
-                else:
-                    # If both decreased loss, reject and keep old params
-                    params = params  # No change
-                    loss = loss_before
+                loss = loss_step
 
             losses.append(loss)
 
             if verbose:
                 if iteration == 0:
-                    print(f"Iteration {iteration:3d}: loss = {loss:.6e}")
+                    print(f"iter {iteration:3d}: loss = {loss:.6e}")
                 else:
-                    rel_change = abs(losses[-2] - loss) / losses[-2]
-                    print(f"Iteration {iteration:3d}: loss = {loss:.6e}, "
-                          f"rel_change = {rel_change:.3e}")
+                    rel = abs(losses[-2] - loss) / (abs(losses[-2]) + 1e-30)
+                    print(f"iter {iteration:3d}: loss = {loss:.6e}  "
+                          f"rel_Δ = {rel:.2e}")
 
-            # Check convergence
             if iteration > 0:
-                rel_change = abs(losses[-2] - loss) / losses[-2]
-                if rel_change < tol:
+                rel = abs(losses[-2] - loss) / (abs(losses[-2]) + 1e-30)
+                if rel < tol:
                     if verbose:
                         print(f"Converged after {iteration + 1} iterations")
                     converged = True
