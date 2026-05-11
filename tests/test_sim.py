@@ -1,38 +1,20 @@
 """
-Tests for eigsep_sim.sim — JAX kernels (_beam_sum, _src_sum) and Simulator.
+Tests for eigsep_sim.sim_jax — JAX kernels (_beam_sum, _src_sum) and SH helpers.
+
+Simulator, sim_spin, and sim_azalt_sh were removed; their functionality is now
+covered by ForwardModel (test_simulate.py) with the new coefficient-based API.
 """
 
 import numpy as np
 import pytest
 import jax.numpy as jnp
 import healpy
-from astropy.time import Time
 
 from eigsep_sim.sim_jax import (
-    _beam_sum, _src_sum, Simulator,
+    _beam_sum, _src_sum,
     _sh_coupling_modes, _sh_fft_spin,
 )
-from eigsep_sim.beam import Beam
 from eigsep_sim.healpix import float_dtype
-
-
-# ---------------------------------------------------------------------------
-# Minimal mock observer — identity rotation, all pixels above horizon
-# ---------------------------------------------------------------------------
-
-class MockObserver:
-    """Trivial observer for testing: identity gal→top, all sky visible."""
-    def __init__(self):
-        self.time = None
-
-    def set_time(self, t):
-        self.time = t
-
-    def rot_gal2top(self):
-        return np.eye(3, dtype=np.float32)
-
-    def above_horizon(self, nside):
-        return np.ones(healpy.nside2npix(nside), dtype=bool)
 
 
 # ---------------------------------------------------------------------------
@@ -165,86 +147,6 @@ class TestSrcSum:
 
 
 # ---------------------------------------------------------------------------
-# Simulator
-# ---------------------------------------------------------------------------
-
-class TestSimulator:
-    """Integration tests using MockObserver (no GSM, no terrain, no catalog)."""
-
-    def _make_sim(self, nside=8, nfreq=4, monopole=None):
-        freqs = np.linspace(50e6, 150e6, nfreq, dtype=np.float32)
-        observer = MockObserver()
-        beam = Beam(freqs, beam_type='dipole', nside=nside, peak_normalize=True)
-        sim = Simulator(
-            observer, freqs, beam,
-            nside=nside, gsm=False,
-            monopole=monopole,
-        )
-        return sim, freqs
-
-    def test_trx_only_zero_sky(self):
-        """With no sky emission, vis = Trx at all frequencies."""
-        Trx = 75.0
-        sim, freqs = self._make_sim()
-        times = [Time('2024-01-01')]
-        azalts = np.zeros((1, 2), dtype=np.float32)
-        vis = sim.sim(times, azalts=azalts, Trx=Trx, S11=0.0, bandpass=1.0)
-        assert vis.shape == (1, 1, len(freqs))
-        np.testing.assert_allclose(vis[0, 0], Trx, rtol=0.05)
-
-    def test_S11_scales_sky_contribution(self):
-        """
-        With Trx=0, S11=0 gives full T_ant; S11=0.5 gives half.
-        vis = bandpass * (S12 * T_ant + Trx)
-            S11=0.0 → vis_full = T_ant
-            S11=0.5 → vis_half = 0.5 * T_ant
-        """
-        T_monopole = 100.0
-        monopole = np.full(4, T_monopole, dtype=np.float32)
-        sim, freqs = self._make_sim(monopole=monopole)
-        times = [Time('2024-01-01')]
-        azalts = np.zeros((1, 2), dtype=np.float32)
-
-        vis_full = sim.sim(times, azalts=azalts, Trx=0.0, S11=0.0)
-        vis_half = sim.sim(times, azalts=azalts, Trx=0.0, S11=0.5)
-        np.testing.assert_allclose(vis_half, 0.5 * vis_full, rtol=1e-5)
-
-    def test_bandpass_scaling(self):
-        """bandpass=0.5 should halve all output values."""
-        Trx = 50.0
-        sim, freqs = self._make_sim()
-        times = [Time('2024-01-01')]
-        azalts = np.zeros((1, 2), dtype=np.float32)
-
-        vis_1 = sim.sim(times, azalts=azalts, Trx=Trx, bandpass=1.0)
-        vis_p = sim.sim(times, azalts=azalts, Trx=Trx, bandpass=0.5)
-        np.testing.assert_allclose(vis_p, 0.5 * vis_1, rtol=1e-5)
-
-    def test_output_shape_multiple_times_and_orients(self):
-        sim, freqs = self._make_sim(nfreq=3)
-        n_times = 2
-        n_orient = 3
-        times = [Time('2024-01-01'), Time('2024-01-02')]
-        azalts = np.zeros((n_orient, 2), dtype=np.float32)
-        vis = sim.sim(times, azalts=azalts, Trx=10.0)
-        assert vis.shape == (n_times, n_orient, 3)
-
-    def test_monopole_temperature_recovered(self):
-        """
-        A perfectly uniform sky of temperature T with a beam-weighted
-        integral gives T_ant = T (beam cancels in numerator/denominator).
-        """
-        T_monopole = 150.0
-        monopole = np.full(4, T_monopole, dtype=np.float32)
-        sim, freqs = self._make_sim(monopole=monopole)
-        times = [Time('2024-01-01')]
-        azalts = np.zeros((1, 2), dtype=np.float32)
-        vis = sim.sim(times, azalts=azalts, Trx=0.0, S11=0.0, bandpass=1.0)
-        # Beam over uniform sky → T_ant = T_monopole
-        np.testing.assert_allclose(vis[0, 0], T_monopole, rtol=0.05)
-
-
-# ---------------------------------------------------------------------------
 # SH + FFT helpers
 # ---------------------------------------------------------------------------
 
@@ -324,132 +226,3 @@ class TestSHHelpers:
         # 1 + cos(theta) averaged over sphere = 1 (cos averages to 0)
         np.testing.assert_allclose(T_fft, T_mean, rtol=0.05)
 
-
-# ---------------------------------------------------------------------------
-# Simulator.sim_spin
-# ---------------------------------------------------------------------------
-
-class TestSimulatorSpinSweep:
-    """Tests for Simulator.sim_spin (SH+FFT spin-sweep method)."""
-
-    def _make_sim(self, nside=8, nfreq=4, monopole=None):
-        freqs = np.linspace(50e6, 150e6, nfreq, dtype=np.float32)
-        observer = MockObserver()
-        beam = Beam(freqs, beam_type='dipole', nside=nside, peak_normalize=True)
-        sim = Simulator(
-            observer, freqs, beam,
-            nside=nside, gsm=False,
-            monopole=monopole,
-        )
-        return sim, freqs
-
-    def test_output_shape(self):
-        n_phi = 16
-        sim, freqs = self._make_sim(nfreq=3)
-        times = [Time('2024-01-01'), Time('2024-01-02')]
-        vis = sim.sim_spin(times, n_phi=n_phi, Trx=10.0)
-        assert vis.shape == (2, n_phi, 3)
-
-    def test_uniform_sky_constant_spin(self):
-        """Uniform sky → T_ant should be (near-)constant across all spin angles."""
-        T_monopole = 100.0
-        monopole = np.full(4, T_monopole, dtype=np.float32)
-        sim, freqs = self._make_sim(monopole=monopole)
-        times = [Time('2024-01-01')]
-        n_phi = 32
-        vis = sim.sim_spin(times, n_phi=n_phi, Trx=0.0, S11=0.0)
-        # All spin angles should give roughly the same T_ant
-        assert vis.shape == (1, n_phi, 4)
-        for fi in range(4):
-            rms_var = float(np.std(vis[0, :, fi]))
-            assert rms_var < 5.0, f"Spin variation too large at freq {fi}: {rms_var:.2f}"
-
-    def test_trx_added(self):
-        """Trx offset should appear uniformly in all spin angles."""
-        Trx = 50.0
-        sim, freqs = self._make_sim()
-        times = [Time('2024-01-01')]
-        vis_no_trx = sim.sim_spin(times, n_phi=8, Trx=0.0)
-        vis_trx = sim.sim_spin(times, n_phi=8, Trx=Trx)
-        np.testing.assert_allclose(vis_trx - vis_no_trx, Trx, atol=1.0)
-
-
-class TestSimulatorAzAltSH:
-    """Tests for Simulator.sim_azalt_sh (SH+FFT az+alt sweep method)."""
-
-    def _make_sim(self, nside=8, nfreq=4, monopole=None):
-        freqs = np.linspace(50e6, 150e6, nfreq, dtype=np.float32)
-        observer = MockObserver()
-        beam = Beam(freqs, beam_type='dipole', nside=nside, peak_normalize=True)
-        sim = Simulator(
-            observer, freqs, beam,
-            nside=nside, gsm=False,
-            monopole=monopole,
-        )
-        return sim, freqs
-
-    def test_output_shape(self):
-        """Output shape should be (ntimes, N_alt, n_phi, nfreq)."""
-        n_phi = 16
-        alts = np.linspace(0.1, 0.5, 3)
-        sim, freqs = self._make_sim(nfreq=3)
-        times = [Time('2024-01-01'), Time('2024-01-02')]
-        vis = sim.sim_azalt_sh(times, alts_rad=alts, n_phi=n_phi, Trx=10.0)
-        assert vis.shape == (2, 3, n_phi, 3)
-
-    def test_output_shape_custom_east_vec(self):
-        """Non-default east_vec should not change output shape."""
-        n_phi = 8
-        alts = np.array([0.2, 0.4])
-        sim, freqs = self._make_sim(nfreq=2)
-        times = [Time('2024-01-01')]
-        east = np.array([0.98, 0.0, 0.02])  # slightly tilted east axis
-        vis = sim.sim_azalt_sh(times, alts_rad=alts, n_phi=n_phi,
-                               east_vec=east, Trx=0.0)
-        assert vis.shape == (1, 2, n_phi, 2)
-
-    def test_uniform_sky_constant_azimuth(self):
-        """Uniform sky → T_ant nearly constant across all az for each alt."""
-        T_monopole = 100.0
-        monopole = np.full(4, T_monopole, dtype=np.float32)
-        sim, freqs = self._make_sim(monopole=monopole)
-        times = [Time('2024-01-01')]
-        alts = np.array([0.0, 0.3, 0.7])
-        n_phi = 32
-        vis = sim.sim_azalt_sh(times, alts_rad=alts, n_phi=n_phi,
-                               Trx=0.0, S11=0.0)
-        assert vis.shape == (1, 3, n_phi, 4)
-        # Each altitude should have near-constant T_ant across azimuth
-        for ai in range(3):
-            for fi in range(4):
-                rms_var = float(np.std(vis[0, ai, :, fi]))
-                assert rms_var < 5.0, (
-                    f"Az variation too large at alt_idx={ai} freq={fi}: {rms_var:.2f}"
-                )
-
-    def test_trx_added(self):
-        """Trx offset should appear uniformly in all az and alt angles."""
-        Trx = 50.0
-        sim, freqs = self._make_sim()
-        times = [Time('2024-01-01')]
-        alts = np.array([0.2, 0.5])
-        vis_no_trx = sim.sim_azalt_sh(times, alts_rad=alts, n_phi=8, Trx=0.0)
-        vis_trx = sim.sim_azalt_sh(times, alts_rad=alts, n_phi=8, Trx=Trx)
-        np.testing.assert_allclose(vis_trx - vis_no_trx, Trx, atol=1.0)
-
-    def test_zero_alt_matches_spin(self):
-        """At alt=0 with east_vec=[1,0,0], az+alt sweep == pure spin sweep."""
-        sim, freqs = self._make_sim(nfreq=3)
-        times = [Time('2024-01-01')]
-        n_phi = 32
-        # sim_spin: pure z-axis spin
-        vis_spin = sim.sim_spin(times, n_phi=n_phi, Trx=0.0, S11=0.0)  # (1, n_phi, 3)
-        # sim_azalt_sh at alt=0: R_east(0) = identity, so same as spin sweep
-        vis_azalt = sim.sim_azalt_sh(
-            times, alts_rad=np.array([0.0]), n_phi=n_phi,
-            east_vec=np.array([1.0, 0.0, 0.0]),
-            Trx=0.0, S11=0.0,
-        )  # (1, 1, n_phi, 3)
-        np.testing.assert_allclose(
-            vis_azalt[0, 0], vis_spin[0], rtol=0.02, atol=1.0,
-        )
