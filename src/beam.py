@@ -561,3 +561,42 @@ class Beam:
     def nmodes(self):
         """Number of spectral modes."""
         return self.coeffs.shape[2]
+
+    # ── Body-frame rotation helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def rot_x(a):
+        """Right-handed rotation matrix by angle *a* [rad] around x-axis."""
+        c, s = np.cos(a), np.sin(a)
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=DTYPE_R_NPY)
+
+    @staticmethod
+    def rot_z(a):
+        """Right-handed rotation matrix by angle *a* [rad] around z-axis."""
+        c, s = np.cos(a), np.sin(a)
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=DTYPE_R_NPY)
+
+    @staticmethod
+    def top2body(az, alt):
+        """Rotation matrix from topocentric to antenna body frame.
+
+        Implements the EIGSEP scanning convention: azimuth rotates around the
+        topocentric ẑ axis, altitude tilts around the topocentric x̂ (east) axis.
+        At az=alt=0 the body frame coincides with the topocentric frame
+        (x = east, y = north, z = up).
+
+            R_body2top = R_z(az) @ R_x(alt)
+            R_top2body = R_x(−alt) @ R_z(−az)
+
+        Parameters
+        ----------
+        az : float
+            Azimuth [rad].
+        alt : float
+            Altitude tilt [rad].
+
+        Returns
+        -------
+        ndarray, shape (3, 3), float32
+        """
+        return Beam.rot_x(-alt) @ Beam.rot_z(-az)

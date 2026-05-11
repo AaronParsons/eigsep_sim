@@ -201,6 +201,64 @@ class BeamBasis(_SpectralBasis):
     """
 
     @classmethod
+    def from_map(cls, bm, freqs_hz, K):
+        """Build BeamBasis from a (npix, nfreq) beam power map via truncated SVD.
+
+        Returns both the basis and the coefficient array shaped for a single-dipole
+        Beam (n_dipoles=1).
+
+        Parameters
+        ----------
+        bm : ndarray, shape (npix, nfreq)
+            Beam power map interpolated to freqs_hz.
+        freqs_hz : ndarray, shape (nfreq,)
+            Frequencies [Hz].
+        K : int
+            Number of spectral modes to retain.
+
+        Returns
+        -------
+        basis : BeamBasis
+            Spectral basis with A of shape (nfreq, K).
+        coeffs : ndarray, shape (1, npix, K)
+            Beam coefficients for a single-dipole Beam.
+        """
+        bm = np.asarray(bm, dtype=DTYPE_R_NPY)
+        freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
+        U, s, Vt = np.linalg.svd(bm, full_matrices=False)
+        A = Vt[:K].T                              # (nfreq, K)
+        coeffs = (U[:, :K] * s[:K])[np.newaxis]  # (1, npix, K)
+        basis = cls(A, freqs_hz=freqs_hz, svd_modes=U[:, :K], svd_svals=s[:K])
+        return basis, coeffs
+
+    @classmethod
+    def from_beam_file(cls, path, freqs_hz, K):
+        """Load a beam NPZ file and compress to K spectral modes via SVD.
+
+        Wraps load_beam_file() to interpolate the stored beam to freqs_hz, then
+        delegates to from_map().
+
+        Parameters
+        ----------
+        path : str
+            Path to beam NPZ file (e.g. eigsep_sim.beam.BEAM_NPZ).
+        freqs_hz : ndarray, shape (nfreq,)
+            Target simulation frequencies [Hz].
+        K : int
+            Number of spectral modes to retain.
+
+        Returns
+        -------
+        basis : BeamBasis
+            Spectral basis with A of shape (nfreq, K).
+        coeffs : ndarray, shape (1, npix, K)
+            Beam coefficients for a single-dipole Beam.
+        """
+        from .beam import load_beam_file
+        bm = load_beam_file(freqs_hz, path)  # (npix, nfreq)
+        return cls.from_map(bm, freqs_hz, K)
+
+    @classmethod
     def from_dipole(cls, freqs_hz, arm_length_m, u_body=None, K=5, nside=8):
         """Build beam basis from thin-dipole analytic model.
 
