@@ -167,16 +167,36 @@ class ForwardModel:
         ntimes = len(times)
         npix_sky = self.sky.npix
 
-        for t in times:
+        # Batch-compute rotation matrices when the observer supports it.
+        # EarthSurface uses a vectorised astropy call (61× faster than looping).
+        # Other observers fall back to the default per-step loop.
+        if hasattr(self.observer, 'rot_gal2top_stack'):
+            R_all = self.observer.rot_gal2top_stack(times)   # (ntimes, 3, 3)
+        else:
+            R_all = None
+
+        for i, t in enumerate(times):
             self.observer.set_time(t)
 
-            R = self.observer.rot_gal2top().astype(np.float32)
+            R = R_all[i] if R_all is not None else self.observer.rot_gal2top().astype(np.float32)
             geom['rot_gal2top'].append(R)
 
             crds_top = R @ self._crds_gal
             geom['crds_top'].append(crds_top)
 
-            geom['masks'].append(self._compute_mask(crds_top))
+            # For observers with rot_gal2top_stack (surface types), "above
+            # horizon" is crds_top[2] > 0; skip the redundant rot_gal2top()
+            # call that observer.above_horizon() would make internally.
+            # LunarOrbit (no rot_gal2top_stack) still delegates to above_horizon.
+            if R_all is not None:
+                geo_mask = (crds_top[2] > 0).astype(np.float32)
+                if self.terrain is not None:
+                    terrain_mask = self.terrain.mask(crds_top).astype(np.float32)
+                    geom['masks'].append(geo_mask * terrain_mask)
+                else:
+                    geom['masks'].append(geo_mask)
+            else:
+                geom['masks'].append(self._compute_mask(crds_top))
 
         # Vectorise beam-interpolation weight computation over all times at once.
         # healpy's C implementation processes ntimes*npix_sky pixels in a single

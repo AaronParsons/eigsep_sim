@@ -298,6 +298,50 @@ def test_calibrator_beam_step_decreases_loss():
     )
 
 
+def test_calibrator_sky_step_decreases_loss_significantly():
+    """
+    Calibrator: sky_step() must reduce loss by at least 10× from zero sky.
+
+    This test catches the lam_abs over-regularization bug where gradient-scaled
+    Tikhonov made lam_abs >> H_diagonal, turning Newton-CG into over-damped
+    gradient descent that barely moved the sky coefficients.
+
+    With the correct (H-diagonal-relative) lam_abs, a single Newton-CG step
+    from sky=0 should drop the loss by orders of magnitude, since the sky loss
+    is exactly quadratic and Newton's method is exact for quadratic problems.
+    """
+    freqs_hz = np.array([50e6, 100e6, 150e6], dtype=np.float64)
+    nside = 4
+    from eigsep_sim import Beam, Sky, ForwardModel, NullTerrain
+    beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=[3.0], K=2)
+    sky = Sky.from_gsm(nside, freqs_hz, n_modes=2, include_flat=True)
+    observer = EarthSurface(lat=39.2, lon=-113.4)
+    fwd = ForwardModel(observer, beam, sky, terrain=NullTerrain())
+
+    gsm_coeffs = sky.init_coeffs()
+    beam_coeffs = beam.coeffs.copy()
+
+    times = [Time("2025-01-01") + i * 3600 for i in range(8)]
+    geom = fwd.precompute_geometry(times)
+    T_true = fwd.simulate(gsm_coeffs, beam_coeffs, geom=geom)
+    data = np.array(T_true).astype(np.float32)
+
+    cal = Calibrator(fwd, data, lam_beam=0.0)
+    cal._geom = geom
+    params = {'sky_coeffs': np.zeros_like(gsm_coeffs), 'beam_coeffs': beam_coeffs.copy()}
+
+    loss_before = float(cal._loss(params))
+    params_after = cal.sky_step(params)
+    loss_after = float(cal._loss(params_after))
+
+    reduction = loss_before / (loss_after + 1e-30)
+    assert reduction > 10.0, (
+        f"sky_step() only reduced loss by {reduction:.1f}× (expected ≥10×). "
+        f"lam_abs may be over-regularized (gradient-scaled instead of H-scaled). "
+        f"loss_before={loss_before:.3e}, loss_after={loss_after:.3e}"
+    )
+
+
 if __name__ == "__main__":
     test_anderson_accelerator_basic()
     test_anderson_accelerator_reset()

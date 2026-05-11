@@ -122,6 +122,31 @@ class EarthSurface(Observer):
         top2gal = ICRS2GAL @ top2icrs
         return top2gal.T  # gal2top = top2gal^{-1} = top2gal.T
 
+    def rot_gal2top_stack(self, times):
+        """
+        Batch rotation matrices for multiple times. Shape: (ntimes, 3, 3).
+
+        61× faster than calling rot_gal2top() in a loop for EarthSurface,
+        because astropy's GCRS transform is vectorised over Time arrays.
+        """
+        from astropy.time import Time as ATime
+        times = [ATime(t) if not isinstance(t, ATime) else t for t in times]
+        times_arr = ATime(times)
+        # Batch GCRS: all ntimes positions in one call
+        gcrs_all = self.location.get_gcrs(times_arr)
+        up_all = gcrs_all.cartesian.xyz.value          # (3, ntimes)
+        up_all = up_all / np.linalg.norm(up_all, axis=0, keepdims=True)
+        pole = np.array([0.0, 0.0, 1.0])
+        # cross(pole, up_all.T) → (ntimes, 3), transpose → (3, ntimes)
+        east_all = np.cross(pole, up_all.T).T
+        east_all = east_all / np.linalg.norm(east_all, axis=0, keepdims=True)
+        north_all = np.cross(up_all.T, east_all.T).T
+        # top2icrs_batch[t] = column_stack([east_t, north_t, up_t]) → (3, 3)
+        # Stack: (ntimes, 3, 3) where axis 2 indexes [east, north, up] columns
+        top2icrs_batch = np.stack([east_all.T, north_all.T, up_all.T], axis=2)
+        top2gal_batch = np.einsum('ij,tjk->tik', ICRS2GAL, top2icrs_batch)
+        return top2gal_batch.transpose(0, 2, 1).astype(np.float32)  # gal2top
+
     def above_horizon(self, nside):
         """
         Boolean HEALPix mask (galactic frame) of pixels above the horizon.

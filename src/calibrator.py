@@ -294,10 +294,17 @@ class Calibrator:
 
         sky_jax = jnp.asarray(params['sky_coeffs'])
         grad_fn = jax.grad(loss_sky)
-        grad_val = grad_fn(sky_jax)
         loss_before = float(loss_sky(sky_jax))
+        grad_val = grad_fn(sky_jax)
 
-        lam_abs = lam * float(jnp.mean(jnp.abs(grad_val))) + 1e-12
+        # The sky loss is exactly quadratic in sky_coeffs, so the CG should
+        # find the Newton direction without regularization.  A tiny floor
+        # is kept only for numerical stability (prevents divide-by-zero in
+        # degenerate subspaces).  Do NOT scale with gradient magnitude: the
+        # gradient far from the minimum is O(||data||/N), while the Hessian
+        # diagonal is O(||A||^2 W/N) — many orders of magnitude smaller —
+        # so gradient-scaled lam_abs would completely dominate the Hessian.
+        lam_abs = lam * 1e-6 + 1e-12
 
         # Fully JAX-native HVP: compiled as single XLA kernel by jax.scipy CG
         def hvp_flat(v):
@@ -359,10 +366,18 @@ class Calibrator:
 
         beam_jax = jnp.asarray(params['beam_coeffs'])
         grad_fn = jax.grad(loss_beam)
-        grad_val = grad_fn(beam_jax)
         loss_before = float(loss_beam(beam_jax))
+        grad_val = grad_fn(beam_jax)
 
-        lam_abs = lam * float(jnp.mean(jnp.abs(grad_val))) + 1e-12
+        # Use H-diagonal estimate as Tikhonov scale: v^T H v / ||v||^2 ≈ trace(H)/n.
+        # This avoids the gradient-magnitude scaling bug: ||grad|| >> H_diag when
+        # far from minimum, which makes gradient-scaled lam_abs >> H and causes CG
+        # to ignore curvature (reduces to over-damped gradient descent).
+        rng_key = jax.random.PRNGKey(0)
+        v_probe = jax.random.rademacher(rng_key, beam_jax.shape, dtype=beam_jax.dtype)
+        _, h_probe = jax.jvp(grad_fn, (beam_jax,), (v_probe,))
+        h_diag_est = float(jnp.sum(h_probe * v_probe) / jnp.sum(v_probe * v_probe))
+        lam_abs = lam * max(abs(h_diag_est), 1e-12) + 1e-12
 
         def hvp_flat(v):
             _, h = jax.jvp(grad_fn, (beam_jax,), (v.reshape(beam_jax.shape),))
@@ -443,10 +458,14 @@ class Calibrator:
 
         theta = pack(sky_jax, beam_jax)
         grad_fn = jax.grad(loss_joint)
-        grad_val = grad_fn(theta)
         loss_before = float(loss_joint(theta))
+        grad_val = grad_fn(theta)
 
-        lam_abs = lam * float(jnp.mean(jnp.abs(grad_val))) + 1e-12
+        rng_key = jax.random.PRNGKey(0)
+        v_probe = jax.random.rademacher(rng_key, theta.shape, dtype=theta.dtype)
+        _, h_probe = jax.jvp(grad_fn, (theta,), (v_probe,))
+        h_diag_est = float(jnp.sum(h_probe * v_probe) / jnp.sum(v_probe * v_probe))
+        lam_abs = lam * max(abs(h_diag_est), 1e-12) + 1e-12
 
         def hvp_flat(v):
             _, h = jax.jvp(grad_fn, (theta,), (v,))

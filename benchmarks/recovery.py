@@ -227,6 +227,89 @@ def main(args):
 
     print(f"\n  Observed scaling closely follows ntimes (linear), confirming")
     print(f"  the forward model dominates and is O(ntimes) as designed.")
+
+    # ── Recovery / convergence validation ─────────────────────────────────────
+    print(f"\n{'='*70}")
+    print(f"  Recovery Validation  (ntimes={args.ntimes})")
+    print(f"{'='*70}\n")
+
+    sky_true_map = gsm_coeffs @ sky.basis.A.T   # (npix_sky, nfreq)
+
+    # Sanity check: sky-only recovery with fixed true beam.
+    # Loss is exactly quadratic in sky_coeffs, so Newton-CG (sky_step) should
+    # reach the global minimum in one call.  Residual = basis truncation + noise.
+    print("[ 1. Sky-only recovery  (true beam, 1 sky_step) ]\n")
+    params_sky_only = {
+        'sky_coeffs': np.zeros_like(gsm_coeffs),
+        'beam_coeffs': beam_coeffs_true.copy(),
+    }
+    cal_sonly = Calibrator(fwd, data, inv_noise_var=inv_noise_var, lam_beam=0.0)
+    cal_sonly._geom = geom
+    cal_sonly.sky_step(params_sky_only)                           # JIT warmup
+    p_sky = cal_sonly.sky_step(params_sky_only)
+    sky_rec1 = p_sky['sky_coeffs'] @ sky.basis.A.T
+    sky_err1 = float(np.std(sky_rec1 - sky_true_map) / np.mean(sky_true_map) * 100)
+    print(f"  Sky rms error (1 step):  {sky_err1:.2f}%")
+    print(f"  (irreducible floor = basis truncation + noise)\n")
+
+    # Joint recovery: start from a non-degenerate beam shape perturbation.
+    # 2.0m → 2.1m arm changes the frequency-dependent pattern, not just the
+    # overall scale; uniform-scale degeneracy does not cover shape changes.
+    arm_true = 2.0
+    arm_pert = 2.1
+    print(f"[ 2. Joint sky+beam recovery ]\n")
+    print(f"  True arm length: {arm_true} m  |  Initial estimate: {arm_pert} m\n")
+
+    beam_pert = Beam.from_dipole(
+        args.nside, freqs_hz,
+        arm_lengths_m=[arm_pert] * args.n_dipoles,
+        K=args.k_beam,
+    )
+    beam_coeffs_pert = beam_pert.coeffs.copy()
+
+    beam_true_map = beam_coeffs_true @ beam.basis.A.T   # (n_dipoles, npix, nfreq)
+    beam_pert_map = beam_coeffs_pert @ beam.basis.A.T
+
+    def norm_beam(bmap):
+        """Remove scale degeneracy for shape comparison."""
+        return bmap / (np.mean(bmap) + 1e-30)
+
+    beam_init_err = float(
+        np.std(norm_beam(beam_pert_map) - norm_beam(beam_true_map)) * 100
+    )
+    print(f"  Beam shape error (initial):  {beam_init_err:.2f}%")
+
+    params_joint = {
+        'sky_coeffs':  np.zeros_like(gsm_coeffs),
+        'beam_coeffs': beam_coeffs_pert.copy(),
+    }
+    cal_joint = Calibrator(
+        fwd, data, inv_noise_var=inv_noise_var, lam_beam=0.01
+    )
+    cal_joint._beam_nom = beam_coeffs_pert.copy()   # regularize toward initial
+    cal_joint._geom = geom
+
+    t0 = time.perf_counter()
+    result = cal_joint.fit(params=params_joint, max_iter=args.max_iter, verbose=False)
+    t_fit = (time.perf_counter() - t0) * 1e3
+
+    sky_final   = result['params']['sky_coeffs']  @ sky.basis.A.T
+    beam_final  = result['params']['beam_coeffs'] @ beam.basis.A.T
+    sky_err_f   = float(np.std(sky_final  - sky_true_map) / np.mean(sky_true_map) * 100)
+    beam_err_f  = float(np.std(norm_beam(beam_final) - norm_beam(beam_true_map)) * 100)
+
+    print(f"\n  {'':30s} {'sky err':>10}  {'beam err':>10}")
+    print(f"  {'initial (sky=0, beam=pert)':30s} {'--':>10}  {beam_init_err:>9.2f}%")
+    print(f"  {'after fit()':30s} {sky_err_f:>9.2f}%  {beam_err_f:>9.2f}%")
+    print(f"\n  sky-only floor (step 1):    {sky_err1:.2f}%")
+    print(f"  converged:                  {result['converged']}")
+    print(f"  iterations:                 {result['n_iter']}")
+    print(f"  total fit time:             {t_fit:.0f} ms\n")
+
+    print(f"  Loss curve:")
+    for i, loss in enumerate(result['losses']):
+        print(f"    iter {i:3d}:  {loss:.6e}")
+
     print(f"\n{'='*70}\n")
 
 
