@@ -10,10 +10,11 @@ Architecture:
 - Simulates antenna temperature given basis coefficients
 
 Performance notes:
-- precompute_geometry() computes beam-pixel indices and bilinear weights once per
-  time step (O(npix_sky) trig per step).  simulate() reuses these, eliminating all
-  transcendental arithmetic from the JIT hot path — only vectorised gather+sum
-  remains, giving a ~50× speedup for the steady-state kernel.
+- precompute_geometry() stores rotation matrices (rots_jax, body_rots_jax) and
+  terrain masks (terrain_masks_jax) as small JAX arrays (~100 KB for 1296 steps).
+  simulate() passes these plus crds_gal_jax to a JIT-compiled scan kernel that
+  performs gal→top and top→body rotations, healjax interpolation, and sky
+  integration entirely inside XLA — fusing all coordinate arithmetic into one pass.
 """
 
 from __future__ import annotations
@@ -107,6 +108,36 @@ class ForwardModel:
         self._beam_basis_A_jax = None
         self._sky_basis_A_jax = None
 
+    def build_sky_mask(self, rots=None, times=None):
+        """Return a bool (npix_sky,) mask: True for pixels ever above the horizon.
+
+        Pass the result as ``sky_mask`` to ``precompute_geometry`` to exclude
+        pixels that never contribute, reducing coordinate arrays and kernel work
+        proportionally.  Gains are largest for long integrations at a fixed
+        sky orientation; for a full az/alt scan nearly all pixels are visible.
+
+        Parameters
+        ----------
+        rots : list of (3, 3) ndarray, optional
+            Pre-computed galactic-to-topocentric rotation matrices.
+        times : list of Time, optional
+            Observation epochs (queries the observer ephemeris).
+        """
+        if rots is not None:
+            R_arr = np.stack([np.asarray(r, dtype=np.float32) for r in rots])
+            crds_top_arr = R_arr @ self._crds_gal          # (ntimes, 3, npix_sky)
+            return np.any(crds_top_arr[:, 2, :] > 0, axis=0)  # (npix_sky,)
+        elif times is not None:
+            from astropy.time import Time
+            mask = np.zeros(self.sky.npix, dtype=bool)
+            for t in times:
+                self.observer.set_time(Time(t) if not isinstance(t, Time) else t)
+                R = self.observer.rot_gal2top().astype(np.float32)
+                mask |= (R @ self._crds_gal)[2] > 0
+            return mask
+        else:
+            raise ValueError("Either rots or times must be provided")
+
     def _ensure_jax_arrays(self):
         """Convert and cache basis matrices as JAX arrays; build JIT-compiled sim kernel."""
         if self._beam_basis_A_jax is None:
@@ -119,61 +150,73 @@ class ForwardModel:
     def _build_sim_fn(self):
         """Build and JIT-compile the inner simulation kernel.
 
-        Returns a function ``sim(sky_coeffs, beam_coeffs, masks, px_all, wgts_all,
-        T_gnd, tx_px_all, tx_wgts_all)`` that is fully JAX-traceable.  Beam-pixel
-        indices and bilinear weights are passed as precomputed arrays from
-        precompute_geometry(), eliminating all transcendental arithmetic from the
-        XLA hot path.
+        Returns a function ``sim(sky_coeffs, beam_coeffs, terrain_masks, rots,
+        body_rots, T_gnd, tx_crds_all, crds_gal)`` that is fully JAX-traceable.
+        Rotation matmuls (gal→top, top→body) and healjax interpolation run inside
+        jax.lax.scan so that coordinate arithmetic, beam gather, and sky integration
+        are fused by XLA.
 
-        Transmitter temperatures (tx_T_jax, shape (n_sources, nfreq)) are closed
-        over as a compile-time constant; tx_px_all/tx_wgts_all carry per-step beam
-        pixel indices for each source.  When n_sources=0 the arrays are empty and
-        the sum contributes zero.
+        Transmitter temperatures (tx_T_jax, (n_sources, nfreq)) are closed over as
+        compile-time constants; tx_crds_all carries per-step body-frame directions.
+        When n_sources=0 the arrays are empty and the TX sum contributes zero.
         """
         A_sky = self._sky_basis_A_jax        # (nfreq, nmodes_sky)
         A_beam = self._beam_basis_A_jax      # (nfreq, nmodes_beam)
         npix_beam = self.beam.npix           # static int
         npix_sky = self.sky.npix             # static int
+        nside_beam = self.beam.nside         # static int — required by healjax
         scale = float(npix_sky) / float(npix_beam)
         tx_T_jax = jnp.asarray(self._tx_T_internal, dtype=DTYPE_R_JAX)  # (n_src, nfreq)
 
         @jax.jit
-        def _sim(sky_coeffs, beam_coeffs, masks, px_all, wgts_all, T_gnd,
-                 tx_px_all, tx_wgts_all):
+        def _sim(sky_coeffs, beam_coeffs, terrain_masks, rots, body_rots,
+                 T_gnd, tx_crds_all, crds_gal):
             """
-            sky_coeffs   : (npix_sky, nmodes_sky)
-            beam_coeffs  : (n_dipoles, npix_beam, nmodes_beam)
-            masks        : (ntimes, npix_sky)              float32  1=vis 0=blocked
-            px_all       : (ntimes, 4, npix_sky)           int32    beam pixel indices
-            wgts_all     : (ntimes, 4, npix_sky)           float32  bilinear weights
-            T_gnd        : scalar [K]
-            tx_px_all    : (ntimes, n_sources, 4)          int32
-            tx_wgts_all  : (ntimes, n_sources, 4)          float32
-            Returns      : (ntimes, n_dipoles, nfreq)
+            sky_coeffs    : (npix_vis, nmodes_sky)
+            beam_coeffs   : (n_dipoles, npix_beam, nmodes_beam)
+            terrain_masks : (ntimes, npix_vis)        float32  terrain factor (1=clear)
+            rots          : (ntimes, 3, 3)            float32  gal→top rotation matrices
+            body_rots     : (ntimes, 3, 3)            float32  top→body rotation matrices
+            T_gnd         : scalar [K]
+            tx_crds_all   : (ntimes, n_sources, 3)   float32  TX body-frame directions
+            crds_gal      : (3, npix_vis)             float32  galactic unit vectors
+            Returns       : (ntimes, n_dipoles, nfreq)
             """
-            sky_recon = sky_coeffs @ A_sky.T          # (npix_sky, nfreq)
+            sky_recon = sky_coeffs @ A_sky.T          # (npix_vis, nfreq)
             beam_recon_all = beam_coeffs @ A_beam.T   # (n_dipoles, npix_beam, nfreq)
-            # Denominator (beam solid angle) is rotation-invariant: compute once
             den_all = jnp.sum(beam_recon_all, axis=1) * scale  # (n_dipoles, nfreq)
 
             def one_time(_, args):
-                mask, px, wgts, tx_px, tx_wgts = args
-                # tx_px   : (n_sources, 4)
-                # tx_wgts : (n_sources, 4)
+                terrain_mask, R, br, tx_c = args
+                # R: (3,3)  br: (3,3)  terrain_mask: (npix_vis,)  tx_c: (n_sources,3)
+                crds_top = R @ crds_gal                              # (3, npix_vis)
+                geo_mask = (crds_top[2] > 0).astype(DTYPE_R_JAX)   # (npix_vis,)
+                mask = geo_mask * terrain_mask                       # (npix_vis,)
+                crds_body = br @ crds_top                           # (3, npix_vis)
+
+                th, ph = healjax.vec2ang(crds_body[0], crds_body[1], crds_body[2])
+                px, wgts = healjax.get_interp_weights(th, ph, nside_beam)
+                # px: (4, npix_vis)   wgts: (4, npix_vis)
+
                 sky_masked = sky_recon * mask[:, None] + T_gnd * (1.0 - mask[:, None])
 
                 def one_dipole(beam_recon_d, den_d):  # (npix_beam, nfreq), (nfreq,)
-                    # Gather beam at sky-pixel directions via precomputed weights
-                    beam_at_sky = jnp.sum(
-                        beam_recon_d[px] * wgts[:, :, None], axis=0
-                    )                                  # (npix_sky, nfreq)
+                    # Accumulate 4 bilinear neighbors without materialising (4,npix,nfreq)
+                    beam_at_sky = jax.lax.fori_loop(
+                        0, 4,
+                        lambda k, acc: acc + beam_recon_d[px[k]] * wgts[k, :, None],
+                        jnp.zeros_like(sky_recon),
+                    )                                  # (npix_vis, nfreq)
                     num = jnp.sum(beam_at_sky * sky_masked, axis=0)  # (nfreq,)
 
-                    # Transmitter contribution: sum over n_sources
-                    # beam_recon_d[tx_px]: (n_sources, 4, nfreq)
-                    # tx_wgts[:,:,None]:   (n_sources, 4, 1)
-                    beam_at_tx = jnp.sum(
-                        beam_recon_d[tx_px] * tx_wgts[:, :, None], axis=1
+                    # TX: interpolate beam at each source direction
+                    th_tx, ph_tx = healjax.vec2ang(tx_c[:, 0], tx_c[:, 1], tx_c[:, 2])
+                    tx_px, tx_wgts = healjax.get_interp_weights(th_tx, ph_tx, nside_beam)
+                    # tx_px: (4, n_sources)   tx_wgts: (4, n_sources)
+                    beam_at_tx = jax.lax.fori_loop(
+                        0, 4,
+                        lambda k, acc: acc + beam_recon_d[tx_px[k]] * tx_wgts[k, :, None],
+                        jnp.zeros_like(tx_T_jax),
                     )                                  # (n_sources, nfreq)
                     num = num + jnp.sum(beam_at_tx * tx_T_jax, axis=0)  # (nfreq,)
                     return num / den_d
@@ -181,21 +224,17 @@ class ForwardModel:
                 return None, jax.vmap(one_dipole)(beam_recon_all, den_all)
 
             _, antenna_temp = jax.lax.scan(
-                one_time, None, (masks, px_all, wgts_all, tx_px_all, tx_wgts_all)
+                one_time, None, (terrain_masks, rots, body_rots, tx_crds_all)
             )
             return antenna_temp  # (ntimes, n_dipoles, nfreq)
 
         return _sim
 
-    def precompute_geometry(self, times=None, rots=None, body_rots=None):
+    def precompute_geometry(self, times=None, rots=None, body_rots=None,
+                            sky_mask=None):
         """
-        Precompute rotation matrices, terrain masks, and beam interpolation
-        weights for a list of observation times or pre-computed rotation matrices.
-
-        The expensive coordinate-conversion and bilinear-interpolation-weight
-        computation (O(npix_sky) trig per time step) is done here once rather
-        than inside the JIT-compiled simulate() kernel, which only needs
-        vectorised gather+sum operations.
+        Precompute rotation matrices and terrain masks for a list of observation
+        times or pre-computed rotation matrices.
 
         Parameters
         ----------
@@ -211,44 +250,64 @@ class ForwardModel:
             sky coordinates are rotated from topocentric into the antenna body
             frame before beam pixel lookup.  If None, body frame coincides
             with the topocentric frame (the default).
+        sky_mask : ndarray of bool, shape (npix_sky,), optional
+            Static pixel-reduction mask from ``build_sky_mask()``.  Only
+            masked-in pixels are included in the geometry arrays, reducing
+            coordinate and kernel sizes proportionally.  ``simulate()``
+            automatically gathers the corresponding sky coefficients via the
+            ``sky_indices_jax`` entry stored in the returned geom dict.
 
         Returns
         -------
         geom : dict
-            Cached geometry:
-            - 'rot_gal2top': list of (3, 3) rotation matrices
-            - 'crds_top': list of (3, npix_sky) topocentric coordinates
-            - 'masks': list of (npix_sky,) float32 visibility masks
-            - 'masks_jax': (ntimes, npix_sky) stacked JAX array
-            - 'px_jax': (ntimes, 4, npix_sky) int32 — beam pixel indices
-            - 'wgts_jax': (ntimes, 4, npix_sky) float32 — bilinear weights
+            Cached geometry (JAX arrays ready for the kernel):
+            - 'rots_jax': (ntimes, 3, 3) float32 — gal→top rotation matrices
+            - 'body_rots_jax': (ntimes, 3, 3) float32 — top→body rotations (identity if body_rots=None)
+            - 'terrain_masks_jax': (ntimes, npix_vis) float32 — terrain factor (1=clear, computed
+              in-kernel from crds_top[2]>0); all ones when no terrain
+            - 'crds_gal_jax': (3, npix_vis) float32 — galactic unit vectors (filtered by sky_mask)
+            - 'tx_crds_jax': (ntimes, n_sources, 3) float32 — TX body-frame directions
+            - 'sky_indices_jax': (npix_vis,) int32 — only present when sky_mask given
+            Times path also retains: 'rot_gal2top', 'crds_top', 'masks' (numpy arrays)
         """
         from astropy.time import Time
 
+        # Optional static pixel reduction: restrict to ever-visible pixels.
+        if sky_mask is not None:
+            sky_mask_np = np.asarray(sky_mask, dtype=bool)
+            sky_indices = np.where(sky_mask_np)[0].astype(np.int32)
+            crds_gal = self._crds_gal[:, sky_mask_np]  # (3, npix_vis)
+        else:
+            sky_indices = None
+            crds_gal = self._crds_gal                  # (3, npix_sky)
+
+        npix_vis = crds_gal.shape[1]
+        geom = {}
+
         if rots is not None:
-            # Use pre-computed rotation matrices; skip observer ephemeris.
-            R_stack = [np.asarray(r, dtype=np.float32) for r in rots]
-            ntimes = len(R_stack)
-            geom = {'rot_gal2top': [], 'crds_top': [], 'masks': []}
-            npix_sky = self.sky.npix
-            for R in R_stack:
-                geom['rot_gal2top'].append(R)
-                crds_top = R @ self._crds_gal
-                geom['crds_top'].append(crds_top)
-                if self.terrain is not None:
-                    terrain_mask = self.terrain.mask(crds_top).astype(np.float32)
-                    geom['masks'].append((crds_top[2] > 0).astype(np.float32) * terrain_mask)
-                else:
-                    geom['masks'].append((crds_top[2] > 0).astype(np.float32))
+            # Rots path: skip observer ephemeris and gal→top matmul.
+            # The kernel performs R @ crds_gal per step inside jax.lax.scan.
+            R_arr = np.stack([np.asarray(r, dtype=np.float32) for r in rots])
+            ntimes = R_arr.shape[0]
+            geom['rot_gal2top'] = R_arr
+
+            if self.terrain is not None:
+                # Compute crds_top only to evaluate the terrain mask.
+                crds_top_arr = R_arr @ crds_gal      # (ntimes, 3, npix_vis)
+                terrain_masks = np.stack([
+                    self.terrain.mask(crds_top_arr[i]).astype(np.float32)
+                    for i in range(ntimes)
+                ])                                   # (ntimes, npix_vis)
+            else:
+                terrain_masks = np.ones((ntimes, npix_vis), dtype=np.float32)
+
         elif times is not None:
             times = [Time(t) if not isinstance(t, Time) else t for t in times]
-            geom = {'rot_gal2top': [], 'crds_top': [], 'masks': []}
             ntimes = len(times)
-            npix_sky = self.sky.npix
+            rot_list, crds_list, masks_list, terrain_list = [], [], [], []
 
             # Batch-compute rotation matrices when the observer supports it.
             # EarthSurface uses a vectorised astropy call (61× faster than looping).
-            # Other observers fall back to the default per-step loop.
             if hasattr(self.observer, 'rot_gal2top_stack'):
                 R_all = self.observer.rot_gal2top_stack(times)   # (ntimes, 3, 3)
             else:
@@ -257,82 +316,53 @@ class ForwardModel:
             for i, t in enumerate(times):
                 self.observer.set_time(t)
                 R = R_all[i] if R_all is not None else self.observer.rot_gal2top().astype(np.float32)
-                geom['rot_gal2top'].append(R)
-                crds_top = R @ self._crds_gal
-                geom['crds_top'].append(crds_top)
+                rot_list.append(R)
+                crds_top = R @ crds_gal              # (3, npix_vis)
+                crds_list.append(crds_top)
 
-                # For observers with rot_gal2top_stack, "above horizon" is
-                # crds_top[2] > 0; skip the redundant rot_gal2top() call that
-                # observer.above_horizon() would make internally.
-                if R_all is not None:
-                    geo_mask = (crds_top[2] > 0).astype(np.float32)
-                    if self.terrain is not None:
-                        terrain_mask = self.terrain.mask(crds_top).astype(np.float32)
-                        geom['masks'].append(geo_mask * terrain_mask)
-                    else:
-                        geom['masks'].append(geo_mask)
+                geo_mask = (crds_top[2] > 0).astype(np.float32)
+                if self.terrain is not None:
+                    t_mask = self.terrain.mask(crds_top).astype(np.float32)
+                    masks_list.append(geo_mask * t_mask)
+                    terrain_list.append(t_mask)
                 else:
-                    geom['masks'].append(self._compute_mask(crds_top))
+                    masks_list.append(geo_mask)
+                    terrain_list.append(np.ones(npix_vis, dtype=np.float32))
+
+            R_arr = np.stack(rot_list)
+            geom.update({
+                'rot_gal2top': R_arr,
+                'crds_top':    np.stack(crds_list),
+                'masks':       np.stack(masks_list).astype(np.float32),
+            })
+            terrain_masks = np.stack(terrain_list).astype(np.float32)
         else:
             raise ValueError("Either times or rots must be provided")
 
-        # Vectorise beam-interpolation weight computation over all times at once.
-        # healpy's C implementation processes ntimes*npix_sky pixels in a single
-        # call, ~600× faster than looping with per-step JAX dispatch overhead.
-        # When body_rots is provided, apply per-step top→body rotations before
-        # beam pixel lookup (beam lives in body frame, not topocentric frame).
+        # Build body_rots array: identity if not provided.
         if body_rots is not None:
-            crds_beam = np.stack([
-                np.asarray(br, dtype=np.float32) @ ct
-                for br, ct in zip(body_rots, geom['crds_top'])
-            ])  # (ntimes, 3, npix_sky)
+            body_rots_arr = np.stack(
+                [np.asarray(br, dtype=np.float32) for br in body_rots]
+            )                                        # (ntimes, 3, 3)
         else:
-            crds_beam = np.stack(geom['crds_top'])  # (ntimes, 3, npix_sky)
+            body_rots_arr = np.broadcast_to(
+                np.eye(3, dtype=np.float32), (ntimes, 3, 3)
+            ).copy()
 
-        crds_flat = (crds_beam
-                       .transpose(0, 2, 1)         # (ntimes, npix_sky, 3)
-                       .reshape(ntimes * npix_sky, 3))
-        th_all, ph_all = healpy.vec2ang(crds_flat)        # (ntimes*npix_sky,) each
-        px_flat, wgts_flat = healpy.get_interp_weights(
-            self.beam.nside, th_all, ph_all, nest=False
-        )  # (4, ntimes*npix_sky) each
-        # Reshape to (ntimes, 4, npix_sky)
-        px_all   = px_flat.reshape(4, ntimes, npix_sky).transpose(1, 0, 2).astype(np.int32)
-        wgts_all = wgts_flat.reshape(4, ntimes, npix_sky).transpose(1, 0, 2).astype(np.float32)
-
-        geom['masks_jax'] = jnp.stack(
-            [jnp.asarray(m, dtype=DTYPE_R_JAX) for m in geom['masks']]
-        )  # (ntimes, npix_sky)
-        geom['px_jax']   = jnp.asarray(px_all,   dtype=jnp.int32)    # (ntimes, 4, npix_sky)
-        geom['wgts_jax'] = jnp.asarray(wgts_all, dtype=DTYPE_R_JAX)  # (ntimes, 4, npix_sky)
-
-        # Transmitter beam-pixel lookups.
         # Transmitters are topocentric; only body_rots applies (gal→top does NOT).
         n_sources = self._tx_dirs.shape[0]
         if n_sources > 0:
-            if body_rots is not None:
-                # tx_body: (ntimes, n_sources, 3)
-                tx_body = np.stack([
-                    np.stack([np.asarray(br, dtype=np.float32) @ d
-                              for d in self._tx_dirs])
-                    for br in body_rots
-                ])
-            else:
-                tx_body = np.tile(self._tx_dirs[None], (ntimes, 1, 1))
-            tx_flat = tx_body.reshape(ntimes * n_sources, 3)
-            th_tx, ph_tx = healpy.vec2ang(tx_flat)
-            tx_px_f, tx_wgts_f = healpy.get_interp_weights(
-                self.beam.nside, th_tx, ph_tx, nest=False
-            )  # (4, ntimes*n_sources) each
-            # → (ntimes, n_sources, 4)
-            tx_px_all   = tx_px_f.T.reshape(ntimes, n_sources, 4).astype(np.int32)
-            tx_wgts_all = tx_wgts_f.T.reshape(ntimes, n_sources, 4).astype(np.float32)
+            tx_body = (body_rots_arr @ self._tx_dirs.T).transpose(0, 2, 1)
         else:
-            tx_px_all   = np.zeros((ntimes, 0, 4), dtype=np.int32)
-            tx_wgts_all = np.zeros((ntimes, 0, 4), dtype=np.float32)
+            tx_body = np.zeros((ntimes, 0, 3), dtype=np.float32)
 
-        geom['tx_px_jax']   = jnp.asarray(tx_px_all,   dtype=jnp.int32)
-        geom['tx_wgts_jax'] = jnp.asarray(tx_wgts_all, dtype=DTYPE_R_JAX)
+        geom['rots_jax']          = jnp.asarray(R_arr,         dtype=DTYPE_R_JAX)  # (ntimes, 3, 3)
+        geom['body_rots_jax']     = jnp.asarray(body_rots_arr, dtype=DTYPE_R_JAX)  # (ntimes, 3, 3)
+        geom['terrain_masks_jax'] = jnp.asarray(terrain_masks, dtype=DTYPE_R_JAX)  # (ntimes, npix_vis)
+        geom['crds_gal_jax']      = jnp.asarray(crds_gal,      dtype=DTYPE_R_JAX)  # (3, npix_vis)
+        geom['tx_crds_jax']       = jnp.asarray(tx_body,       dtype=DTYPE_R_JAX)  # (ntimes, n_src, 3)
+        if sky_indices is not None:
+            geom['sky_indices_jax'] = jnp.asarray(sky_indices, dtype=jnp.int32)
         return geom
 
     def _compute_mask(self, crds_top):
@@ -386,42 +416,19 @@ class ForwardModel:
         sky_coeffs_jax = jnp.asarray(sky_coeffs, dtype=DTYPE_R_JAX)
         beam_coeffs_jax = jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
 
-        masks_jax = geom.get('masks_jax')
-        px_jax = geom.get('px_jax')
-        wgts_jax = geom.get('wgts_jax')
-
-        if masks_jax is None:
-            masks_jax = jnp.stack(
-                [jnp.asarray(m, dtype=DTYPE_R_JAX) for m in geom['masks']]
-            )
-
-        if px_jax is None or wgts_jax is None:
-            # Fallback for geom dicts built before this optimisation was added
-            px_list, wgts_list = [], []
-            for crds in geom['crds_top']:
-                th, ph = healjax.vec2ang(crds[0], crds[1], crds[2])
-                px, wgts = healjax.get_interp_weights(th, ph, self.beam.nside)
-                px_list.append(np.array(px, dtype=np.int32))
-                wgts_list.append(np.array(wgts, dtype=np.float32))
-            px_jax = jnp.stack([jnp.asarray(p, dtype=jnp.int32) for p in px_list])
-            wgts_jax = jnp.stack([jnp.asarray(w, dtype=DTYPE_R_JAX) for w in wgts_list])
-            geom['px_jax'] = px_jax
-            geom['wgts_jax'] = wgts_jax
-
-        # Transmitter pixel lookups — computed by precompute_geometry; if missing
-        # (old geom dict), synthesize empty arrays so the kernel stays valid.
-        ntimes = masks_jax.shape[0]
-        n_sources = self._tx_dirs.shape[0]
-        tx_px_jax = geom.get('tx_px_jax')
-        tx_wgts_jax = geom.get('tx_wgts_jax')
-        if tx_px_jax is None:
-            tx_px_jax   = jnp.zeros((ntimes, n_sources, 4), dtype=jnp.int32)
-            tx_wgts_jax = jnp.zeros((ntimes, n_sources, 4), dtype=DTYPE_R_JAX)
+        sky_indices_jax = geom.get('sky_indices_jax')
+        if sky_indices_jax is not None:
+            sky_coeffs_jax = sky_coeffs_jax[sky_indices_jax]  # (npix_vis, nmodes_sky)
 
         return self._sim_jit(
-            sky_coeffs_jax, beam_coeffs_jax, masks_jax, px_jax, wgts_jax,
+            sky_coeffs_jax,
+            beam_coeffs_jax,
+            geom['terrain_masks_jax'],
+            geom['rots_jax'],
+            geom['body_rots_jax'],
             jnp.asarray(T_gnd, dtype=DTYPE_R_JAX),
-            tx_px_jax, tx_wgts_jax,
+            geom['tx_crds_jax'],
+            geom['crds_gal_jax'],
         )
 
 

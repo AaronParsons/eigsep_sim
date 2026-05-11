@@ -180,22 +180,41 @@ class Calibrator:
         # Precomputed geometry (cached from init_params or fit)
         self._geom = None
 
-    def init_params(self, times=None) -> Dict[str, np.ndarray]:
-        """
-        Initialize parameters with default values.
+    def _resolve_geom(self, times=None, rots=None, body_rots=None,
+                      geom=None, sky_mask=None):
+        """Compute and cache geometry from whichever source is provided."""
+        if geom is not None:
+            self._geom = geom
+        elif rots is not None:
+            self._geom = self.fwd.precompute_geometry(
+                rots=rots, body_rots=body_rots, sky_mask=sky_mask)
+        elif times is not None:
+            self._geom = self.fwd.precompute_geometry(
+                times=times, sky_mask=sky_mask)
 
-        Uses zero coefficients for sky, and initial beam coefficients.
-        Precomputes geometry if times are provided.
+    def init_params(self, times=None, rots=None, body_rots=None,
+                    geom=None, sky_mask=None) -> Dict[str, np.ndarray]:
+        """
+        Initialize parameters with nominal beam and zero sky coefficients.
+
+        Also precomputes and caches geometry when observation data is provided.
 
         Parameters
         ----------
         times : list of Time, optional
-            Observation times. If provided, precomputes geometry.
+        rots : list of (3, 3) ndarray, optional
+            Pre-computed gal→top rotation matrices (mutually exclusive with times).
+        body_rots : list of (3, 3) ndarray, optional
+            Per-step top→body rotations (used with rots or times).
+        geom : dict, optional
+            Pre-computed geometry dict from ForwardModel.precompute_geometry().
+            Takes priority over times/rots when provided.
+        sky_mask : ndarray of bool, optional
+            Pixel-reduction mask from ForwardModel.build_sky_mask().
 
         Returns
         -------
-        params : dict
-            Initial parameters {'sky_coeffs', 'beam_coeffs'}.
+        params : dict with keys 'sky_coeffs' and 'beam_coeffs'.
         """
         sky_npix = self.fwd.sky.npix
         sky_nmodes = self.fwd.sky.nmodes
@@ -205,14 +224,10 @@ class Calibrator:
             'sky_coeffs': np.zeros((sky_npix, sky_nmodes), dtype=DTYPE_R_NPY),
             'beam_coeffs': beam_coeffs.copy(),
         }
-
-        # Cache nominal beam for regularization
         self._beam_nom = beam_coeffs.copy()
 
-        # Precompute geometry if times provided
-        if times is not None:
-            self._geom = self.fwd.precompute_geometry(times)
-
+        self._resolve_geom(times=times, rots=rots, body_rots=body_rots,
+                           geom=geom, sky_mask=sky_mask)
         return params
 
     def _loss(self, params: Dict[str, np.ndarray]) -> float:
@@ -584,7 +599,7 @@ class Calibrator:
         return params.copy()
 
     def fit(self, params: Optional[Dict[str, np.ndarray]] = None,
-            times=None,
+            times=None, rots=None, body_rots=None, geom=None, sky_mask=None,
             max_iter: int = 30,
             tol: float = 1e-6,
             verbose: bool = True,
@@ -604,7 +619,16 @@ class Calibrator:
         params : dict, optional
             Initial parameters. If None, calls init_params().
         times : list of Time, optional
-            Observation times. Required if geometry not yet precomputed.
+            Observation epochs. Mutually exclusive with rots.
+        rots : list of (3, 3) ndarray, optional
+            Pre-computed gal→top rotation matrices (mutually exclusive with times).
+        body_rots : list of (3, 3) ndarray, optional
+            Per-step top→body rotations.
+        geom : dict, optional
+            Pre-computed geometry from ForwardModel.precompute_geometry().
+            Takes priority over times/rots when provided.
+        sky_mask : ndarray of bool, optional
+            Pixel-reduction mask from ForwardModel.build_sky_mask().
         max_iter : int, optional
             Maximum iterations (default 30).
         tol : float, optional
@@ -635,12 +659,17 @@ class Calibrator:
             - 'n_iter': iterations completed
         """
         if params is None:
-            params = self.init_params(times=times)
-        elif times is not None and self._geom is None:
-            self._geom = self.fwd.precompute_geometry(times)
+            params = self.init_params(times=times, rots=rots,
+                                      body_rots=body_rots, geom=geom,
+                                      sky_mask=sky_mask)
+        elif self._geom is None:
+            self._resolve_geom(times=times, rots=rots, body_rots=body_rots,
+                               geom=geom, sky_mask=sky_mask)
 
         if self._geom is None:
-            raise ValueError("Provide times or call init_params(times=...) first")
+            raise ValueError(
+                "Provide times, rots, or geom to specify observation geometry"
+            )
 
         self._aa.reset()
         losses = []

@@ -403,6 +403,88 @@ def test_calibrator_sky_step_decreases_loss_significantly():
     )
 
 
+def test_calibrator_init_params_with_rots():
+    """init_params(rots=...) precomputes geometry from rotation matrices."""
+    fwd = setup_forward_model()
+    R = fwd.observer.rot_gal2top().astype(np.float32)
+    ntimes = 4
+    data = np.zeros((ntimes, fwd.beam.coeffs.shape[0], len(fwd.beam.freqs_hz)),
+                    dtype=np.float32)
+    cal = Calibrator(fwd, data)
+    params = cal.init_params(rots=[R] * ntimes)
+    assert cal._geom is not None
+    assert 'rots_jax' in cal._geom
+    assert cal._geom['rots_jax'].shape == (ntimes, 3, 3)
+    assert params['sky_coeffs'].shape == (fwd.sky.npix, fwd.sky.nmodes)
+
+
+def test_calibrator_init_params_with_geom():
+    """init_params(geom=...) accepts a pre-computed geometry dict."""
+    fwd = setup_forward_model()
+    R = fwd.observer.rot_gal2top().astype(np.float32)
+    ntimes = 3
+    geom = fwd.precompute_geometry(rots=[R] * ntimes)
+    data = np.zeros((ntimes, fwd.beam.coeffs.shape[0], len(fwd.beam.freqs_hz)),
+                    dtype=np.float32)
+    cal = Calibrator(fwd, data)
+    params = cal.init_params(geom=geom)
+    assert cal._geom is geom   # same object, not re-computed
+
+
+def test_calibrator_fit_with_rots():
+    """fit(rots=...) runs a full calibration iteration from rots geometry."""
+    fwd = setup_forward_model()
+    R = fwd.observer.rot_gal2top().astype(np.float32)
+    ntimes = 5
+    n_dipoles = fwd.beam.coeffs.shape[0]
+    nfreq = len(fwd.beam.freqs_hz)
+
+    # Simulate noiseless data using nominal parameters
+    geom = fwd.precompute_geometry(rots=[R] * ntimes)
+    sky_c = fwd.sky.init_coeffs()
+    beam_c = fwd.beam.coeffs.copy()
+    data = np.array(fwd.simulate(sky_c, beam_c, geom=geom), dtype=np.float32)
+
+    cal = Calibrator(fwd, data, lam_beam=0.0)
+    result = cal.fit(rots=[R] * ntimes, max_iter=3, verbose=False)
+
+    assert 'params' in result
+    assert result['params']['sky_coeffs'].shape == (fwd.sky.npix, fwd.sky.nmodes)
+    assert result['n_iter'] <= 3
+
+
+def test_calibrator_fit_with_precomputed_geom():
+    """fit(geom=...) accepts a pre-computed geometry dict directly."""
+    fwd = setup_forward_model()
+    R = fwd.observer.rot_gal2top().astype(np.float32)
+    ntimes = 4
+    geom = fwd.precompute_geometry(rots=[R] * ntimes)
+    sky_c = fwd.sky.init_coeffs()
+    beam_c = fwd.beam.coeffs.copy()
+    data = np.array(fwd.simulate(sky_c, beam_c, geom=geom), dtype=np.float32)
+
+    cal = Calibrator(fwd, data, lam_beam=0.0)
+    result = cal.fit(geom=geom, max_iter=2, verbose=False)
+    assert 'params' in result
+
+
+def test_calibrator_fit_with_sky_mask():
+    """fit(rots=..., sky_mask=...) propagates sky_mask through geometry."""
+    fwd = setup_forward_model()
+    R = fwd.observer.rot_gal2top().astype(np.float32)
+    ntimes = 4
+    sky_mask = fwd.build_sky_mask(rots=[R])
+    geom = fwd.precompute_geometry(rots=[R] * ntimes, sky_mask=sky_mask)
+    sky_c = fwd.sky.init_coeffs()
+    beam_c = fwd.beam.coeffs.copy()
+    data = np.array(fwd.simulate(sky_c, beam_c, geom=geom), dtype=np.float32)
+
+    cal = Calibrator(fwd, data, lam_beam=0.0)
+    result = cal.fit(rots=[R] * ntimes, sky_mask=sky_mask, max_iter=2, verbose=False)
+    assert 'sky_indices_jax' in cal._geom
+    assert result['params']['sky_coeffs'].shape == (fwd.sky.npix, fwd.sky.nmodes)
+
+
 if __name__ == "__main__":
     test_anderson_accelerator_basic()
     test_anderson_accelerator_reset()
