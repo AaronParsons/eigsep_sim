@@ -12,6 +12,8 @@ dist/
 # Simulation caches
 .eigsep_cache/
 .sim_cache/
+notebooks/jax_profile/
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/*.png
