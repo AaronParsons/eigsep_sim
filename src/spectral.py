@@ -16,7 +16,7 @@ import numpy as np
 import healpy
 from scipy.spatial.transform import Rotation
 
-from .sim import thin_dipole_pattern
+from .beam import thin_dipole_pattern
 
 
 def gsm_eigenmodes(gsm_maps, n_modes, include_flat=True):

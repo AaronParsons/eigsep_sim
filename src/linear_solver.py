@@ -346,7 +346,7 @@ def build_A_from_model(rots_per_orbit, masks, spectral_basis, c, delta_phi,
     Parameters
     ----------
     rots_per_orbit : list of Rotation
-        Spacecraft attitudes per observation (from eigsep_sim.lunar_orbit).
+        Spacecraft attitudes per observation (from eigsep_sim.observer.LunarOrbit).
     masks : ndarray, shape (n_obs, npix_sky), float32
         Binary masks (1 = sky, 0 = regolith).
     spectral_basis : dict
