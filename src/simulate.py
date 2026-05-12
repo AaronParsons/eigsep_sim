@@ -125,15 +125,20 @@ class ForwardModel:
         """
         if rots is not None:
             R_arr = np.stack([np.asarray(r, dtype=np.float32) for r in rots])
-            crds_top_arr = R_arr @ self._crds_gal          # (ntimes, 3, npix_sky)
-            return np.any(crds_top_arr[:, 2, :] > 0, axis=0)  # (npix_sky,)
+            if getattr(self.observer, "uses_local_horizon", True):
+                crds_top_arr = R_arr @ self._crds_gal      # (ntimes, 3, npix_sky)
+                return np.any(crds_top_arr[:, 2, :] > 0, axis=0)
+            return self.observer.above_horizon(self.sky.nside)
         elif times is not None:
             from astropy.time import Time
             mask = np.zeros(self.sky.npix, dtype=bool)
             for t in times:
                 self.observer.set_time(Time(t) if not isinstance(t, Time) else t)
-                R = self.observer.rot_gal2top().astype(np.float32)
-                mask |= (R @ self._crds_gal)[2] > 0
+                if getattr(self.observer, "uses_local_horizon", True):
+                    R = self.observer.rot_gal2top().astype(np.float32)
+                    mask |= (R @ self._crds_gal)[2] > 0
+                else:
+                    mask |= self.observer.above_horizon(self.sky.nside)
             return mask
         else:
             raise ValueError("Either rots or times must be provided")
@@ -174,7 +179,7 @@ class ForwardModel:
             """
             sky_coeffs    : (npix_vis, nmodes_sky)
             beam_coeffs   : (n_dipoles, npix_beam, nmodes_beam)
-            terrain_masks : (ntimes, npix_vis)        float32  terrain factor (1=clear)
+            terrain_masks : (ntimes, npix_vis)        float32  visibility factor (1=sky)
             rots          : (ntimes, 3, 3)            float32  gal→top rotation matrices
             body_rots     : (ntimes, 3, 3)            float32  top→body rotation matrices
             T_gnd         : scalar [K]
@@ -190,15 +195,12 @@ class ForwardModel:
                 terrain_mask, R, br, tx_c = args
                 # R: (3,3)  br: (3,3)  terrain_mask: (npix_vis,)  tx_c: (n_sources,3)
                 crds_top = R @ crds_gal                              # (3, npix_vis)
-                geo_mask = (crds_top[2] > 0).astype(DTYPE_R_JAX)   # (npix_vis,)
-                mask = geo_mask * terrain_mask                       # (npix_vis,)
+                mask = terrain_mask                                # (npix_vis,)
                 crds_body = br @ crds_top                           # (3, npix_vis)
 
                 th, ph = healjax.vec2ang(crds_body[0], crds_body[1], crds_body[2])
                 px, wgts = healjax.get_interp_weights(th, ph, nside_beam)
                 # px: (4, npix_vis)   wgts: (4, npix_vis)
-
-                sky_masked = sky_recon * mask[:, None] + T_gnd * (1.0 - mask[:, None])
 
                 def one_dipole(beam_recon_d, den_d):  # (npix_beam, nfreq), (nfreq,)
                     # Accumulate 4 bilinear neighbors without materialising (4,npix,nfreq)
@@ -207,11 +209,19 @@ class ForwardModel:
                         lambda k, acc: acc + beam_recon_d[px[k]] * wgts[k, :, None],
                         jnp.zeros_like(sky_recon),
                     )                                  # (npix_vis, nfreq)
-                    num = jnp.sum(beam_at_sky * sky_masked, axis=0)  # (nfreq,)
+                    sky_weight = jnp.sum(beam_at_sky * mask[:, None], axis=0)
+                    sky_num = jnp.sum(
+                        beam_at_sky * sky_recon * mask[:, None], axis=0
+                    )
+                    # Treat every non-visible direction as uniform ground.
+                    # This also accounts for pixels omitted by sky_mask.
+                    num = sky_num + T_gnd * (den_d - sky_weight)
 
                     # TX: interpolate beam at each source direction
                     th_tx, ph_tx = healjax.vec2ang(tx_c[:, 0], tx_c[:, 1], tx_c[:, 2])
-                    tx_px, tx_wgts = healjax.get_interp_weights(th_tx, ph_tx, nside_beam)
+                    tx_px, tx_wgts = healjax.get_interp_weights(
+                        th_tx, ph_tx, nside_beam
+                    )
                     # tx_px: (4, n_sources)   tx_wgts: (4, n_sources)
                     beam_at_tx = jax.lax.fori_loop(
                         0, 4,
@@ -263,8 +273,7 @@ class ForwardModel:
             Cached geometry (JAX arrays ready for the kernel):
             - 'rots_jax': (ntimes, 3, 3) float32 — gal→top rotation matrices
             - 'body_rots_jax': (ntimes, 3, 3) float32 — top→body rotations (identity if body_rots=None)
-            - 'terrain_masks_jax': (ntimes, npix_vis) float32 — terrain factor (1=clear, computed
-              in-kernel from crds_top[2]>0); all ones when no terrain
+            - 'terrain_masks_jax': (ntimes, npix_vis) float32 — visibility factor (1=sky)
             - 'crds_gal_jax': (3, npix_vis) float32 — galactic unit vectors (filtered by sky_mask)
             - 'tx_crds_jax': (ntimes, n_sources, 3) float32 — TX body-frame directions
             - 'sky_indices_jax': (npix_vis,) int32 — only present when sky_mask given
@@ -291,20 +300,35 @@ class ForwardModel:
             ntimes = R_arr.shape[0]
             geom['rot_gal2top'] = R_arr
 
+            crds_top_arr = R_arr @ crds_gal      # (ntimes, 3, npix_vis)
+            if getattr(self.observer, "uses_local_horizon", True):
+                obs_masks = (crds_top_arr[:, 2, :] > 0).astype(np.float32)
+            else:
+                obs_mask_full = self.observer.above_horizon(
+                    self.sky.nside
+                ).astype(np.float32)
+                if sky_indices is not None:
+                    obs_mask = obs_mask_full[sky_indices]
+                else:
+                    obs_mask = obs_mask_full
+                obs_masks = np.broadcast_to(
+                    obs_mask, (ntimes, npix_vis)
+                ).astype(np.float32)
+
             if self.terrain is not None:
-                # Compute crds_top only to evaluate the terrain mask.
-                crds_top_arr = R_arr @ crds_gal      # (ntimes, 3, npix_vis)
                 terrain_masks = np.stack([
-                    self.terrain.mask(crds_top_arr[i]).astype(np.float32)
+                    (obs_masks[i] * self.terrain.mask(crds_top_arr[i])).astype(
+                        np.float32
+                    )
                     for i in range(ntimes)
                 ])                                   # (ntimes, npix_vis)
             else:
-                terrain_masks = np.ones((ntimes, npix_vis), dtype=np.float32)
+                terrain_masks = obs_masks
 
         elif times is not None:
             times = [Time(t) if not isinstance(t, Time) else t for t in times]
             ntimes = len(times)
-            rot_list, crds_list, masks_list, terrain_list = [], [], [], []
+            rot_list, crds_list, masks_list = [], [], []
 
             # Batch-compute rotation matrices when the observer supports it.
             # EarthSurface uses a vectorised astropy call (61× faster than looping).
@@ -313,21 +337,50 @@ class ForwardModel:
             else:
                 R_all = None
 
+            if (not getattr(self.observer, "uses_local_horizon", True)
+                    and hasattr(self.observer, "above_horizon_stack")):
+                obs_mask_all = self.observer.above_horizon_stack(
+                    times, self.sky.nside
+                ).astype(np.float32)
+                if sky_indices is not None:
+                    obs_mask_all = obs_mask_all[:, sky_indices]
+            else:
+                obs_mask_all = None
+
+            needs_step_time = R_all is None or (
+                not getattr(self.observer, "uses_local_horizon", True)
+                and obs_mask_all is None
+            )
+
             for i, t in enumerate(times):
-                self.observer.set_time(t)
-                R = R_all[i] if R_all is not None else self.observer.rot_gal2top().astype(np.float32)
+                if needs_step_time:
+                    self.observer.set_time(t)
+                R = (
+                    R_all[i]
+                    if R_all is not None
+                    else self.observer.rot_gal2top().astype(np.float32)
+                )
                 rot_list.append(R)
                 crds_top = R @ crds_gal              # (3, npix_vis)
                 crds_list.append(crds_top)
 
-                geo_mask = (crds_top[2] > 0).astype(np.float32)
+                if getattr(self.observer, "uses_local_horizon", True):
+                    obs_mask = (crds_top[2] > 0).astype(np.float32)
+                elif obs_mask_all is not None:
+                    obs_mask = obs_mask_all[i]
+                else:
+                    obs_mask_full = self.observer.above_horizon(
+                        self.sky.nside
+                    ).astype(np.float32)
+                    if sky_indices is not None:
+                        obs_mask = obs_mask_full[sky_indices]
+                    else:
+                        obs_mask = obs_mask_full
                 if self.terrain is not None:
                     t_mask = self.terrain.mask(crds_top).astype(np.float32)
-                    masks_list.append(geo_mask * t_mask)
-                    terrain_list.append(t_mask)
+                    masks_list.append(obs_mask * t_mask)
                 else:
-                    masks_list.append(geo_mask)
-                    terrain_list.append(np.ones(npix_vis, dtype=np.float32))
+                    masks_list.append(obs_mask)
 
             R_arr = np.stack(rot_list)
             geom.update({
@@ -335,7 +388,8 @@ class ForwardModel:
                 'crds_top':    np.stack(crds_list),
                 'masks':       np.stack(masks_list).astype(np.float32),
             })
-            terrain_masks = np.stack(terrain_list).astype(np.float32)
+            terrain_masks = np.stack(masks_list).astype(np.float32)
+            self.observer.set_time(times[-1])
         else:
             raise ValueError("Either times or rots must be provided")
 

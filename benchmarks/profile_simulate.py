@@ -23,7 +23,10 @@ import tracemalloc
 import numpy as np
 import healpy
 from astropy.time import Time
-from line_profiler import LineProfiler
+try:
+    from line_profiler import LineProfiler
+except ImportError:
+    LineProfiler = None
 
 import jax
 import jax.profiler
@@ -107,20 +110,23 @@ print("=" * 70)
 print("2. line_profiler — precompute_geometry")
 print("=" * 70)
 
-from eigsep_sim.simulate import ForwardModel as _FwdCls
+if LineProfiler is None:
+    print("  line_profiler is not installed; skipping this section.\n")
+else:
+    from eigsep_sim.simulate import ForwardModel as _FwdCls
 
-lp = LineProfiler()
-lp.add_function(_FwdCls.precompute_geometry)
-lp_wrapper = lp(_FwdCls.precompute_geometry)
+    lp = LineProfiler()
+    lp.add_function(_FwdCls.precompute_geometry)
+    lp_wrapper = lp(_FwdCls.precompute_geometry)
 
-# Call via wrapper (line_profiler instruments the source function directly)
-lp.enable_by_count()
-geom = fwd.precompute_geometry(rots=rots_scan, body_rots=body_rots_scan)
-lp.disable_by_count()
+    # Call via wrapper (line_profiler instruments the source function directly)
+    lp.enable_by_count()
+    geom = fwd.precompute_geometry(rots=rots_scan, body_rots=body_rots_scan)
+    lp.disable_by_count()
 
-buf2 = io.StringIO()
-lp.print_stats(stream=buf2)
-print(buf2.getvalue())
+    buf2 = io.StringIO()
+    lp.print_stats(stream=buf2)
+    print(buf2.getvalue())
 
 
 # ── 3. JAX profiler — simulate ────────────────────────────────────────────────
@@ -166,10 +172,24 @@ def mb(arr):
 print(f"  Python heap peak during precompute_geometry: {peak / 1024**2:.1f} MB")
 print()
 print("  Geom array sizes:")
-print(f"    masks_jax     {str(tuple(geom_mem['masks_jax'].shape)):30s}  {mb(geom_mem['masks_jax']):.1f} MB")
-print(f"    crds_beam_jax {str(tuple(geom_mem['crds_beam_jax'].shape)):30s}  {mb(geom_mem['crds_beam_jax']):.1f} MB")
-print(f"    tx_crds_jax   {str(tuple(geom_mem['tx_crds_jax'].shape)):30s}  {mb(geom_mem['tx_crds_jax']):.1f} MB")
-total = sum(mb(geom_mem[k]) for k in ('masks_jax', 'crds_beam_jax', 'tx_crds_jax'))
+geom_keys = [
+    'rots_jax',
+    'body_rots_jax',
+    'terrain_masks_jax',
+    'crds_gal_jax',
+    'tx_crds_jax',
+]
+total = 0.0
+for key in geom_keys:
+    arr = geom_mem[key]
+    size_mb = mb(arr)
+    total += size_mb
+    print(f"    {key:<17s} {str(tuple(arr.shape)):30s}  {size_mb:.1f} MB")
+if 'sky_indices_jax' in geom_mem:
+    arr = geom_mem['sky_indices_jax']
+    size_mb = mb(arr)
+    total += size_mb
+    print(f"    {'sky_indices_jax':<17s} {str(tuple(arr.shape)):30s}  {size_mb:.1f} MB")
 print(f"    {'TOTAL':30s}  {total:.1f} MB")
 print()
 print("Done.")

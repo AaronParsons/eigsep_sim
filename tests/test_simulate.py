@@ -632,6 +632,66 @@ def test_sky_mask_same_result_at_zero_T_gnd(simple_fwd):
     np.testing.assert_allclose(T_full, T_mask, rtol=1e-5, atol=1e-5)
 
 
+def test_sky_mask_same_result_with_ground(simple_fwd):
+    """sky_mask must preserve ground emission from omitted pixels."""
+    fwd = simple_fwd
+    R = fwd.observer.rot_gal2top().astype(np.float32)
+    sky_c = np.abs(
+        np.random.default_rng(43).standard_normal((fwd.sky.npix, 2))
+    ).astype(np.float32)
+    beam_c = fwd.beam.coeffs
+
+    mask = fwd.build_sky_mask(rots=[R])
+    geom_full = fwd.precompute_geometry(rots=[R])
+    geom_mask = fwd.precompute_geometry(rots=[R], sky_mask=mask)
+
+    T_full = np.array(fwd.simulate(sky_c, beam_c, geom=geom_full, T_gnd=300.0))
+    T_mask = np.array(fwd.simulate(sky_c, beam_c, geom=geom_mask, T_gnd=300.0))
+
+    np.testing.assert_allclose(T_full, T_mask, rtol=1e-5, atol=1e-5)
+
+
+def test_lunar_orbit_uses_occultation_not_body_horizon():
+    """A far lunar orbiter with no occulted pixels should not see ground."""
+    from eigsep_sim.basis import BeamBasis, SkyBasis
+
+    freqs_hz = np.array([50e6, 100e6], dtype=np.float64)
+    nside = 4
+    npix = healpy.nside2npix(nside)
+
+    beam = Beam(
+        nside,
+        freqs_hz,
+        BeamBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+        np.ones((1, npix, 1), dtype=np.float32),
+    )
+    sky = Sky(
+        nside,
+        freqs_hz,
+        SkyBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+    )
+    observer = LunarOrbit(
+        altitude=5e7,
+        rot_orbit_vec=[0, 0, 1],
+        rot_spin_vec=[0, 0, 1],
+    )
+    fwd = ForwardModel(observer, beam, sky)
+
+    sky_c = np.zeros((npix, 1), dtype=np.float32)
+    beam_c = beam.coeffs
+    geom = fwd.precompute_geometry(times=[observer.t0])
+    assert np.all(np.array(geom["masks"]) == 1.0)
+
+    T = np.array(fwd.simulate(sky_c, beam_c, geom=geom, T_gnd=300.0))
+    np.testing.assert_allclose(T, 0.0, atol=1e-5)
+
+
 if __name__ == "__main__":
     test_forward_model_basic()
     test_forward_model_with_terrain()

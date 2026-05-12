@@ -49,6 +49,8 @@ class Observer:
       - set_time(t)     : stores Time(t) in self.time
     """
 
+    uses_local_horizon = True
+
     def __init__(self):
         self.time = None
 
@@ -330,6 +332,8 @@ class LunarOrbit(Observer):
         phase at this time.  Default: J2000.
     """
 
+    uses_local_horizon = False
+
     def __init__(
         self,
         altitude,
@@ -361,6 +365,11 @@ class LunarOrbit(Observer):
 
         self._th_orbit = 0.0
         self._th_spin = 0.0
+        self._pix_vec_cache = {}
+
+    def _time_seconds(self, times):
+        times = Time(times)
+        return (times - self.t0).to(u.s).value
 
     def set_time(self, t):
         """Set the current epoch and update orbital and spin phases."""
@@ -407,6 +416,46 @@ class LunarOrbit(Observer):
         R_spin = rot_m(self._th_spin, self.rot_spin_vec)
         return R_spin.T
 
+    def rot_gal2top_stack(self, times):
+        """Batch galactic-to-spacecraft-frame rotations for multiple times."""
+        dt = self._time_seconds(times)
+        th_spin = (
+            2 * np.pi * dt / self.spin_period if self.spin_period != 0.0 else 0.0
+        )
+        R_spin = rot_m(th_spin, self.rot_spin_vec)
+        if R_spin.ndim == 2:
+            R_spin = np.broadcast_to(R_spin, (len(Time(times)), 3, 3))
+        return np.swapaxes(R_spin, -1, -2).astype(np.float32)
+
+    def spacecraft_position_stack(self, times):
+        """Batch spacecraft positions in galactic coordinates, shape (ntimes, 3)."""
+        dt = self._time_seconds(times)
+        th_orbit = 2 * np.pi * dt / self.orbital_period
+        R_orbit = rot_m(th_orbit, self.rot_orbit_vec)
+        return np.einsum(
+            "tij,j->ti",
+            R_orbit,
+            self.start_pos * self.orbital_radius,
+        )
+
+    def _pix_vecs(self, nside):
+        nside = int(nside)
+        if nside not in self._pix_vec_cache:
+            npix = healpy.nside2npix(nside)
+            self._pix_vec_cache[nside] = np.array(
+                healpy.pix2vec(nside, np.arange(npix)), dtype=np.float64
+            )
+        return self._pix_vec_cache[nside]
+
+    def above_horizon_stack(self, times, nside):
+        """Batch lunar occultation masks, shape (ntimes, npix)."""
+        pos = self.spacecraft_position_stack(times)
+        d = np.linalg.norm(pos, axis=1)
+        moon_dir = pos / d[:, None]
+        dot = moon_dir @ self._pix_vecs(nside)
+        limb_dot = -np.sqrt(np.maximum(0.0, 1.0 - (R_MOON / d) ** 2))
+        return dot > limb_dot[:, None]
+
     def above_horizon(self, nside):
         """
         Boolean HEALPix mask (galactic frame) of pixels not occluded by
@@ -418,17 +467,14 @@ class LunarOrbit(Observer):
             True for pixels whose line of sight from the spacecraft does
             not intersect the lunar sphere.
         """
-        from .utils import moon_surface_distance
-
-        npix = healpy.nside2npix(nside)
-        vecs = np.array(
-            healpy.pix2vec(nside, np.arange(npix)), dtype=np.float64
-        )  # (3, npix)
         pos = self.spacecraft_position()          # (3,) metres, from Moon centre
         d = float(np.linalg.norm(pos))
-        moon_dir = pos / d                        # direction from Moon centre to spacecraft
-        # angle between each pixel direction and moon_dir (i.e. outward radial)
-        dot = np.clip(moon_dir @ vecs, -1.0, 1.0)
-        angle = np.arccos(dot)
-        dist = moon_surface_distance(angle, d)
-        return np.isnan(dist)                     # NaN → no intersection → pixel visible
+        moon_dir = pos / d                        # Moon centre → spacecraft
+
+        # Ray from spacecraft along sky direction u intersects the lunar sphere
+        # iff its closest approach is within R_MOON and the closest point is in
+        # front of the spacecraft: pos·u < 0.  With dot = moon_dir·u this is
+        # equivalent to dot <= -sqrt(1 - (R_MOON / d)^2).
+        dot = moon_dir @ self._pix_vecs(nside)
+        limb_dot = -np.sqrt(max(0.0, 1.0 - (R_MOON / d) ** 2))
+        return dot > limb_dot

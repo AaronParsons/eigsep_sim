@@ -291,6 +291,26 @@ def test_lunar_orbit_rotation():
     assert np.isclose(np.linalg.det(R), 1.0)
 
 
+def test_lunar_orbit_rotation_stack_matches_scalar():
+    """LunarOrbit: batched rotations match scalar rot_gal2top calls."""
+    orbit = LunarOrbit(
+        100e3,
+        [0, 0, 1],
+        [0, 0, 1],
+        spin_period=3600.0,
+        t0=Time("2000-01-01"),
+    )
+    times = orbit.t0 + np.array([0.0, 60.0, 120.0]) * u.s
+
+    R_stack = orbit.rot_gal2top_stack(times)
+    R_loop = []
+    for t in times:
+        orbit.set_time(t)
+        R_loop.append(orbit.rot_gal2top())
+
+    np.testing.assert_allclose(R_stack, np.stack(R_loop), atol=1e-7)
+
+
 def test_lunar_orbit_above_horizon_no_occultation():
     """LunarOrbit: far from moon, all sky visible."""
     altitude = 100e3
@@ -302,6 +322,26 @@ def test_lunar_orbit_above_horizon_no_occultation():
 
     # Most sky should be visible
     assert np.sum(mask) > 0.9 * len(mask)
+
+
+def test_lunar_orbit_above_horizon_stack_matches_scalar():
+    """LunarOrbit: batched occultation masks match scalar masks."""
+    orbit = LunarOrbit(
+        100e3,
+        [0, 0, 1],
+        [0, 0, 1],
+        spin_period=3600.0,
+        t0=Time("2000-01-01"),
+    )
+    times = orbit.t0 + np.array([0.0, 60.0, 120.0]) * u.s
+
+    mask_stack = orbit.above_horizon_stack(times, nside=4)
+    mask_loop = []
+    for t in times:
+        orbit.set_time(t)
+        mask_loop.append(orbit.above_horizon(nside=4))
+
+    np.testing.assert_array_equal(mask_stack, np.stack(mask_loop))
 
 
 def test_lunar_orbit_above_horizon_occultation():
