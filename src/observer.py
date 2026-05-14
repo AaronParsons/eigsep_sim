@@ -49,7 +49,7 @@ class Observer:
       - set_time(t)     : stores Time(t) in self.time
     """
 
-    uses_local_horizon = True
+    occludes_sky = False
 
     def __init__(self):
         self.time = None
@@ -332,7 +332,7 @@ class LunarOrbit(Observer):
         phase at this time.  Default: J2000.
     """
 
-    uses_local_horizon = False
+    occludes_sky = True
 
     def __init__(
         self,

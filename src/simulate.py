@@ -11,10 +11,10 @@ Architecture:
 
 Performance notes:
 - precompute_geometry() stores rotation matrices (rots_jax, body_rots_jax) and
-  terrain masks (terrain_masks_jax) as small JAX arrays (~100 KB for 1296 steps).
-  simulate() passes these plus crds_gal_jax to a JIT-compiled scan kernel that
-  performs gal→top and top→body rotations, healjax interpolation, and sky
-  integration entirely inside XLA — fusing all coordinate arithmetic into one pass.
+  terrain masks/emission and rotations as JAX arrays. simulate() passes these
+  plus crds_gal_jax to a JIT-compiled scan kernel that performs gal→top and
+  top→body rotations, healjax interpolation, and sky integration entirely
+  inside XLA — fusing all coordinate arithmetic into one pass.
 """
 
 from __future__ import annotations
@@ -57,7 +57,8 @@ class ForwardModel:
     sky : Sky
         Sky descriptor with basis (no stored coefficients).
     terrain : Terrain, optional
-        Terrain model for horizon/occultation. If None, use observer.above_horizon().
+        Terrain model for explicit sky blocking. If None, no surface horizon
+        is applied; lunar orbit occultation is handled by the observer.
     """
 
     def __init__(self, observer: Observer, beam: Beam, sky: Sky,
@@ -109,7 +110,7 @@ class ForwardModel:
         self._sky_basis_A_jax = None
 
     def build_sky_mask(self, rots=None, times=None):
-        """Return a bool (npix_sky,) mask: True for pixels ever above the horizon.
+        """Return a bool (npix_sky,) mask: True for pixels ever visible.
 
         Pass the result as ``sky_mask`` to ``precompute_geometry`` to exclude
         pixels that never contribute, reducing coordinate arrays and kernel work
@@ -123,25 +124,62 @@ class ForwardModel:
         times : list of Time, optional
             Observation epochs (queries the observer ephemeris).
         """
+        if rots is None and times is None:
+            raise ValueError("Either rots or times must be provided")
+
+        if self.terrain is None and not getattr(self.observer, "occludes_sky", False):
+            return np.ones(self.sky.npix, dtype=bool)
+
         if rots is not None:
             R_arr = np.stack([np.asarray(r, dtype=np.float32) for r in rots])
-            if getattr(self.observer, "uses_local_horizon", True):
-                crds_top_arr = R_arr @ self._crds_gal      # (ntimes, 3, npix_sky)
-                return np.any(crds_top_arr[:, 2, :] > 0, axis=0)
-            return self.observer.above_horizon(self.sky.nside)
+            ntimes = R_arr.shape[0]
+            crds_top_arr = R_arr @ self._crds_gal      # (ntimes, 3, npix_sky)
+            masks = np.ones((ntimes, self.sky.npix), dtype=bool)
+            if getattr(self.observer, "occludes_sky", False):
+                masks &= self.observer.above_horizon(self.sky.nside)[None, :]
+            if self.terrain is not None:
+                masks &= np.stack([
+                    self.terrain.mask(crds_top_arr[i])
+                    for i in range(ntimes)
+                ])
+            return np.any(masks, axis=0)
         elif times is not None:
             from astropy.time import Time
+            times = [Time(t) if not isinstance(t, Time) else t for t in times]
             mask = np.zeros(self.sky.npix, dtype=bool)
-            for t in times:
-                self.observer.set_time(Time(t) if not isinstance(t, Time) else t)
-                if getattr(self.observer, "uses_local_horizon", True):
-                    R = self.observer.rot_gal2top().astype(np.float32)
-                    mask |= (R @ self._crds_gal)[2] > 0
+            if hasattr(self.observer, 'rot_gal2top_stack'):
+                R_all = self.observer.rot_gal2top_stack(times)
+            else:
+                R_all = None
+            if (getattr(self.observer, "occludes_sky", False)
+                    and hasattr(self.observer, "above_horizon_stack")):
+                obs_mask_all = self.observer.above_horizon_stack(
+                    times, self.sky.nside
+                )
+            else:
+                obs_mask_all = None
+            for i, t in enumerate(times):
+                if R_all is None or (
+                    getattr(self.observer, "occludes_sky", False)
+                    and obs_mask_all is None
+                ):
+                    self.observer.set_time(t)
+                if obs_mask_all is not None:
+                    step_mask = obs_mask_all[i].copy()
+                elif getattr(self.observer, "occludes_sky", False):
+                    step_mask = self.observer.above_horizon(self.sky.nside)
                 else:
-                    mask |= self.observer.above_horizon(self.sky.nside)
+                    step_mask = np.ones(self.sky.npix, dtype=bool)
+                if self.terrain is not None:
+                    R = (
+                        R_all[i]
+                        if R_all is not None
+                        else self.observer.rot_gal2top().astype(np.float32)
+                    )
+                    step_mask &= self.terrain.mask(R @ self._crds_gal)
+                mask |= step_mask
+            self.observer.set_time(times[-1])
             return mask
-        else:
-            raise ValueError("Either rots or times must be provided")
 
     def _ensure_jax_arrays(self):
         """Convert and cache basis matrices as JAX arrays; build JIT-compiled sim kernel."""
@@ -155,8 +193,10 @@ class ForwardModel:
     def _build_sim_fn(self):
         """Build and JIT-compile the inner simulation kernel.
 
-        Returns a function ``sim(sky_coeffs, beam_coeffs, terrain_masks, rots,
-        body_rots, T_gnd, tx_crds_all, crds_gal)`` that is fully JAX-traceable.
+        Returns a function ``sim(sky_coeffs, beam_coeffs, terrain_masks,
+        terrain_emissions, default_emission_masks, unresolved_emission,
+        unresolved_default_emission, rots, body_rots, T_gnd, tx_crds_all,
+        crds_gal)`` that is fully JAX-traceable.
         Rotation matmuls (gal→top, top→body) and healjax interpolation run inside
         jax.lax.scan so that coordinate arithmetic, beam gather, and sky integration
         are fused by XLA.
@@ -174,12 +214,18 @@ class ForwardModel:
         tx_T_jax = jnp.asarray(self._tx_T_internal, dtype=DTYPE_R_JAX)  # (n_src, nfreq)
 
         @jax.jit
-        def _sim(sky_coeffs, beam_coeffs, terrain_masks, rots, body_rots,
-                 T_gnd, tx_crds_all, crds_gal):
+        def _sim(sky_coeffs, beam_coeffs, terrain_masks, terrain_emissions,
+                 default_emission_masks, unresolved_emission,
+                 unresolved_default_emission, rots, body_rots, T_gnd,
+                 tx_crds_all, crds_gal):
             """
             sky_coeffs    : (npix_vis, nmodes_sky)
             beam_coeffs   : (n_dipoles, npix_beam, nmodes_beam)
             terrain_masks : (ntimes, npix_vis)        float32  visibility factor (1=sky)
+            terrain_emissions : (ntimes, npix_vis, nfreq) float32  blocked brightness [K]
+            default_emission_masks : (ntimes, npix_vis) float32  T_gnd fallback factor
+            unresolved_emission : (nfreq,) float32  omitted-pixel brightness
+            unresolved_default_emission : (nfreq,) float32  omitted-pixel T_gnd factor
             rots          : (ntimes, 3, 3)            float32  gal→top rotation matrices
             body_rots     : (ntimes, 3, 3)            float32  top→body rotation matrices
             T_gnd         : scalar [K]
@@ -192,7 +238,7 @@ class ForwardModel:
             den_all = jnp.sum(beam_recon_all, axis=1) * scale  # (n_dipoles, nfreq)
 
             def one_time(_, args):
-                terrain_mask, R, br, tx_c = args
+                terrain_mask, terrain_emit, default_emit_mask, R, br, tx_c = args
                 # R: (3,3)  br: (3,3)  terrain_mask: (npix_vis,)  tx_c: (n_sources,3)
                 crds_top = R @ crds_gal                              # (3, npix_vis)
                 mask = terrain_mask                                # (npix_vis,)
@@ -202,6 +248,13 @@ class ForwardModel:
                 px, wgts = healjax.get_interp_weights(th, ph, nside_beam)
                 # px: (4, npix_vis)   wgts: (4, npix_vis)
 
+                # TX interpolation locations are independent of dipole.
+                th_tx, ph_tx = healjax.vec2ang(tx_c[:, 0], tx_c[:, 1], tx_c[:, 2])
+                tx_px, tx_wgts = healjax.get_interp_weights(
+                    th_tx, ph_tx, nside_beam
+                )
+                # tx_px: (4, n_sources)   tx_wgts: (4, n_sources)
+
                 def one_dipole(beam_recon_d, den_d):  # (npix_beam, nfreq), (nfreq,)
                     # Accumulate 4 bilinear neighbors without materialising (4,npix,nfreq)
                     beam_at_sky = jax.lax.fori_loop(
@@ -209,20 +262,29 @@ class ForwardModel:
                         lambda k, acc: acc + beam_recon_d[px[k]] * wgts[k, :, None],
                         jnp.zeros_like(sky_recon),
                     )                                  # (npix_vis, nfreq)
-                    sky_weight = jnp.sum(beam_at_sky * mask[:, None], axis=0)
                     sky_num = jnp.sum(
                         beam_at_sky * sky_recon * mask[:, None], axis=0
                     )
-                    # Treat every non-visible direction as uniform ground.
-                    # This also accounts for pixels omitted by sky_mask.
-                    num = sky_num + T_gnd * (den_d - sky_weight)
+                    terrain_num = jnp.sum(beam_at_sky * terrain_emit, axis=0)
+                    sampled_weight = jnp.sum(beam_at_sky, axis=0)
+                    default_weight = jnp.sum(
+                        beam_at_sky * default_emit_mask[:, None], axis=0
+                    )
+                    # Pixels omitted by sky_mask use the terrain-provided
+                    # unresolved spectrum. Sampled observer-only occultation
+                    # still uses the scalar T_gnd fallback.
+                    unresolved_weight = den_d - sampled_weight
+                    num = (
+                        sky_num
+                        + terrain_num
+                        + T_gnd * default_weight
+                        + unresolved_weight * (
+                            unresolved_emission
+                            + T_gnd * unresolved_default_emission
+                        )
+                    )
 
                     # TX: interpolate beam at each source direction
-                    th_tx, ph_tx = healjax.vec2ang(tx_c[:, 0], tx_c[:, 1], tx_c[:, 2])
-                    tx_px, tx_wgts = healjax.get_interp_weights(
-                        th_tx, ph_tx, nside_beam
-                    )
-                    # tx_px: (4, n_sources)   tx_wgts: (4, n_sources)
                     beam_at_tx = jax.lax.fori_loop(
                         0, 4,
                         lambda k, acc: acc + beam_recon_d[tx_px[k]] * tx_wgts[k, :, None],
@@ -234,7 +296,15 @@ class ForwardModel:
                 return None, jax.vmap(one_dipole)(beam_recon_all, den_all)
 
             _, antenna_temp = jax.lax.scan(
-                one_time, None, (terrain_masks, rots, body_rots, tx_crds_all)
+                one_time, None,
+                (
+                    terrain_masks,
+                    terrain_emissions,
+                    default_emission_masks,
+                    rots,
+                    body_rots,
+                    tx_crds_all,
+                ),
             )
             return antenna_temp  # (ntimes, n_dipoles, nfreq)
 
@@ -272,8 +342,12 @@ class ForwardModel:
         geom : dict
             Cached geometry (JAX arrays ready for the kernel):
             - 'rots_jax': (ntimes, 3, 3) float32 — gal→top rotation matrices
-            - 'body_rots_jax': (ntimes, 3, 3) float32 — top→body rotations (identity if body_rots=None)
+            - 'body_rots_jax': (ntimes, 3, 3) float32 — top→body rotations
             - 'terrain_masks_jax': (ntimes, npix_vis) float32 — visibility factor (1=sky)
+            - 'terrain_emissions_jax': (ntimes, npix_vis, nfreq) float32 — blocked brightness
+            - 'default_emission_masks_jax': (ntimes, npix_vis) float32 — T_gnd fallback factor
+            - 'unresolved_emission_jax': (nfreq,) float32 — omitted-pixel brightness
+            - 'unresolved_default_emission_jax': (nfreq,) float32 — omitted-pixel T_gnd factor
             - 'crds_gal_jax': (3, npix_vis) float32 — galactic unit vectors (filtered by sky_mask)
             - 'tx_crds_jax': (ntimes, n_sources, 3) float32 — TX body-frame directions
             - 'sky_indices_jax': (npix_vis,) int32 — only present when sky_mask given
@@ -291,6 +365,32 @@ class ForwardModel:
             crds_gal = self._crds_gal                  # (3, npix_sky)
 
         npix_vis = crds_gal.shape[1]
+        if self.terrain is not None:
+            unresolved_emission = self.terrain.unresolved_emission(
+                self.beam.freqs_hz
+            )
+            unresolved_default_emission = np.zeros(
+                len(self.beam.freqs_hz), dtype=np.float32
+            )
+            if unresolved_emission is None:
+                if sky_mask is not None and npix_vis != self.sky.npix:
+                    raise ValueError(
+                        "sky_mask with terrain requires terrain.unresolved_emission() "
+                        "or full geometry for exact omitted-pixel emission"
+                    )
+                unresolved_emission = np.zeros(
+                    len(self.beam.freqs_hz), dtype=np.float32
+                )
+            else:
+                unresolved_emission = np.asarray(
+                    unresolved_emission, dtype=np.float32
+                )
+        else:
+            unresolved_emission = np.zeros(len(self.beam.freqs_hz), dtype=np.float32)
+            unresolved_default_emission = np.ones(
+                len(self.beam.freqs_hz), dtype=np.float32
+            )
+
         geom = {}
 
         if rots is not None:
@@ -301,9 +401,7 @@ class ForwardModel:
             geom['rot_gal2top'] = R_arr
 
             crds_top_arr = R_arr @ crds_gal      # (ntimes, 3, npix_vis)
-            if getattr(self.observer, "uses_local_horizon", True):
-                obs_masks = (crds_top_arr[:, 2, :] > 0).astype(np.float32)
-            else:
+            if getattr(self.observer, "occludes_sky", False):
                 obs_mask_full = self.observer.above_horizon(
                     self.sky.nside
                 ).astype(np.float32)
@@ -314,21 +412,38 @@ class ForwardModel:
                 obs_masks = np.broadcast_to(
                     obs_mask, (ntimes, npix_vis)
                 ).astype(np.float32)
+            else:
+                obs_masks = np.ones((ntimes, npix_vis), dtype=np.float32)
 
             if self.terrain is not None:
-                terrain_masks = np.stack([
-                    (obs_masks[i] * self.terrain.mask(crds_top_arr[i])).astype(
-                        np.float32
+                terrain_masks_list = []
+                terrain_emissions_list = []
+                default_emission_masks_list = []
+                for i in range(ntimes):
+                    t_mask = self.terrain.mask(crds_top_arr[i]).astype(np.float32)
+                    terrain_masks_list.append(
+                        (obs_masks[i] * t_mask).astype(np.float32)
                     )
-                    for i in range(ntimes)
-                ])                                   # (ntimes, npix_vis)
+                    t_emit = self.terrain.emission(
+                        crds_top_arr[i], self.beam.freqs_hz
+                    ).astype(np.float32)
+                    terrain_emissions_list.append(t_emit)
+                    default_emission_masks_list.append(1.0 - obs_masks[i])
+                terrain_masks = np.stack(terrain_masks_list)
+                terrain_emissions = np.stack(terrain_emissions_list)
+                default_emission_masks = np.stack(default_emission_masks_list)
             else:
                 terrain_masks = obs_masks
+                terrain_emissions = np.zeros(
+                    (ntimes, npix_vis, len(self.beam.freqs_hz)), dtype=np.float32
+                )
+                default_emission_masks = 1.0 - obs_masks
 
         elif times is not None:
             times = [Time(t) if not isinstance(t, Time) else t for t in times]
             ntimes = len(times)
-            rot_list, crds_list, masks_list = [], [], []
+            rot_list, crds_list = [], []
+            masks_list, emissions_list, default_emission_masks_list = [], [], []
 
             # Batch-compute rotation matrices when the observer supports it.
             # EarthSurface uses a vectorised astropy call (61× faster than looping).
@@ -337,7 +452,7 @@ class ForwardModel:
             else:
                 R_all = None
 
-            if (not getattr(self.observer, "uses_local_horizon", True)
+            if (getattr(self.observer, "occludes_sky", False)
                     and hasattr(self.observer, "above_horizon_stack")):
                 obs_mask_all = self.observer.above_horizon_stack(
                     times, self.sky.nside
@@ -348,7 +463,7 @@ class ForwardModel:
                 obs_mask_all = None
 
             needs_step_time = R_all is None or (
-                not getattr(self.observer, "uses_local_horizon", True)
+                getattr(self.observer, "occludes_sky", False)
                 and obs_mask_all is None
             )
 
@@ -364,11 +479,9 @@ class ForwardModel:
                 crds_top = R @ crds_gal              # (3, npix_vis)
                 crds_list.append(crds_top)
 
-                if getattr(self.observer, "uses_local_horizon", True):
-                    obs_mask = (crds_top[2] > 0).astype(np.float32)
-                elif obs_mask_all is not None:
+                if obs_mask_all is not None:
                     obs_mask = obs_mask_all[i]
-                else:
+                elif getattr(self.observer, "occludes_sky", False):
                     obs_mask_full = self.observer.above_horizon(
                         self.sky.nside
                     ).astype(np.float32)
@@ -376,11 +489,24 @@ class ForwardModel:
                         obs_mask = obs_mask_full[sky_indices]
                     else:
                         obs_mask = obs_mask_full
+                else:
+                    obs_mask = np.ones(npix_vis, dtype=np.float32)
                 if self.terrain is not None:
                     t_mask = self.terrain.mask(crds_top).astype(np.float32)
                     masks_list.append(obs_mask * t_mask)
+                    t_emit = self.terrain.emission(
+                        crds_top, self.beam.freqs_hz
+                    ).astype(np.float32)
+                    emissions_list.append(t_emit)
+                    default_emission_masks_list.append(1.0 - obs_mask)
                 else:
                     masks_list.append(obs_mask)
+                    emissions_list.append(
+                        np.zeros(
+                            (npix_vis, len(self.beam.freqs_hz)), dtype=np.float32
+                        )
+                    )
+                    default_emission_masks_list.append(1.0 - obs_mask)
 
             R_arr = np.stack(rot_list)
             geom.update({
@@ -389,6 +515,10 @@ class ForwardModel:
                 'masks':       np.stack(masks_list).astype(np.float32),
             })
             terrain_masks = np.stack(masks_list).astype(np.float32)
+            terrain_emissions = np.stack(emissions_list).astype(np.float32)
+            default_emission_masks = np.stack(
+                default_emission_masks_list
+            ).astype(np.float32)
             self.observer.set_time(times[-1])
         else:
             raise ValueError("Either times or rots must be provided")
@@ -410,11 +540,25 @@ class ForwardModel:
         else:
             tx_body = np.zeros((ntimes, 0, 3), dtype=np.float32)
 
-        geom['rots_jax']          = jnp.asarray(R_arr,         dtype=DTYPE_R_JAX)  # (ntimes, 3, 3)
-        geom['body_rots_jax']     = jnp.asarray(body_rots_arr, dtype=DTYPE_R_JAX)  # (ntimes, 3, 3)
-        geom['terrain_masks_jax'] = jnp.asarray(terrain_masks, dtype=DTYPE_R_JAX)  # (ntimes, npix_vis)
-        geom['crds_gal_jax']      = jnp.asarray(crds_gal,      dtype=DTYPE_R_JAX)  # (3, npix_vis)
-        geom['tx_crds_jax']       = jnp.asarray(tx_body,       dtype=DTYPE_R_JAX)  # (ntimes, n_src, 3)
+        geom['rots_jax'] = jnp.asarray(R_arr, dtype=DTYPE_R_JAX)
+        geom['body_rots_jax'] = jnp.asarray(body_rots_arr, dtype=DTYPE_R_JAX)
+        geom['terrain_masks_jax'] = jnp.asarray(
+            terrain_masks, dtype=DTYPE_R_JAX
+        )
+        geom['terrain_emissions_jax'] = jnp.asarray(
+            terrain_emissions, dtype=DTYPE_R_JAX
+        )
+        geom['default_emission_masks_jax'] = jnp.asarray(
+            default_emission_masks, dtype=DTYPE_R_JAX
+        )
+        geom['unresolved_emission_jax'] = jnp.asarray(
+            unresolved_emission, dtype=DTYPE_R_JAX
+        )
+        geom['unresolved_default_emission_jax'] = jnp.asarray(
+            unresolved_default_emission, dtype=DTYPE_R_JAX
+        )
+        geom['crds_gal_jax'] = jnp.asarray(crds_gal, dtype=DTYPE_R_JAX)
+        geom['tx_crds_jax'] = jnp.asarray(tx_body, dtype=DTYPE_R_JAX)
         if sky_indices is not None:
             geom['sky_indices_jax'] = jnp.asarray(sky_indices, dtype=jnp.int32)
         return geom
@@ -431,12 +575,15 @@ class ForwardModel:
         -------
         mask : ndarray, shape (npix_sky,), float32
         """
-        geo_mask = self.observer.above_horizon(self.sky.nside).astype(np.float32)
+        if getattr(self.observer, "occludes_sky", False):
+            obs_mask = self.observer.above_horizon(self.sky.nside).astype(np.float32)
+        else:
+            obs_mask = np.ones(self.sky.npix, dtype=np.float32)
 
         if self.terrain is not None:
             terrain_mask = self.terrain.mask(crds_top).astype(np.float32)
-            return geo_mask * terrain_mask
-        return geo_mask
+            return obs_mask * terrain_mask
+        return obs_mask
 
     def simulate(self, sky_coeffs, beam_coeffs, times=None, geom=None,
                  T_gnd=300.0):
@@ -478,6 +625,10 @@ class ForwardModel:
             sky_coeffs_jax,
             beam_coeffs_jax,
             geom['terrain_masks_jax'],
+            geom['terrain_emissions_jax'],
+            geom['default_emission_masks_jax'],
+            geom['unresolved_emission_jax'],
+            geom['unresolved_default_emission_jax'],
             geom['rots_jax'],
             geom['body_rots_jax'],
             jnp.asarray(T_gnd, dtype=DTYPE_R_JAX),

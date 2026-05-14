@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 from astropy.time import Time
 import healpy
 
-from eigsep_sim import Sky, Beam, ForwardModel
+from eigsep_sim import Sky, Beam, ForwardModel, HorizonTerrain
 from eigsep_sim.observer import EarthSurface
 from eigsep_sim.beam import BEAM_NPZ
 from eigsep_sim.basis import BeamBasis
@@ -81,6 +81,9 @@ print("Building observer …")
 observer = EarthSurface(lat=LAT, lon=LON, height=HEIGHT_M)
 observer.set_time(OBS_TIME)
 
+print("Loading packaged Marjum horizon terrain …")
+terrain = HorizonTerrain.from_packaged_model(height=100.0, T_terrain=T_GND)
+
 # ── Build beam from measured bowtie pattern ────────────────────────────────────
 # Load the eigsep_bowtie_v000.npz beam and compress it into K spectral modes.
 # The NPZ stores bm as (nfreq_file, npix); load_beam_file interpolates to freqs_hz.
@@ -99,7 +102,7 @@ print("Building GSM sky …")
 sky        = Sky.from_gsm(NSIDE_SKY, freqs_hz, n_modes=N_SKY_MODES)
 sky_coeffs = sky.init_coeffs()
 
-fwd = ForwardModel(observer, beam, sky,
+fwd = ForwardModel(observer, beam, sky, terrain=terrain,
                    transmitters=[(TX_DIR_TOP, TX_FREQS, TX_POW)])
 
 # ── Compute geometry for the az/alt scan ──────────────────────────────────────

@@ -4,7 +4,14 @@ __version__ = "0.0.1"
 from .const import DTYPE_R_NPY, DTYPE_R_JAX
 from .basis import BeamBasis, SkyBasis
 from .beam import Beam
-from .terrain import Terrain, NullTerrain, HorizonTerrain, LunarDisk, DEMTerrain
+from .terrain import (
+    HORIZON_MODELS_NPZ,
+    Terrain,
+    NullTerrain,
+    HorizonTerrain,
+    LunarDisk,
+    DEMTerrain,
+)
 from .observer import Observer, EarthSurface, LunarSurface, LunarOrbit
 from .sky import Sky
 from .simulate import ForwardModel
@@ -16,6 +23,7 @@ __all__ = [
     "BeamBasis",
     "SkyBasis",
     "Beam",
+    "HORIZON_MODELS_NPZ",
     "Terrain",
     "NullTerrain",
     "HorizonTerrain",

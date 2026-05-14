@@ -351,6 +351,10 @@ def test_precompute_geometry_rots_shape(simple_fwd):
     assert geom['rots_jax'].shape          == (ntimes, 3, 3)
     assert geom['body_rots_jax'].shape     == (ntimes, 3, 3)
     assert geom['terrain_masks_jax'].shape == (ntimes, npix_sky)
+    assert geom['terrain_emissions_jax'].shape == (
+        ntimes, npix_sky, len(fwd.beam.freqs_hz)
+    )
+    assert geom['default_emission_masks_jax'].shape == (ntimes, npix_sky)
     assert geom['crds_gal_jax'].shape      == (3, npix_sky)
     assert geom['tx_crds_jax'].shape       == (ntimes, 0, 3)
 
@@ -537,8 +541,7 @@ def test_transmitter_body_rots_coupling(simple_fwd):
 
     # No body rotation: tx is at body [0,0,1]
     geom_no_rot = fwd_tx.precompute_geometry(rots=[R], body_rots=None)
-    # Use T_gnd=0 to isolate the TX contribution; the ground term changes under
-    # body rotation because the two dipoles sweep different horizon edges.
+    # Use T_gnd=0 to isolate the TX contribution from sky coupling changes.
     T_no_rot = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_no_rot, T_gnd=0.0))
 
     # 90-degree body rotation around z: topocentric [0,0,1] maps to body [0,0,1]
@@ -584,8 +587,8 @@ def test_build_sky_mask_rots(simple_fwd):
     mask = fwd.build_sky_mask(rots=[R])
     assert mask.shape == (fwd.sky.npix,)
     assert mask.dtype == bool
-    # At least some pixels visible, at least some blocked
-    assert mask.any() and not mask.all()
+    # Surface observers no longer impose an implicit z > 0 horizon.
+    assert mask.all()
 
 
 def test_sky_mask_reduces_crds_shape(simple_fwd):
@@ -602,6 +605,14 @@ def test_sky_mask_reduces_crds_shape(simple_fwd):
 
     assert geom_mask['crds_gal_jax'].shape      == (3, npix_vis)
     assert geom_mask['terrain_masks_jax'].shape == (ntimes, npix_vis)
+    assert geom_mask['terrain_emissions_jax'].shape == (
+        ntimes, npix_vis, len(fwd.beam.freqs_hz)
+    )
+    assert geom_mask['default_emission_masks_jax'].shape == (ntimes, npix_vis)
+    assert geom_mask['unresolved_emission_jax'].shape == (len(fwd.beam.freqs_hz),)
+    assert geom_mask['unresolved_default_emission_jax'].shape == (
+        len(fwd.beam.freqs_hz),
+    )
     assert 'sky_indices_jax' in geom_mask
     assert geom_mask['sky_indices_jax'].shape == (npix_vis,)
 
@@ -613,8 +624,8 @@ def test_sky_mask_reduces_crds_shape(simple_fwd):
 def test_sky_mask_same_result_at_zero_T_gnd(simple_fwd):
     """With T_gnd=0, sky_mask gives identical Tant to full-sky simulation.
 
-    At T_gnd=0 the excluded always-below-horizon pixels contribute 0 in both
-    paths, so the results must be numerically identical.
+    With an explicit sky_mask, omitted pixels contribute 0 in both paths when
+    T_gnd=0, so the results must be numerically identical.
     """
     fwd = simple_fwd
     R = fwd.observer.rot_gal2top().astype(np.float32)
@@ -649,6 +660,189 @@ def test_sky_mask_same_result_with_ground(simple_fwd):
     T_mask = np.array(fwd.simulate(sky_c, beam_c, geom=geom_mask, T_gnd=300.0))
 
     np.testing.assert_allclose(T_full, T_mask, rtol=1e-5, atol=1e-5)
+
+
+def test_surface_observer_without_terrain_has_no_ground_cut():
+    """EarthSurface without terrain sees the full sphere, even with T_gnd set."""
+    from eigsep_sim.basis import BeamBasis, SkyBasis
+
+    freqs_hz = np.array([50e6, 100e6], dtype=np.float64)
+    nside = 4
+    npix = healpy.nside2npix(nside)
+
+    beam = Beam(
+        nside,
+        freqs_hz,
+        BeamBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+        np.ones((1, npix, 1), dtype=np.float32),
+    )
+    sky = Sky(
+        nside,
+        freqs_hz,
+        SkyBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+    )
+    observer = EarthSurface(lat=45.0, lon=0.0)
+    observer.set_time("2000-01-01")
+    fwd = ForwardModel(observer, beam, sky)
+
+    sky_c = np.zeros((npix, 1), dtype=np.float32)
+    beam_c = beam.coeffs
+    R = observer.rot_gal2top().astype(np.float32)
+    geom = fwd.precompute_geometry(rots=[R])
+    assert np.all(np.array(geom["terrain_masks_jax"]) == 1.0)
+
+    T = np.array(fwd.simulate(sky_c, beam_c, geom=geom, T_gnd=300.0))
+    np.testing.assert_allclose(T, 0.0, atol=1e-5)
+
+
+def test_surface_terrain_controls_ground_cut():
+    """Terrain, not observer z, controls blocked surface-observer pixels."""
+    from eigsep_sim.basis import BeamBasis, SkyBasis
+    from eigsep_sim.terrain import Terrain
+
+    class AllBlockedTerrain(Terrain):
+        def mask(self, crds_top):
+            return np.zeros(crds_top.shape[-1], dtype=bool)
+
+        def emission(self, crds_top, freqs_hz):
+            return np.full(
+                (crds_top.shape[-1], len(freqs_hz)), 275.0, dtype=np.float32
+            )
+
+    freqs_hz = np.array([50e6, 100e6], dtype=np.float64)
+    nside = 4
+    npix = healpy.nside2npix(nside)
+
+    beam = Beam(
+        nside,
+        freqs_hz,
+        BeamBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+        np.ones((1, npix, 1), dtype=np.float32),
+    )
+    sky = Sky(
+        nside,
+        freqs_hz,
+        SkyBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+    )
+    observer = EarthSurface(lat=45.0, lon=0.0)
+    observer.set_time("2000-01-01")
+    fwd = ForwardModel(observer, beam, sky, terrain=AllBlockedTerrain())
+
+    sky_c = np.zeros((npix, 1), dtype=np.float32)
+    beam_c = beam.coeffs
+    R = observer.rot_gal2top().astype(np.float32)
+    geom = fwd.precompute_geometry(rots=[R])
+    assert np.all(np.array(geom["terrain_masks_jax"]) == 0.0)
+
+    T = np.array(fwd.simulate(sky_c, beam_c, geom=geom, T_gnd=300.0))
+    np.testing.assert_allclose(T, 275.0, atol=1e-5)
+
+
+def test_sky_mask_preserves_uniform_terrain_emission():
+    """sky_mask accounts for omitted blocked pixels using terrain spectrum."""
+    from eigsep_sim.basis import BeamBasis, SkyBasis
+    from eigsep_sim.terrain import HorizonTerrain
+
+    freqs_hz = np.array([50e6, 100e6], dtype=np.float64)
+    nside = 4
+    npix = healpy.nside2npix(nside)
+    horizon_map = np.full(npix, 1.0, dtype=np.float32)
+
+    beam = Beam(
+        nside,
+        freqs_hz,
+        BeamBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+        np.ones((1, npix, 1), dtype=np.float32),
+    )
+    sky = Sky(
+        nside,
+        freqs_hz,
+        SkyBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+    )
+    observer = EarthSurface(lat=45.0, lon=0.0)
+    observer.set_time("2000-01-01")
+    terrain = HorizonTerrain(nside, horizon_map, T_terrain=250.0)
+    fwd = ForwardModel(observer, beam, sky, terrain=terrain)
+
+    sky_c = np.zeros((npix, 1), dtype=np.float32)
+    beam_c = beam.coeffs
+    R = observer.rot_gal2top().astype(np.float32)
+    sky_mask = fwd.build_sky_mask(rots=[R])
+    assert not sky_mask.any()
+
+    geom_full = fwd.precompute_geometry(rots=[R])
+    geom_mask = fwd.precompute_geometry(rots=[R], sky_mask=sky_mask)
+
+    T_full = np.array(fwd.simulate(sky_c, beam_c, geom=geom_full, T_gnd=300.0))
+    T_mask = np.array(fwd.simulate(sky_c, beam_c, geom=geom_mask, T_gnd=300.0))
+
+    np.testing.assert_allclose(T_full, 250.0, atol=1e-5)
+    np.testing.assert_allclose(T_mask, T_full, atol=1e-5)
+
+
+def test_sky_mask_rejects_unresolved_nonuniform_terrain_emission():
+    """Nonuniform omitted terrain emission requires full geometry."""
+    from eigsep_sim.basis import BeamBasis, SkyBasis
+    from eigsep_sim.terrain import Terrain
+
+    class NonUniformBlockedTerrain(Terrain):
+        def mask(self, crds_top):
+            return np.zeros(crds_top.shape[-1], dtype=bool)
+
+        def emission(self, crds_top, freqs_hz):
+            npix = crds_top.shape[-1]
+            vals = np.arange(npix, dtype=np.float32)[:, None]
+            return np.repeat(vals, len(freqs_hz), axis=1)
+
+    freqs_hz = np.array([50e6, 100e6], dtype=np.float64)
+    nside = 4
+    npix = healpy.nside2npix(nside)
+
+    beam = Beam(
+        nside,
+        freqs_hz,
+        BeamBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+        np.ones((1, npix, 1), dtype=np.float32),
+    )
+    sky = Sky(
+        nside,
+        freqs_hz,
+        SkyBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+    )
+    observer = EarthSurface(lat=45.0, lon=0.0)
+    observer.set_time("2000-01-01")
+    fwd = ForwardModel(observer, beam, sky, terrain=NonUniformBlockedTerrain())
+
+    R = observer.rot_gal2top().astype(np.float32)
+    sky_mask = fwd.build_sky_mask(rots=[R])
+    assert not sky_mask.any()
+
+    with pytest.raises(ValueError, match="unresolved_emission"):
+        fwd.precompute_geometry(rots=[R], sky_mask=sky_mask)
 
 
 def test_lunar_orbit_uses_occultation_not_body_horizon():
@@ -690,6 +884,51 @@ def test_lunar_orbit_uses_occultation_not_body_horizon():
 
     T = np.array(fwd.simulate(sky_c, beam_c, geom=geom, T_gnd=300.0))
     np.testing.assert_allclose(T, 0.0, atol=1e-5)
+
+
+def test_lunar_sky_mask_preserves_occultation_emission():
+    """sky_mask preserves lunar occultation fallback emission."""
+    from eigsep_sim.basis import BeamBasis, SkyBasis
+
+    freqs_hz = np.array([50e6, 100e6], dtype=np.float64)
+    nside = 4
+    npix = healpy.nside2npix(nside)
+
+    beam = Beam(
+        nside,
+        freqs_hz,
+        BeamBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+        np.ones((1, npix, 1), dtype=np.float32),
+    )
+    sky = Sky(
+        nside,
+        freqs_hz,
+        SkyBasis(
+            np.ones((len(freqs_hz), 1), dtype=np.float32),
+            freqs_hz=freqs_hz,
+        ),
+    )
+    observer = LunarOrbit(
+        altitude=100e3,
+        rot_orbit_vec=[0, 0, 1],
+        rot_spin_vec=[0, 0, 1],
+    )
+    fwd = ForwardModel(observer, beam, sky)
+
+    sky_c = np.zeros((npix, 1), dtype=np.float32)
+    beam_c = beam.coeffs
+    sky_mask = fwd.build_sky_mask(times=[observer.t0])
+    assert sky_mask.any() and not sky_mask.all()
+
+    geom_full = fwd.precompute_geometry(times=[observer.t0])
+    geom_mask = fwd.precompute_geometry(times=[observer.t0], sky_mask=sky_mask)
+
+    T_full = np.array(fwd.simulate(sky_c, beam_c, geom=geom_full, T_gnd=300.0))
+    T_mask = np.array(fwd.simulate(sky_c, beam_c, geom=geom_mask, T_gnd=300.0))
+    np.testing.assert_allclose(T_mask, T_full, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

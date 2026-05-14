@@ -12,7 +12,12 @@ import numpy as np
 import pytest
 import healpy
 
-from eigsep_sim.terrain import NullTerrain, HorizonTerrain, LunarDisk
+from eigsep_sim.terrain import (
+    HORIZON_MODELS_NPZ,
+    NullTerrain,
+    HorizonTerrain,
+    LunarDisk,
+)
 from eigsep_sim.const import R_MOON, GM_MOON
 
 
@@ -178,6 +183,35 @@ def test_horizon_terrain_invalid_shape():
 
     with pytest.raises(ValueError, match="inconsistent with nside"):
         HorizonTerrain(nside, horizon_map)
+
+
+def test_horizon_terrain_from_packaged_model():
+    """HorizonTerrain: load packaged Marjum horizon model by index."""
+    terrain = HorizonTerrain.from_packaged_model(index=0)
+
+    assert terrain.nside == 64
+    assert terrain.horizon_map.shape == (healpy.nside2npix(64),)
+    assert terrain.height == 1.0
+    assert terrain.center.shape == (3,)
+    assert terrain.metadata["index"] == 0
+    assert terrain.metadata["path"] == HORIZON_MODELS_NPZ
+    assert np.isfinite(terrain.horizon_map).any()
+    assert np.isnan(terrain.horizon_map).any()
+
+
+def test_horizon_terrain_from_packaged_model_nearest_height():
+    """HorizonTerrain: select nearest packaged Marjum height slice."""
+    terrain = HorizonTerrain.from_packaged_model(height=64.0, T_terrain=275.0)
+
+    assert np.isclose(terrain.height, 63.77777777777778)
+    assert terrain.T_terrain == 275.0
+    assert terrain.metadata["index"] == 5
+
+
+def test_horizon_terrain_from_file_rejects_ambiguous_selection():
+    """HorizonTerrain: reject index and height together."""
+    with pytest.raises(ValueError, match="either index or height"):
+        HorizonTerrain.from_file(HORIZON_MODELS_NPZ, index=0, height=1.0)
 
 
 def test_lunar_disk_no_position():

@@ -176,6 +176,10 @@ geom_keys = [
     'rots_jax',
     'body_rots_jax',
     'terrain_masks_jax',
+    'terrain_emissions_jax',
+    'default_emission_masks_jax',
+    'unresolved_emission_jax',
+    'unresolved_default_emission_jax',
     'crds_gal_jax',
     'tx_crds_jax',
 ]
