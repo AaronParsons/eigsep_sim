@@ -104,7 +104,7 @@ def test_horizon_terrain_mask_mixed():
                           dtype=np.float32)
 
     terrain = HorizonTerrain(nside, horizon_map)
-    crds_top = np.random.randn(3, npix)
+    crds_top = np.array(healpy.pix2vec(nside, np.arange(npix)))
     mask = terrain.mask(crds_top)
 
     assert np.sum(mask) == npix // 2  # Half visible
@@ -145,7 +145,7 @@ def test_horizon_terrain_emission():
 
     terrain = HorizonTerrain(nside, horizon_map, T_terrain=T_terrain)
     freqs_hz = np.array([50e6, 100e6, 150e6])
-    crds_top = np.random.randn(3, npix)
+    crds_top = np.array(healpy.pix2vec(nside, np.arange(npix)))
 
     emission = terrain.emission(crds_top, freqs_hz)
 
@@ -154,6 +154,24 @@ def test_horizon_terrain_emission():
     assert np.allclose(emission[:npix//2], 0.0)
     # Blocked pixels should have T_terrain
     assert np.allclose(emission[npix//2:], T_terrain)
+
+
+def test_horizon_terrain_mask_uses_coordinates_same_nside():
+    """HorizonTerrain: same-nside rotated coordinates are not direct indexed."""
+    nside = 4
+    npix = healpy.nside2npix(nside)
+    horizon_map = np.full(npix, np.nan, dtype=np.float32)
+    horizon_map[0] = 1e6
+    terrain = HorizonTerrain(nside, horizon_map)
+
+    native_crds = np.array(healpy.pix2vec(nside, np.arange(npix)))
+    mask_native = terrain.mask(native_crds)
+    assert not mask_native[0]
+    assert np.all(mask_native[1:])
+
+    repeated_blocked_crds = np.repeat(native_crds[:, :1], npix, axis=1)
+    mask_repeated = terrain.mask(repeated_blocked_crds)
+    assert not np.any(mask_repeated)
 
 
 def test_horizon_terrain_set_temperature():

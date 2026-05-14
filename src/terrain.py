@@ -226,16 +226,15 @@ class HorizonTerrain(Terrain):
             npix_sky = crds_top.shape[0]
             crds_top = crds_top.T  # (3, npix)
 
-        # If sky resolution differs from terrain, interpolate
-        if npix_sky == self.npix:
-            # Same resolution: direct lookup
-            mask = np.isnan(self.horizon_map)
-        else:
-            # Different resolution: interpolate horizon map to sky pixels
-            theta, phi = healpy.vec2ang(crds_top, lonlat=False)
-            horizon_interp = healpy.get_interp_val(self.horizon_map, theta, phi,
-                                                   lonlat=False)
-            mask = np.isnan(horizon_interp)
+        # Always use the supplied coordinates. Direct array lookup is only valid
+        # for unrotated native HEALPix pixel centers; using it for rotated sky
+        # directions scrambles otherwise contiguous terrain regions. Treat the
+        # horizon map as a categorical visibility mask and use nearest-neighbor
+        # lookup instead of interpolating NaNs.
+        pix = healpy.vec2pix(
+            self.nside, crds_top[0], crds_top[1], crds_top[2]
+        )
+        mask = np.isnan(self.horizon_map[pix])
 
         return mask.astype(bool)
 
