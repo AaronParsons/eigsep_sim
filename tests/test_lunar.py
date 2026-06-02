@@ -14,6 +14,7 @@ import astropy.units as u
 from eigsep_sim import Beam, ForwardModel, LunarOrbit, Sky
 from eigsep_sim.lunar import (
     LunarCampaign,
+    angular_momentum_for_spin_period,
     crossed_rod_inertia,
     integrate_torque_free,
     make_ecliptic_orbit_normals,
@@ -40,7 +41,8 @@ def _campaign_config():
             "opening_angle_deg": 90.0,
             "arm_lengths_m": [6.0, 4.0],
             "arm_masses_kg": [1.0, 2.25],
-            "angular_momentum_gal": [1.0, 0.0, 0.2],
+            "angular_momentum_direction_gal": [1.0, 0.0, 0.2],
+            "spin_period_s": 60.0,
             "attitude_phase_offsets_deg": [0.0, 45.0],
         },
         "orbit": {
@@ -79,6 +81,23 @@ def test_ecliptic_orbit_normals_have_common_node_and_inclinations():
         normals_ecl[:, 1], [-normals_ecl[1, 1], normals_ecl[1, 1]], atol=1e-10
     )
     np.testing.assert_allclose(normals_ecl[:, 0], 0.0, atol=1e-10)
+
+
+def test_angular_momentum_direction_is_scaled_to_spin_period():
+    inertia = crossed_rod_inertia()
+    direction = np.array([2.0, 0.0, 0.4])
+    momentum = angular_momentum_for_spin_period(inertia, direction, 60.0)
+    omega = np.linalg.solve(inertia, momentum)
+    np.testing.assert_allclose(
+        momentum / np.linalg.norm(momentum),
+        direction / np.linalg.norm(direction),
+    )
+    np.testing.assert_allclose(np.linalg.norm(omega), 2.0 * np.pi / 60.0)
+
+
+def test_angular_momentum_spin_period_must_be_positive():
+    with pytest.raises(ValueError, match="positive"):
+        angular_momentum_for_spin_period(np.eye(3), [1.0, 0.0, 0.0], 0.0)
 
 
 def test_torque_free_conserves_norm_momentum_and_energy():
@@ -160,6 +179,9 @@ def test_campaign_shapes_tracks_phase_and_recovery_adapter():
         _campaign_config(), sky=sky, sky_coeffs=sky_coeffs
     )
     result = campaign.run()
+    np.testing.assert_allclose(
+        campaign.initial_angular_speed_rad_s, 2.0 * np.pi / 60.0
+    )
     assert result.spectra_K.shape == (2, 4, 2, len(freqs_hz))
     assert result.masks.shape == (2, 4, sky.npix)
     assert not np.array_equal(result.masks[0], result.masks[1])

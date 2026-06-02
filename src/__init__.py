@@ -24,6 +24,7 @@ from .lunar_surface import (
 from .lunar import (
     LunarCampaign,
     LunarCampaignResult,
+    angular_momentum_for_spin_period,
     crossed_rod_inertia,
     integrate_torque_free,
     interpolate_body_rotations,
@@ -58,6 +59,7 @@ __all__ = [
     "LunarCampaign",
     "LunarCampaignResult",
     "LunarRecoveryAdapter",
+    "angular_momentum_for_spin_period",
     "build_surface_design_matrix",
     "sample_beam_weights",
     "crossed_rod_inertia",

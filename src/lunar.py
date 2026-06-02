@@ -78,6 +78,23 @@ def crossed_rod_inertia(
     return inertia
 
 
+def angular_momentum_for_spin_period(inertia, direction, spin_period_s):
+    """Scale an angular-momentum direction to an initial rotation period.
+
+    Torque-free tumbling generally has multiple attitude timescales. This
+    convention sets the initial angular-speed magnitude to
+    ``2 * pi / spin_period_s`` when body and inertial axes are aligned.
+    """
+    spin_period_s = float(spin_period_s)
+    if spin_period_s <= 0.0:
+        raise ValueError("spin_period_s must be positive")
+    direction = normalize_vector(direction)
+    inertia_inv = np.linalg.inv(np.asarray(inertia, dtype=float))
+    unit_omega = inertia_inv @ direction
+    scale = (2.0 * np.pi / spin_period_s) / np.linalg.norm(unit_omega)
+    return direction * scale
+
+
 def torque_free_rhs(_time_s, state, inertia, inertia_inv):
     """Quaternion and body-angular-momentum RHS for torque-free rotation."""
     quat = state[:4] / np.linalg.norm(state[:4])
@@ -268,14 +285,25 @@ class LunarCampaign:
             cfg.get("opening_angle_deg", 90.0),
         )
         max_time = max(float(np.max(offsets_s)), 1e-6)
-        dt_s = self.config["integration"].get("attitude_step_s", 1.0)
+        spin_period_s = cfg["spin_period_s"]
+        momentum_direction = cfg["angular_momentum_direction_gal"]
+        angular_momentum = angular_momentum_for_spin_period(
+            inertia, momentum_direction, spin_period_s
+        )
+        self.attitude_inertia = inertia
+        self.angular_momentum_gal = angular_momentum
+        self.initial_angular_speed_rad_s = np.linalg.norm(
+            np.linalg.solve(inertia, angular_momentum)
+        )
+        requested_step_s = self.config["integration"].get(
+            "attitude_step_s", spin_period_s / 20.0
+        )
+        dt_s = min(requested_step_s, spin_period_s / 20.0)
         sim_times = np.arange(0.0, max_time + dt_s, dt_s)
         if sim_times[-1] < max_time:
             sim_times = np.append(sim_times, max_time)
         base = interpolate_body_rotations(
-            integrate_torque_free(
-                inertia, cfg["angular_momentum_gal"], sim_times
-            ),
+            integrate_torque_free(inertia, angular_momentum, sim_times),
             offsets_s,
         )
         phases = cfg.get(
@@ -284,8 +312,7 @@ class LunarCampaign:
         body_rots = []
         for phase_deg in phases:
             phase = Rotation.from_rotvec(
-                normalize_vector(cfg["angular_momentum_gal"])
-                * np.deg2rad(phase_deg)
+                normalize_vector(momentum_direction) * np.deg2rad(phase_deg)
             )
             body_rots.append((phase * base).inv().as_matrix())
         return np.asarray(body_rots, dtype=np.float32)
