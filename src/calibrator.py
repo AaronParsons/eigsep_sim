@@ -24,7 +24,7 @@ from .linear_solver import normal_solve
 
 class AndersonAccelerator:
     """
-    Type-I Anderson Acceleration for fixed-point iteration.
+    Type-II Anderson Acceleration for fixed-point iteration.
 
     Maintains a history of iterates and applies optimal linear combination
     to accelerate convergence.
@@ -81,35 +81,30 @@ class AndersonAccelerator:
             self.x_history.pop(0)
             self.fx_diff_history.pop(0)
 
-        # Need at least 2 iterates for acceleration
+        # The unaccelerated fixed-point update is g(x) = x + f(x).
+        fixed_point = x + fx
         if len(self.x_history) < 2:
-            return x_new.astype(x_new.dtype)
+            return fixed_point.reshape(x_shape).astype(x_new.dtype)
 
-        # Build the Gram matrix of residual differences
+        # Type-II Anderson acceleration:
+        #   g(x_k) - (ΔX_k + ΔF_k) γ,
+        # where γ minimizes ||f_k - ΔF_k γ||₂.
         k = len(self.x_history) - 1
-        fx_diffs = np.array([self.fx_diff_history[i + 1] - self.fx_diff_history[i]
-                             for i in range(k)])  # (k, n)
-
-        # Gram matrix: G[i,j] = (fx_diff_i, fx_diff_j)
-        G = fx_diffs @ fx_diffs.T  # (k, k)
-
-        # RHS: -fx_diff_history[-1]
-        rhs = -self.fx_diff_history[-1]  # (n,)
-        g_rhs = fx_diffs @ rhs  # (k,)
-
-        # Solve regularized normal equations: (G + epsilon*I) alpha = g_rhs
+        x_diffs = np.column_stack([
+            self.x_history[i + 1] - self.x_history[i] for i in range(k)
+        ])
+        fx_diffs = np.column_stack([
+            self.fx_diff_history[i + 1] - self.fx_diff_history[i]
+            for i in range(k)
+        ])
+        gram = fx_diffs.T @ fx_diffs
+        rhs = fx_diffs.T @ fx
         try:
-            alpha = np.linalg.solve(G + self.tol * np.eye(k), g_rhs)
+            gamma = np.linalg.solve(gram + self.tol * np.eye(k), rhs)
         except np.linalg.LinAlgError:
-            # Degenerate case: return unaccelerated
-            return x_new.astype(x_new.dtype)
+            return fixed_point.reshape(x_shape).astype(x_new.dtype)
 
-        # Accelerated iterate: x_acc = sum_i alpha_i * x_{n-k+i}
-        x_acc = np.zeros_like(x)
-        x_acc += (1.0 - np.sum(alpha)) * x  # Contribution from x_n
-        for i in range(k):
-            x_acc += alpha[i] * self.x_history[i]
-
+        x_acc = fixed_point - (x_diffs + fx_diffs) @ gamma
         return x_acc.reshape(x_shape).astype(x_new.dtype)
 
 
@@ -170,6 +165,14 @@ class Calibrator:
         )
         self._lam_beam = float(lam_beam)
         self._lam_sky = float(lam_sky)
+        self._data_flat_jax = jnp.reshape(
+            jnp.asarray(self._data, dtype=DTYPE_R_JAX),
+            (-1, self._data.shape[-1]),
+        )
+        self._inv_noise_var_flat_jax = jnp.reshape(
+            jnp.asarray(self._inv_noise_var, dtype=DTYPE_R_JAX),
+            (-1, self._inv_noise_var.shape[-1]),
+        )
 
         # Anderson accelerator
         self._aa = AndersonAccelerator(m=m_anderson)
@@ -254,12 +257,9 @@ class Calibrator:
 
         # Reshape pred and data to (ntimes*n_dipoles, nfreq) for consistent loss computation
         pred_flat = jnp.reshape(pred, (-1, pred.shape[-1]))
-        data_flat = jnp.reshape(jnp.asarray(self._data), (-1, pred.shape[-1]))
-        inv_noise_var_flat = jnp.reshape(jnp.asarray(self._inv_noise_var), (-1, pred.shape[-1]))
-
         # Data residual
-        resid = pred_flat - data_flat
-        loss = jnp.mean(inv_noise_var_flat * resid**2)
+        resid = pred_flat - self._data_flat_jax
+        loss = jnp.mean(self._inv_noise_var_flat_jax * resid**2)
 
         # Beam regularization (ridge toward nominal)
         if self._lam_beam > 0 and self._beam_nom is not None:
@@ -700,14 +700,19 @@ class Calibrator:
             params_aa = params.copy()
             params_aa['beam_coeffs'] = np.asarray(beam_acc, dtype=DTYPE_R_NPY)
 
-            # Accept AA point only if it doesn't raise the loss
+            # Accept AA point only if it doesn't raise the loss. The first
+            # call returns the ordinary fixed-point update, so avoid evaluating
+            # the same loss twice before acceleration has enough history.
             loss_step = float(self._loss(params))
-            loss_aa   = float(self._loss(params_aa))
-            if loss_aa <= loss_step:
-                params = params_aa
-                loss = loss_aa
-            else:
+            if len(self._aa.x_history) < 2:
                 loss = loss_step
+            else:
+                loss_aa = float(self._loss(params_aa))
+                if loss_aa <= loss_step:
+                    params = params_aa
+                    loss = loss_aa
+                else:
+                    loss = loss_step
 
             losses.append(loss)
 

@@ -32,7 +32,14 @@ from .lunar import (
     normalize_vector,
 )
 from .lunar_recovery import LunarRecoveryAdapter
-from .recovery import build_surface_design_matrix, sample_beam_weights
+from .recovery import (
+    AdditiveDegeneracy,
+    RecoverySolution,
+    ScaleDegeneracy,
+    build_surface_design_matrix,
+    relative_rms,
+    sample_beam_weights,
+)
 
 __all__ = [
     "DTYPE_R_NPY",
@@ -60,7 +67,11 @@ __all__ = [
     "LunarCampaignResult",
     "LunarRecoveryAdapter",
     "angular_momentum_for_spin_period",
+    "AdditiveDegeneracy",
+    "RecoverySolution",
+    "ScaleDegeneracy",
     "build_surface_design_matrix",
+    "relative_rms",
     "sample_beam_weights",
     "crossed_rod_inertia",
     "integrate_torque_free",

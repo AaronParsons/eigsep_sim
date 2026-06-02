@@ -49,12 +49,12 @@ def test_anderson_accelerator_reset():
 
 
 def test_anderson_accelerator_single_iterate():
-    """AndersonAccelerator: returns unaccelerated on first iterate (need ≥2)."""
+    """AndersonAccelerator: first iterate returns the fixed-point update."""
     aa = AndersonAccelerator(m=5)
     x = np.array([1.0, 2.0])
     fx = np.array([0.05, 0.1])
     x_acc = aa.apply(x, fx)
-    assert np.allclose(x_acc, x)
+    assert np.allclose(x_acc, x + fx)
 
 
 def test_anderson_accelerator_two_iterates():
