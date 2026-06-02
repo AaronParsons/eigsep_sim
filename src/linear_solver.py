@@ -13,88 +13,41 @@ import numpy as np
 import healpy
 from scipy.spatial.transform import Rotation
 
+from .recovery import build_surface_design_matrix
+
 
 def build_design_matrix(masks, beams, omega_B, J_SUN, npix, include_t_rx=True):
+    """Build the legacy sky, regolith, Sun, and receiver-offset matrix.
+
+    Row ``r = 2 * (orbit * n_obs + time) + dipole``. Column ordering is
+    ``[sky pixels | T_regolith | T_sun | optional T_rx per dipole]``.
+
+    This compatibility wrapper retains the historical API while delegating
+    generic sky, surface, source, and receiver-column construction to
+    :func:`eigsep_sim.recovery.build_surface_design_matrix`.
     """
-    Build the observation design matrix A.
-
-    Row r = 2*(o*n_obs + i) + d corresponds to orbit o, time i, dipole d.
-
-    Column layout when ``include_t_rx=True`` (default):
-        [sky pixels 0..npix-1 | T_regolith | T_sun | T_rx_dipole0 | T_rx_dipole1]
-
-    Column layout when ``include_t_rx=False``:
-        [sky pixels 0..npix-1 | T_regolith | T_sun]
-
-    When ``include_t_rx=False``, receiver temperature is not modelled
-    explicitly.  Any T_rx offset is absorbed into the recovered sky monopole
-    and regolith temperature, and can be removed afterwards by spectrally
-    filtering out the flat (constant-vs-frequency) component.
-
-    When ``include_t_rx=True``, an exact null space exists (uniform sky shift
-    + regolith shift + equal-but-opposite T_rx shift), so the common-mode
-    receiver temperature is degenerate with the sky/regolith monopole.  Only
-    T_rx_1 − T_rx_0 is independently constrained.  The SVD/normal-equations
-    minimum-norm solution handles this by zeroing the degenerate mode.
-
-    Parameters
-    ----------
-    masks : ndarray, shape (n_total, npix), float32
-    beams : ndarray, shape (n_total, 2, npix), float32
-    omega_B : ndarray, shape (n_total, 2)
-    J_SUN : ndarray, shape (n_obs,), int
-        HEALPix pixel of the Sun at each time (shared across orbits).
-    npix : int
-        Number of sky pixels.
-    include_t_rx : bool
-        If True (default), append per-dipole T_rx columns.
-
-    Returns
-    -------
-    A : ndarray, shape (n_total * 2, npix + 4) if include_t_rx else (n_total * 2, npix + 2)
-    """
-    n_total = masks.shape[0]
+    masks = np.asarray(masks, dtype=np.float64)
+    beams = np.asarray(beams, dtype=np.float64)
+    omega_B = np.asarray(omega_B, dtype=np.float64)
+    if beams.shape[2] != npix:
+        raise ValueError(
+            f"beams have {beams.shape[2]} pixels, inconsistent with npix={npix}"
+        )
+    n_total, _, _ = beams.shape
     n_obs = len(J_SUN)
-    n_orbits = n_total // n_obs
-    n_rows = n_total * 2
-    n_cols = npix + 4 if include_t_rx else npix + 2
-
-    # Cast inputs once to float64 to avoid repeated per-row casts.
-    m  = masks.astype(np.float64)       # (n_total, npix)
-    B  = beams.astype(np.float64)       # (n_total, 2, npix)
-    OB = omega_B.astype(np.float64)     # (n_total, 2)
-
-    # J_SUN has length n_obs; tile to n_total (orbits share the same time grid).
-    J_tile = np.tile(J_SUN, n_orbits)   # (n_total,)
-
-    # Row layout: rows [2k, 2k+1] correspond to dipoles [0, 1] of observation k.
-    # Vectorised over all k and d simultaneously.
-
-    # Sky pixel columns: A[2k+d, j] = B[k,d,j] * m[k,j] / OmB[k,d]
-    # Shape: (n_total, 2, npix) → (n_total*2, npix) via reshape (C-order gives
-    # the correct row ordering: d=0 then d=1 for each k).
-    sky_block = (B / OB[:, :, np.newaxis]) * m[:, np.newaxis, :]   # (n_total, 2, npix)
-
-    # Regolith column: sum_j B[k,d,j] * (1 - m[k,j]) / OmB[k,d]
-    reg_block = (B * (1.0 - m[:, np.newaxis, :])).sum(axis=2) / OB  # (n_total, 2)
-
-    # Sun column: B[k,d,J_SUN[i]] * m[k,J_SUN[i]] / OmB[k,d]
-    sun_beam = B[np.arange(n_total), :, J_tile]    # (n_total, 2)
-    sun_mask = m[np.arange(n_total), J_tile]        # (n_total,)
-    sun_block = sun_beam * sun_mask[:, np.newaxis] / OB   # (n_total, 2)
-
-    # Assemble A: interleave dipoles into rows.
-    A = np.empty((n_rows, n_cols), dtype=np.float64)
-    A[:, :npix]    = sky_block.reshape(n_rows, npix)
-    A[:, npix]     = reg_block.reshape(n_rows)
-    A[:, npix + 1] = sun_block.reshape(n_rows)
-    if include_t_rx:
-        A[:, npix + 2] = 0.0
-        A[:, npix + 3] = 0.0
-        A[0::2, npix + 2] = 1.0   # dipole-0 rows
-        A[1::2, npix + 3] = 1.0   # dipole-1 rows
-
-    return A
+    if n_obs == 0 or n_total % n_obs != 0:
+        raise ValueError("J_SUN length must evenly divide the observation count")
+    weights = beams / omega_B[:, :, None]
+    sun_pixels = np.tile(np.asarray(J_SUN, dtype=int), n_total // n_obs)
+    sun_beam = weights[np.arange(n_total), :, sun_pixels]
+    sun_mask = masks[np.arange(n_total), sun_pixels]
+    sun_column = sun_beam * sun_mask[:, None]
+    return build_surface_design_matrix(
+        weights,
+        masks,
+        source_columns={"sun": sun_column},
+        include_receiver_offsets=include_t_rx,
+    )
 
 
 def build_monopole_design_matrix(masks, beams, omega_B, J_SUN):

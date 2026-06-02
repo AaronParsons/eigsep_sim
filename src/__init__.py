@@ -16,6 +16,22 @@ from .observer import Observer, EarthSurface, LunarSurface, LunarOrbit
 from .sky import Sky
 from .simulate import ForwardModel
 from .calibrator import Calibrator
+from .lunar_surface import (
+    LunarSurfaceGeometry,
+    LunarSurfaceModel,
+    UniformLunarSurface,
+)
+from .lunar import (
+    LunarCampaign,
+    LunarCampaignResult,
+    crossed_rod_inertia,
+    integrate_torque_free,
+    interpolate_body_rotations,
+    make_ecliptic_orbit_normals,
+    normalize_vector,
+)
+from .lunar_recovery import LunarRecoveryAdapter
+from .recovery import build_surface_design_matrix, sample_beam_weights
 
 __all__ = [
     "DTYPE_R_NPY",
@@ -36,4 +52,17 @@ __all__ = [
     "Sky",
     "ForwardModel",
     "Calibrator",
+    "LunarSurfaceGeometry",
+    "LunarSurfaceModel",
+    "UniformLunarSurface",
+    "LunarCampaign",
+    "LunarCampaignResult",
+    "LunarRecoveryAdapter",
+    "build_surface_design_matrix",
+    "sample_beam_weights",
+    "crossed_rod_inertia",
+    "integrate_torque_free",
+    "interpolate_body_rotations",
+    "make_ecliptic_orbit_normals",
+    "normalize_vector",
 ]

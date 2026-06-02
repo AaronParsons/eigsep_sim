@@ -31,6 +31,7 @@ from .beam import Beam
 from .sky import Sky
 from .observer import Observer
 from .terrain import Terrain
+from .lunar_surface import LunarSurfaceModel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,14 +60,20 @@ class ForwardModel:
     terrain : Terrain, optional
         Terrain model for explicit sky blocking. If None, no surface horizon
         is applied; lunar orbit occultation is handled by the observer.
+    surface_model : LunarSurfaceModel, optional
+        Lunar surface emission model. Mutually exclusive with ``terrain``.
     """
 
     def __init__(self, observer: Observer, beam: Beam, sky: Sky,
-                 terrain: Terrain | None = None, transmitters=None):
+                 terrain: Terrain | None = None, transmitters=None,
+                 surface_model: LunarSurfaceModel | None = None):
+        if terrain is not None and surface_model is not None:
+            raise ValueError("terrain and surface_model are mutually exclusive")
         self.observer = observer
         self.beam = beam
         self.sky = sky
         self.terrain = terrain
+        self.surface_model = surface_model
 
         # Transmitters: list of (direction_topo, freqs_tx_hz, power_K) tuples.
         # direction_topo : (3,) unit vector in topocentric frame
@@ -325,6 +332,8 @@ class ForwardModel:
             step.  When provided ``times`` is ignored and the observer
             ephemeris is not queried — useful for non-temporal scanning (e.g.
             az/alt sweeps at a fixed epoch computed once outside this call).
+            Lunar surface models repeat the observer's current orbital phase;
+            use ``times=`` for dynamic lunar surface geometry.
         body_rots : list of (3, 3) ndarray, optional
             Per-step topocentric-to-body rotation matrices.  When provided,
             sky coordinates are rotated from topocentric into the antenna body
@@ -365,8 +374,9 @@ class ForwardModel:
             crds_gal = self._crds_gal                  # (3, npix_sky)
 
         npix_vis = crds_gal.shape[1]
-        if self.terrain is not None:
-            unresolved_emission = self.terrain.unresolved_emission(
+        if self.terrain is not None or self.surface_model is not None:
+            emission_model = self.terrain or self.surface_model
+            unresolved_emission = emission_model.unresolved_emission(
                 self.beam.freqs_hz
             )
             unresolved_default_emission = np.zeros(
@@ -375,7 +385,7 @@ class ForwardModel:
             if unresolved_emission is None:
                 if sky_mask is not None and npix_vis != self.sky.npix:
                     raise ValueError(
-                        "sky_mask with terrain requires terrain.unresolved_emission() "
+                        "sky_mask with surface emission requires unresolved_emission() "
                         "or full geometry for exact omitted-pixel emission"
                     )
                 unresolved_emission = np.zeros(
@@ -523,6 +533,35 @@ class ForwardModel:
         else:
             raise ValueError("Either times or rots must be provided")
 
+        if self.surface_model is not None:
+            if not hasattr(self.observer, "spacecraft_position"):
+                raise TypeError("surface_model requires an orbital observer")
+            if times is not None:
+                if hasattr(self.observer, "spacecraft_position_stack"):
+                    positions = self.observer.spacecraft_position_stack(times)
+                else:
+                    positions = []
+                    for time in times:
+                        self.observer.set_time(time)
+                        positions.append(self.observer.spacecraft_position())
+                    positions = np.stack(positions)
+            else:
+                # With rots=, evaluate the current orbital phase and repeat it.
+                positions = np.broadcast_to(
+                    self.observer.spacecraft_position(), (ntimes, 3)
+                )
+            surface_geometry = self.surface_model.prepare_geometry(
+                positions, crds_gal
+            )
+            terrain_masks = surface_geometry.sky_mask.astype(np.float32)
+            terrain_emissions = self.surface_model.thermal_emission(
+                surface_geometry, self.beam.freqs_hz
+            ).astype(np.float32)
+            default_emission_masks = np.zeros_like(terrain_masks)
+            geom["surface_geometry"] = surface_geometry
+            if "masks" in geom:
+                geom["masks"] = terrain_masks
+
         # Build body_rots array: identity if not provided.
         if body_rots is not None:
             body_rots_arr = np.stack(
@@ -562,6 +601,12 @@ class ForwardModel:
         if sky_indices is not None:
             geom['sky_indices_jax'] = jnp.asarray(sky_indices, dtype=jnp.int32)
         return geom
+
+    def sample_beam_weights(self, geom, freq_index, beam_coeffs=None):
+        """Sample normalized beam weights for linear recovery diagnostics."""
+        from .recovery import sample_beam_weights
+
+        return sample_beam_weights(self, geom, freq_index, beam_coeffs)
 
     def _compute_mask(self, crds_top):
         """
