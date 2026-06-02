@@ -57,6 +57,21 @@ def test_beam_from_dipole():
     print("✓ test_beam_from_dipole passed")
 
 
+def test_beam_from_dipole_selectable_polarizations():
+    """Test Beam.from_dipole with a selected subset of polarization axes."""
+    freqs = np.array([50e6, 100e6, 150e6])
+    u_body = np.array([[1.0, 0.0, 0.0]])
+
+    beam = Beam.from_dipole(
+        nside=4, freqs_hz=freqs, arm_lengths_m=3.0, u_body=u_body, K=2
+    )
+
+    assert beam.n_dipoles == 1
+    assert beam.coeffs.shape == (1, healpy.nside2npix(4), 2)
+    assert np.allclose(beam.u_body, u_body)
+    print("✓ test_beam_from_dipole_selectable_polarizations passed")
+
+
 def test_beam_from_dipole_per_dipole_lengths():
     """Test Beam.from_dipole with per-dipole arm lengths."""
     freqs = np.array([50e6, 100e6, 150e6])

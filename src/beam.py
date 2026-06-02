@@ -365,8 +365,8 @@ class Beam:
     coeffs : ndarray, shape (n_dipoles, npix_beam, nmodes)
         Spatial coefficients per dipole in the spectral basis.
     u_body : ndarray, shape (n_dipoles, 3), optional
-        Dipole axis unit vectors in body frame. Defaults to
-        standard orthogonal dipoles if None.
+        Dipole axis unit vectors in body frame. Defaults to a standard
+        orthogonal pair if None.
     """
 
     def __init__(self, nside, freqs_hz, basis, coeffs, u_body=None):
@@ -400,11 +400,10 @@ class Beam:
             HEALPix resolution for body-frame beam.
         freqs_hz : ndarray, shape (nfreq,)
             Frequencies [Hz].
-        arm_lengths_m : float or ndarray, shape (2,)
-            Dipole arm length(s) [m]. If float, used for both dipoles;
-            if (2,), per-dipole arm lengths.
-        u_body : ndarray, shape (2, 3), optional
-            Dipole axes in body frame. Defaults to standard orthogonal pair.
+        arm_lengths_m : float or ndarray, shape (n_dipoles,)
+            Dipole arm length(s) [m]. A scalar is used for every dipole.
+        u_body : ndarray, shape (n_dipoles, 3), optional
+            Dipole axes in body frame. Defaults to a standard orthogonal pair.
         K : int
             Number of spectral modes to retain (default 5).
 
@@ -415,22 +414,37 @@ class Beam:
         """
         from .basis import BeamBasis
 
-        arm_lengths_m = np.atleast_1d(np.asarray(arm_lengths_m, dtype=DTYPE_R_NPY))
-        if arm_lengths_m.size == 1:
-            arm_lengths_m = np.repeat(arm_lengths_m, 2)
-
         if u_body is None:
             u_body = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=DTYPE_R_NPY)
+        u_body = np.asarray(u_body, dtype=DTYPE_R_NPY)
+        if u_body.ndim != 2 or u_body.shape[1] != 3 or u_body.shape[0] == 0:
+            raise ValueError(
+                f"u_body must have shape (n_dipoles, 3), got {u_body.shape}"
+            )
+
+        n_dipoles = u_body.shape[0]
+        arm_lengths_m = np.atleast_1d(
+            np.asarray(arm_lengths_m, dtype=DTYPE_R_NPY)
+        )
+        if arm_lengths_m.size == 1:
+            arm_lengths_m = np.repeat(arm_lengths_m, n_dipoles)
+        elif arm_lengths_m.size != n_dipoles:
+            raise ValueError(
+                "arm_lengths_m must be scalar or have one value per dipole "
+                f"({n_dipoles}), got {arm_lengths_m.size}"
+            )
 
         freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
 
         # Compute cos(θ) for all beam pixels
         npix = healpy.nside2npix(nside)
         N_GAL = np.array(healpy.pix2vec(nside, np.arange(npix)))  # (3, npix)
-        cos_theta = u_body @ N_GAL  # (2, npix)
+        cos_theta = u_body @ N_GAL  # (n_dipoles, npix)
 
         # Evaluate thin-dipole beam at all frequencies
-        nominal_beam = np.zeros((2, npix, len(freqs_hz)), dtype=DTYPE_R_NPY)
+        nominal_beam = np.zeros(
+            (n_dipoles, npix, len(freqs_hz)), dtype=DTYPE_R_NPY
+        )
         for f_idx, f_hz in enumerate(freqs_hz):
             kh_f = arm_lengths_m * np.pi * f_hz / C_LIGHT
             nominal_beam[:, :, f_idx] = thin_dipole_pattern(kh_f[:, np.newaxis], cos_theta)
@@ -439,15 +453,15 @@ class Beam:
         # Note: K is limited by min(npix, nfreq)
         max_rank = min(npix, len(freqs_hz))
         K_actual = min(K, max_rank)
-        coeffs = np.zeros((2, npix, K_actual), dtype=DTYPE_R_NPY)
+        coeffs = np.zeros((n_dipoles, npix, K_actual), dtype=DTYPE_R_NPY)
 
-        for d in range(2):
+        for d in range(n_dipoles):
             B_d = nominal_beam[d]  # (npix, nfreq)
             U, s, Vt = np.linalg.svd(B_d, full_matrices=False)
             coeffs[d] = (U[:, :K_actual] * s[:K_actual])  # (npix, K_actual)
 
         # Build shared basis from averaged dipole
-        B_avg = (nominal_beam[0] + nominal_beam[1]) / 2
+        B_avg = np.mean(nominal_beam, axis=0)
         U, s, Vt = np.linalg.svd(B_avg, full_matrices=False)
         basis_A = Vt[:K_actual].T  # (nfreq, K_actual)
         basis = BeamBasis(basis_A, freqs_hz=freqs_hz)
