@@ -84,9 +84,10 @@ def make_geometry(fwd, args):
         Time("2025-01-01")
         + np.linspace(0.0, 86400.0, args.ntimes, endpoint=False) * u.s
     )
-    times = [time for time in base_times for _ in range(len(orient_rots))]
+    base_rots = fwd.observer.rot_gal2top_stack(base_times)
+    rots = np.repeat(base_rots, len(orient_rots), axis=0)
     body_rots = np.tile(orient_rots, (args.ntimes, 1, 1))
-    return fwd.precompute_geometry(times, body_rots=body_rots)
+    return fwd.precompute_geometry(rots=rots, body_rots=body_rots)
 
 
 def solver_options(name):

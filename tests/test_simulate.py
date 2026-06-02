@@ -357,6 +357,10 @@ def test_precompute_geometry_rots_shape(simple_fwd):
     assert geom['default_emission_masks_jax'].shape == (ntimes, npix_sky)
     assert geom['crds_gal_jax'].shape      == (3, npix_sky)
     assert geom['tx_crds_jax'].shape       == (ntimes, 0, 3)
+    assert geom['beam_px_jax'].shape       == (ntimes, 4, npix_sky)
+    assert geom['beam_wgts_jax'].shape     == (ntimes, 4, npix_sky)
+    assert geom['tx_px_jax'].shape         == (ntimes, 4, 0)
+    assert geom['tx_wgts_jax'].shape       == (ntimes, 4, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -10,11 +10,10 @@ Architecture:
 - Simulates antenna temperature given basis coefficients
 
 Performance notes:
-- precompute_geometry() stores rotation matrices (rots_jax, body_rots_jax) and
-  terrain masks/emission and rotations as JAX arrays. simulate() passes these
-  plus crds_gal_jax to a JIT-compiled scan kernel that performs gal→top and
-  top→body rotations, healjax interpolation, and sky integration entirely
-  inside XLA — fusing all coordinate arithmetic into one pass.
+- precompute_geometry() stores terrain masks/emission plus body-frame HEALPix
+  interpolation pixels and weights as JAX arrays. simulate() passes these to a
+  JIT-compiled scan kernel so repeated optimization steps only reconstruct the
+  sky and beam maps, gather cached beam samples, and integrate the sky.
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ from __future__ import annotations
 import numpy as np
 import jax
 import jax.numpy as jnp
-import healjax
 import healpy
 
 from .healpix import float_dtype
@@ -202,15 +200,15 @@ class ForwardModel:
 
         Returns a function ``sim(sky_coeffs, beam_coeffs, terrain_masks,
         terrain_emissions, default_emission_masks, unresolved_emission,
-        unresolved_default_emission, rots, body_rots, T_gnd, tx_crds_all,
-        crds_gal)`` that is fully JAX-traceable.
-        Rotation matmuls (gal→top, top→body) and healjax interpolation run inside
-        jax.lax.scan so that coordinate arithmetic, beam gather, and sky integration
-        are fused by XLA.
+        unresolved_default_emission, beam_px, beam_wgts, T_gnd, tx_px,
+        tx_wgts)`` that is fully JAX-traceable.
+        Geometry-dependent rotations and HEALPix interpolation are cached by
+        ``precompute_geometry()`` so repeated optimizer evaluations only gather
+        beam samples and integrate the sky.
 
         Transmitter temperatures (tx_T_jax, (n_sources, nfreq)) are closed over as
-        compile-time constants; tx_crds_all carries per-step body-frame directions.
-        When n_sources=0 the arrays are empty and the TX sum contributes zero.
+        compile-time constants. When n_sources=0 the arrays are empty and the TX
+        sum contributes zero.
         """
         A_sky = self._sky_basis_A_jax        # (nfreq, nmodes_sky)
         A_beam = self._beam_basis_A_jax      # (nfreq, nmodes_beam)
@@ -223,8 +221,8 @@ class ForwardModel:
         @jax.jit
         def _sim(sky_coeffs, beam_coeffs, terrain_masks, terrain_emissions,
                  default_emission_masks, unresolved_emission,
-                 unresolved_default_emission, rots, body_rots, T_gnd,
-                 tx_crds_all, crds_gal):
+                 unresolved_default_emission, beam_px_all, beam_wgts_all,
+                 T_gnd, tx_px_all, tx_wgts_all):
             """
             sky_coeffs    : (npix_vis, nmodes_sky)
             beam_coeffs   : (n_dipoles, npix_beam, nmodes_beam)
@@ -233,11 +231,11 @@ class ForwardModel:
             default_emission_masks : (ntimes, npix_vis) float32  T_gnd fallback factor
             unresolved_emission : (nfreq,) float32  omitted-pixel brightness
             unresolved_default_emission : (nfreq,) float32  omitted-pixel T_gnd factor
-            rots          : (ntimes, 3, 3)            float32  gal→top rotation matrices
-            body_rots     : (ntimes, 3, 3)            float32  top→body rotation matrices
+            beam_px_all   : (ntimes, 4, npix_vis)     int32    cached beam pixels
+            beam_wgts_all : (ntimes, 4, npix_vis)     float32  cached beam weights
             T_gnd         : scalar [K]
-            tx_crds_all   : (ntimes, n_sources, 3)   float32  TX body-frame directions
-            crds_gal      : (3, npix_vis)             float32  galactic unit vectors
+            tx_px_all     : (ntimes, 4, n_sources)    int32    cached TX pixels
+            tx_wgts_all   : (ntimes, 4, n_sources)    float32  cached TX weights
             Returns       : (ntimes, n_dipoles, nfreq)
             """
             sky_recon = sky_coeffs @ A_sky.T          # (npix_vis, nfreq)
@@ -245,22 +243,8 @@ class ForwardModel:
             den_all = jnp.sum(beam_recon_all, axis=1) * scale  # (n_dipoles, nfreq)
 
             def one_time(_, args):
-                terrain_mask, terrain_emit, default_emit_mask, R, br, tx_c = args
-                # R: (3,3)  br: (3,3)  terrain_mask: (npix_vis,)  tx_c: (n_sources,3)
-                crds_top = R @ crds_gal                              # (3, npix_vis)
+                terrain_mask, terrain_emit, default_emit_mask, px, wgts, tx_px, tx_wgts = args
                 mask = terrain_mask                                # (npix_vis,)
-                crds_body = br @ crds_top                           # (3, npix_vis)
-
-                th, ph = healjax.vec2ang(crds_body[0], crds_body[1], crds_body[2])
-                px, wgts = healjax.get_interp_weights(th, ph, nside_beam)
-                # px: (4, npix_vis)   wgts: (4, npix_vis)
-
-                # TX interpolation locations are independent of dipole.
-                th_tx, ph_tx = healjax.vec2ang(tx_c[:, 0], tx_c[:, 1], tx_c[:, 2])
-                tx_px, tx_wgts = healjax.get_interp_weights(
-                    th_tx, ph_tx, nside_beam
-                )
-                # tx_px: (4, n_sources)   tx_wgts: (4, n_sources)
 
                 def one_dipole(beam_recon_d, den_d):  # (npix_beam, nfreq), (nfreq,)
                     # Accumulate 4 bilinear neighbors without materialising (4,npix,nfreq)
@@ -308,9 +292,10 @@ class ForwardModel:
                     terrain_masks,
                     terrain_emissions,
                     default_emission_masks,
-                    rots,
-                    body_rots,
-                    tx_crds_all,
+                    beam_px_all,
+                    beam_wgts_all,
+                    tx_px_all,
+                    tx_wgts_all,
                 ),
             )
             return antenna_temp  # (ntimes, n_dipoles, nfreq)
@@ -359,6 +344,10 @@ class ForwardModel:
             - 'unresolved_default_emission_jax': (nfreq,) float32 — omitted-pixel T_gnd factor
             - 'crds_gal_jax': (3, npix_vis) float32 — galactic unit vectors (filtered by sky_mask)
             - 'tx_crds_jax': (ntimes, n_sources, 3) float32 — TX body-frame directions
+            - 'beam_px_jax': (ntimes, 4, npix_vis) int32 — cached beam interpolation pixels
+            - 'beam_wgts_jax': (ntimes, 4, npix_vis) float32 — cached beam interpolation weights
+            - 'tx_px_jax': (ntimes, 4, n_sources) int32 — cached TX interpolation pixels
+            - 'tx_wgts_jax': (ntimes, 4, n_sources) float32 — cached TX interpolation weights
             - 'sky_indices_jax': (npix_vis,) int32 — only present when sky_mask given
             Times path also retains: 'rot_gal2top', 'crds_top', 'masks' (numpy arrays)
         """
@@ -579,8 +568,31 @@ class ForwardModel:
         else:
             tx_body = np.zeros((ntimes, 0, 3), dtype=np.float32)
 
+        # Beam interpolation depends only on geometry, so cache it once. During
+        # calibration this avoids repeating rotations, vec2ang, and HEALPix
+        # interpolation for every loss, gradient, and Hessian-vector product.
+        crds_body = body_rots_arr @ (R_arr @ crds_gal)
+        beam_th = np.arccos(np.clip(crds_body[:, 2], -1.0, 1.0))
+        beam_ph = np.mod(np.arctan2(crds_body[:, 1], crds_body[:, 0]), 2.0 * np.pi)
+        beam_px, beam_wgts = healpy.get_interp_weights(
+            self.beam.nside, beam_th, beam_ph
+        )
+        if n_sources > 0:
+            tx_th = np.arccos(np.clip(tx_body[:, :, 2], -1.0, 1.0))
+            tx_ph = np.mod(np.arctan2(tx_body[:, :, 1], tx_body[:, :, 0]), 2.0 * np.pi)
+            tx_px, tx_wgts = healpy.get_interp_weights(
+                self.beam.nside, tx_th, tx_ph
+            )
+        else:
+            tx_px = np.empty((4, ntimes, 0), dtype=np.int32)
+            tx_wgts = np.empty((4, ntimes, 0), dtype=np.float32)
+
         geom['rots_jax'] = jnp.asarray(R_arr, dtype=DTYPE_R_JAX)
         geom['body_rots_jax'] = jnp.asarray(body_rots_arr, dtype=DTYPE_R_JAX)
+        geom['beam_px_jax'] = jnp.asarray(beam_px.transpose(1, 0, 2), dtype=jnp.int32)
+        geom['beam_wgts_jax'] = jnp.asarray(beam_wgts.transpose(1, 0, 2), dtype=DTYPE_R_JAX)
+        geom['tx_px_jax'] = jnp.asarray(tx_px.transpose(1, 0, 2), dtype=jnp.int32)
+        geom['tx_wgts_jax'] = jnp.asarray(tx_wgts.transpose(1, 0, 2), dtype=DTYPE_R_JAX)
         geom['terrain_masks_jax'] = jnp.asarray(
             terrain_masks, dtype=DTYPE_R_JAX
         )
@@ -674,11 +686,11 @@ class ForwardModel:
             geom['default_emission_masks_jax'],
             geom['unresolved_emission_jax'],
             geom['unresolved_default_emission_jax'],
-            geom['rots_jax'],
-            geom['body_rots_jax'],
+            geom['beam_px_jax'],
+            geom['beam_wgts_jax'],
             jnp.asarray(T_gnd, dtype=DTYPE_R_JAX),
-            geom['tx_crds_jax'],
-            geom['crds_gal_jax'],
+            geom['tx_px_jax'],
+            geom['tx_wgts_jax'],
         )
 
 
