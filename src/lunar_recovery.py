@@ -19,7 +19,7 @@ class LunarRecoveryAdapter:
         }
 
     def beam_weights(self, spacecraft_index, freq_index):
-        """Return normalized Galactic-pixel weights.
+        """Return Galactic-pixel beam weights.
 
         The shape is ``(time, dipole, pixel)``.
         """
@@ -34,11 +34,21 @@ class LunarRecoveryAdapter:
         for spacecraft_index in range(len(self.campaign.observers)):
             weights = self.beam_weights(spacecraft_index, freq_index)
             masks = self.result.masks[spacecraft_index]
+            fwd = self.campaign.forward_models[spacecraft_index]
+            beam_maps = fwd.beam.basis.deproject(fwd.beam.coeffs)
+            unresolved_weights = np.asarray(
+                self.result.geometry[spacecraft_index][
+                    "unresolved_beam_weights_jax"
+                ]
+            )
+            unresolved_surface_weight = unresolved_weights @ (
+                beam_maps[:, :, freq_index].T
+            )
             blocks.append(
                 build_surface_design_matrix(
                     weights,
                     masks,
-                    unresolved_surface_weight=1.0 - np.sum(weights, axis=2),
+                    unresolved_surface_weight=unresolved_surface_weight,
                     include_receiver_offsets=include_receiver_offsets,
                 )
             )

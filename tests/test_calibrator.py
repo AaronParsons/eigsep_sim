@@ -147,6 +147,7 @@ def test_calibrator_beam_step():
 
     times = [Time("2000-01-01")]
     params = cal.init_params(times=times)
+    params['sky_coeffs'] = np.ones_like(params['sky_coeffs'])
     beam_before = params['beam_coeffs'].copy()
 
     params_new = cal.beam_step(params, lr=0.001)
@@ -334,6 +335,29 @@ def test_calibrator_joint_step_decreases_loss():
     assert sky_change + beam_change > 1e-8, (
         "joint_step made no parameter changes"
     )
+
+
+def test_calibrator_fit_use_truncated_beam_cg():
+    """Calibrator: fit() accepts truncated beam-CG controls."""
+    fwd = setup_forward_model()
+    np.random.seed(42)
+    data = np.random.randn(2, 2, 2).astype(np.float32) * 10.0 + 100.0
+
+    cal = Calibrator(fwd, data, lam_beam=0.01)
+    times = [Time("2000-01-01")] * 2
+    params = cal.init_params(times=times)
+    params = cal.sky_step(params)
+    loss_before = float(cal._loss(params))
+
+    result = cal.fit(
+        params=params,
+        max_iter=2,
+        verbose=False,
+        use_cg=True,
+        beam_cg_niter=2,
+        beam_cg_tol=1e-2,
+    )
+    assert result['losses'][-1] <= loss_before * 1.01
 
 
 def test_calibrator_fit_use_joint():

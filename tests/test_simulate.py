@@ -225,6 +225,31 @@ def test_forward_model_simulate_no_times_no_geom_error():
         fwd.simulate(sky_coeffs, beam_coeffs)
 
 
+def test_forward_model_sky_beam_scale_degeneracy():
+    """Opposite sky and beam scales preserve the unnormalized prediction."""
+    nside = 4
+    freqs_hz = np.array([50e6, 100e6])
+    beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
+    sky_map = np.random.default_rng(0).uniform(
+        100.0, 1000.0, size=(healpy.nside2npix(nside), len(freqs_hz))
+    )
+    sky = Sky.from_map(nside, freqs_hz, sky_map, n_modes=2)
+    sky_coeffs = sky.basis.project(sky_map)
+    observer = EarthSurface(lat=45.0, lon=0.0)
+    observer.set_time("2000-01-01")
+    fwd = ForwardModel(observer, beam, sky)
+    geom = fwd.precompute_geometry(rots=[observer.rot_gal2top()])
+
+    nominal = np.asarray(fwd.simulate(sky_coeffs, beam.coeffs, geom=geom))
+    beam_scaled = np.asarray(fwd.simulate(sky_coeffs, 2.0 * beam.coeffs, geom=geom))
+    sky_scaled = np.asarray(fwd.simulate(2.0 * sky_coeffs, beam.coeffs, geom=geom))
+    coupled_scaled = np.asarray(fwd.simulate(2.0 * sky_coeffs, 0.5 * beam.coeffs, geom=geom))
+
+    np.testing.assert_allclose(beam_scaled, 2.0 * nominal, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(sky_scaled, 2.0 * nominal, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(coupled_scaled, nominal, rtol=1e-6, atol=1e-6)
+
+
 def test_forward_model_different_nside_beam_sky():
     """ForwardModel: works even if beam and sky have different nside."""
     freqs_hz = np.array([50e6, 100e6])
@@ -462,8 +487,7 @@ def test_transmitter_physics_formula(simple_fwd):
     """Transmitter contribution matches closed-form formula.
 
     For a transmitter at direction d (body frame) with power T_eff:
-        T_ant_tx(f) = T_eff * B(d, f) / sum_pix(B(pix, f))
-    where the sum is over all beam pixels.
+        T_ant_tx(f) = T_eff * B(d, f)
     """
     fwd = simple_fwd
     freqs_hz = fwd.beam.freqs_hz
@@ -491,14 +515,14 @@ def test_transmitter_physics_formula(simple_fwd):
     T_tx = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_tx))
     delta = (T_tx - T_no)[0, 0, :]   # (nfreq,) — single time, single dipole
 
-    # Closed-form: B(d_body) / sum_pix(B) * T_eff
+    # Closed-form: B(d_body) * T_eff
     # beam_recon: (npix_beam, nfreq)
     beam_recon = fwd.beam.coeffs[0] @ fwd.beam.basis.A.T
     # Beam value at zenith (body frame [0,0,1]) via healpy interpolation
     th_z, ph_z = healpy.vec2ang(np.array([[0., 0., 1.]]))
     px_z, wgts_z = healpy.get_interp_weights(fwd.beam.nside, th_z, ph_z)
     B_at_zenith = np.sum(beam_recon[px_z[:, 0]] * wgts_z[:, 0, None], axis=0)   # (nfreq,)
-    expected = T_eff * B_at_zenith / np.sum(beam_recon, axis=0)                  # (nfreq,)
+    expected = T_eff * B_at_zenith                                               # (nfreq,)
 
     np.testing.assert_allclose(delta, expected, rtol=1e-4)
 
@@ -751,7 +775,7 @@ def test_surface_terrain_controls_ground_cut():
     assert np.all(np.array(geom["terrain_masks_jax"]) == 0.0)
 
     T = np.array(fwd.simulate(sky_c, beam_c, geom=geom, T_gnd=300.0))
-    np.testing.assert_allclose(T, 275.0, atol=1e-5)
+    np.testing.assert_allclose(T, 275.0 * npix, atol=1e-5)
 
 
 def test_sky_mask_preserves_uniform_terrain_emission():
@@ -798,7 +822,7 @@ def test_sky_mask_preserves_uniform_terrain_emission():
     T_full = np.array(fwd.simulate(sky_c, beam_c, geom=geom_full, T_gnd=300.0))
     T_mask = np.array(fwd.simulate(sky_c, beam_c, geom=geom_mask, T_gnd=300.0))
 
-    np.testing.assert_allclose(T_full, 250.0, atol=1e-5)
+    np.testing.assert_allclose(T_full, 250.0 * npix, atol=1e-5)
     np.testing.assert_allclose(T_mask, T_full, atol=1e-5)
 
 

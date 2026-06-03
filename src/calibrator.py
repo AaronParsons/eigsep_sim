@@ -357,21 +357,22 @@ class Calibrator:
         return params.copy()
 
     def beam_cg_step(self, params: Dict[str, np.ndarray],
-                     n_cg: int = 50, lam: float = 1e-4) -> Dict[str, np.ndarray]:
+                     n_cg: int = 50, lam: float = 1e-4,
+                     cg_tol: float = 1e-3) -> Dict[str, np.ndarray]:
         """
         Beam coefficient update via Newton-CG (mirrors sky_step for the beam).
 
-        The loss is NOT quadratic in beam_coeffs (the beam normalization
-        denominator introduces nonlinearity), so this is the inner CG solve
-        of a truncated Newton iteration — multiple outer calls are needed.
-        Near the solution the convergence is superlinear; far away it still
-        beats gradient descent by using curvature information from jax.jvp.
+        With sky coefficients fixed, the forward model is linear in beam
+        coefficients, so the loss is quadratic. A single Newton-CG solve gives
+        the conditional beam minimizer up to the CG tolerance.
 
         Parameters
         ----------
         params : dict
         n_cg : int, optional
-            Max CG iterations per call (default 50).
+            Max CG iterations per call (default 50). Lower values give a
+            faster truncated Newton step that usually moves beam structure much
+            more than gradient descent while avoiding full CG cost.
         lam : float, optional
             Tikhonov regularization as fraction of current loss (default 1e-4).
             Scaled by loss_before so regularization is perturbation-size-independent.
@@ -405,7 +406,7 @@ class Calibrator:
             return h.ravel() + lam_abs * v
 
         delta, _ = jax.scipy.sparse.linalg.cg(
-            hvp_flat, -grad_val.ravel(), maxiter=n_cg, tol=1e-3
+            hvp_flat, -grad_val.ravel(), maxiter=n_cg, tol=cg_tol
         )
 
         beam_new = (beam_jax.ravel() + delta).reshape(beam_jax.shape)
@@ -605,7 +606,9 @@ class Calibrator:
             verbose: bool = True,
             use_cg: bool = False,
             use_joint: bool = False,
-            sky_step_size: float = 1.0) -> Dict:
+            sky_step_size: float = 1.0,
+            beam_cg_niter: int = 50,
+            beam_cg_tol: float = 1e-3) -> Dict:
         """
         Run calibration with Anderson-accelerated alternating sky/beam iteration.
 
@@ -649,6 +652,12 @@ class Calibrator:
         sky_step_size : float, optional
             Damping factor for the sky Newton step in alternating mode (default
             1.0 = full step). Ignored when use_joint=True.
+        beam_cg_niter : int, optional
+            Inner CG iterations for the beam step when use_cg=True (default 50).
+            Use small values such as 5-10 for a fast truncated Newton beam
+            update.
+        beam_cg_tol : float, optional
+            Inner CG tolerance for the beam step when use_cg=True (default 1e-3).
 
         Returns
         -------
@@ -687,7 +696,9 @@ class Calibrator:
                 # Alternating: sky first (near-exact quadratic solve), then beam.
                 params = self.sky_step(params, step_size=sky_step_size)
                 if use_cg:
-                    params = self.beam_cg_step(params)
+                    params = self.beam_cg_step(
+                        params, n_cg=beam_cg_niter, cg_tol=beam_cg_tol
+                    )
                 else:
                     params = self.beam_step(params)
 

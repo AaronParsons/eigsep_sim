@@ -200,8 +200,8 @@ class ForwardModel:
 
         Returns a function ``sim(sky_coeffs, beam_coeffs, terrain_masks,
         terrain_emissions, default_emission_masks, unresolved_emission,
-        unresolved_default_emission, beam_px, beam_wgts, T_gnd, tx_px,
-        tx_wgts)`` that is fully JAX-traceable.
+        unresolved_default_emission, unresolved_beam_weights, beam_px,
+        beam_wgts, T_gnd, tx_px, tx_wgts)`` that is fully JAX-traceable.
         Geometry-dependent rotations and HEALPix interpolation are cached by
         ``precompute_geometry()`` so repeated optimizer evaluations only gather
         beam samples and integrate the sky.
@@ -212,17 +212,13 @@ class ForwardModel:
         """
         A_sky = self._sky_basis_A_jax        # (nfreq, nmodes_sky)
         A_beam = self._beam_basis_A_jax      # (nfreq, nmodes_beam)
-        npix_beam = self.beam.npix           # static int
-        npix_sky = self.sky.npix             # static int
-        nside_beam = self.beam.nside         # static int — required by healjax
-        scale = float(npix_sky) / float(npix_beam)
         tx_T_jax = jnp.asarray(self._tx_T_internal, dtype=DTYPE_R_JAX)  # (n_src, nfreq)
 
         @jax.jit
         def _sim(sky_coeffs, beam_coeffs, terrain_masks, terrain_emissions,
                  default_emission_masks, unresolved_emission,
-                 unresolved_default_emission, beam_px_all, beam_wgts_all,
-                 T_gnd, tx_px_all, tx_wgts_all):
+                 unresolved_default_emission, unresolved_beam_weights_all,
+                 beam_px_all, beam_wgts_all, T_gnd, tx_px_all, tx_wgts_all):
             """
             sky_coeffs    : (npix_vis, nmodes_sky)
             beam_coeffs   : (n_dipoles, npix_beam, nmodes_beam)
@@ -231,6 +227,7 @@ class ForwardModel:
             default_emission_masks : (ntimes, npix_vis) float32  T_gnd fallback factor
             unresolved_emission : (nfreq,) float32  omitted-pixel brightness
             unresolved_default_emission : (nfreq,) float32  omitted-pixel T_gnd factor
+            unresolved_beam_weights_all : (ntimes, npix_beam) float32 omitted-pixel beam sampling accumulator
             beam_px_all   : (ntimes, 4, npix_vis)     int32    cached beam pixels
             beam_wgts_all : (ntimes, 4, npix_vis)     float32  cached beam weights
             T_gnd         : scalar [K]
@@ -240,13 +237,11 @@ class ForwardModel:
             """
             sky_recon = sky_coeffs @ A_sky.T          # (npix_vis, nfreq)
             beam_recon_all = beam_coeffs @ A_beam.T   # (n_dipoles, npix_beam, nfreq)
-            den_all = jnp.sum(beam_recon_all, axis=1) * scale  # (n_dipoles, nfreq)
-
             def one_time(_, args):
-                terrain_mask, terrain_emit, default_emit_mask, px, wgts, tx_px, tx_wgts = args
+                terrain_mask, terrain_emit, default_emit_mask, unresolved_beam_weights, px, wgts, tx_px, tx_wgts = args
                 mask = terrain_mask                                # (npix_vis,)
 
-                def one_dipole(beam_recon_d, den_d):  # (npix_beam, nfreq), (nfreq,)
+                def one_dipole(beam_recon_d):
                     # Accumulate 4 bilinear neighbors without materialising (4,npix,nfreq)
                     beam_at_sky = jax.lax.fori_loop(
                         0, 4,
@@ -264,7 +259,7 @@ class ForwardModel:
                     # Pixels omitted by sky_mask use the terrain-provided
                     # unresolved spectrum. Sampled observer-only occultation
                     # still uses the scalar T_gnd fallback.
-                    unresolved_weight = den_d - sampled_weight
+                    unresolved_weight = unresolved_beam_weights @ beam_recon_d
                     num = (
                         sky_num
                         + terrain_num
@@ -282,9 +277,9 @@ class ForwardModel:
                         jnp.zeros_like(tx_T_jax),
                     )                                  # (n_sources, nfreq)
                     num = num + jnp.sum(beam_at_tx * tx_T_jax, axis=0)  # (nfreq,)
-                    return num / den_d
+                    return num
 
-                return None, jax.vmap(one_dipole)(beam_recon_all, den_all)
+                return None, jax.vmap(one_dipole)(beam_recon_all)
 
             _, antenna_temp = jax.lax.scan(
                 one_time, None,
@@ -292,6 +287,7 @@ class ForwardModel:
                     terrain_masks,
                     terrain_emissions,
                     default_emission_masks,
+                    unresolved_beam_weights_all,
                     beam_px_all,
                     beam_wgts_all,
                     tx_px_all,
@@ -342,6 +338,7 @@ class ForwardModel:
             - 'default_emission_masks_jax': (ntimes, npix_vis) float32 — T_gnd fallback factor
             - 'unresolved_emission_jax': (nfreq,) float32 — omitted-pixel brightness
             - 'unresolved_default_emission_jax': (nfreq,) float32 — omitted-pixel T_gnd factor
+            - 'unresolved_beam_weights_jax': (ntimes, npix_beam) float32 — omitted-pixel beam sampling accumulator
             - 'crds_gal_jax': (3, npix_vis) float32 — galactic unit vectors (filtered by sky_mask)
             - 'tx_crds_jax': (ntimes, n_sources, 3) float32 — TX body-frame directions
             - 'beam_px_jax': (ntimes, 4, npix_vis) int32 — cached beam interpolation pixels
@@ -577,6 +574,34 @@ class ForwardModel:
         beam_px, beam_wgts = healpy.get_interp_weights(
             self.beam.nside, beam_th, beam_ph
         )
+        if sky_mask is not None:
+            omitted_crds_gal = self._crds_gal[:, ~sky_mask_np]
+            omitted_crds_body = body_rots_arr @ (R_arr @ omitted_crds_gal)
+            omitted_th = np.arccos(
+                np.clip(omitted_crds_body[:, 2], -1.0, 1.0)
+            )
+            omitted_ph = np.mod(
+                np.arctan2(omitted_crds_body[:, 1], omitted_crds_body[:, 0]),
+                2.0 * np.pi,
+            )
+            omitted_px, omitted_wgts = healpy.get_interp_weights(
+                self.beam.nside, omitted_th, omitted_ph
+            )
+            unresolved_beam_weights = np.zeros(
+                (ntimes, self.beam.npix), dtype=np.float32
+            )
+            for time_index in range(ntimes):
+                for neighbor_index in range(4):
+                    np.add.at(
+                        unresolved_beam_weights[time_index],
+                        omitted_px[neighbor_index, time_index],
+                        omitted_wgts[neighbor_index, time_index],
+                    )
+        else:
+            unresolved_beam_weights = np.zeros(
+                (ntimes, self.beam.npix), dtype=np.float32
+            )
+
         if n_sources > 0:
             tx_th = np.arccos(np.clip(tx_body[:, :, 2], -1.0, 1.0))
             tx_ph = np.mod(np.arctan2(tx_body[:, :, 1], tx_body[:, :, 0]), 2.0 * np.pi)
@@ -608,6 +633,9 @@ class ForwardModel:
         geom['unresolved_default_emission_jax'] = jnp.asarray(
             unresolved_default_emission, dtype=DTYPE_R_JAX
         )
+        geom['unresolved_beam_weights_jax'] = jnp.asarray(
+            unresolved_beam_weights, dtype=DTYPE_R_JAX
+        )
         geom['crds_gal_jax'] = jnp.asarray(crds_gal, dtype=DTYPE_R_JAX)
         geom['tx_crds_jax'] = jnp.asarray(tx_body, dtype=DTYPE_R_JAX)
         if sky_indices is not None:
@@ -615,7 +643,7 @@ class ForwardModel:
         return geom
 
     def sample_beam_weights(self, geom, freq_index, beam_coeffs=None):
-        """Sample normalized beam weights for linear recovery diagnostics."""
+        """Sample beam weights for linear recovery diagnostics."""
         from .recovery import sample_beam_weights
 
         return sample_beam_weights(self, geom, freq_index, beam_coeffs)
@@ -686,6 +714,7 @@ class ForwardModel:
             geom['default_emission_masks_jax'],
             geom['unresolved_emission_jax'],
             geom['unresolved_default_emission_jax'],
+            geom['unresolved_beam_weights_jax'],
             geom['beam_px_jax'],
             geom['beam_wgts_jax'],
             jnp.asarray(T_gnd, dtype=DTYPE_R_JAX),

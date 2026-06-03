@@ -90,11 +90,36 @@ def make_geometry(fwd, args):
     return fwd.precompute_geometry(rots=rots, body_rots=body_rots)
 
 
+def sampled_beam_weights(geom, beam_coeffs, beam_basis_A):
+    """Return per-sample integrated beam weights in simulator units."""
+    beam_maps = beam_coeffs @ beam_basis_A.T
+    pixels = np.asarray(geom["beam_px_jax"])
+    weights = np.asarray(geom["beam_wgts_jax"])
+    ntimes = pixels.shape[0]
+    n_dipoles, _, nfreq = beam_maps.shape
+    beam_weights = np.zeros((ntimes, n_dipoles, nfreq), dtype=float)
+    for freq_index in range(nfreq):
+        for dipole_index in range(n_dipoles):
+            beam_map = beam_maps[dipole_index, :, freq_index]
+            beam_weights[:, dipole_index, freq_index] = sum(
+                (
+                    beam_map[pixels[:, neighbor_index, :]]
+                    * weights[:, neighbor_index, :]
+                ).sum(axis=1)
+                for neighbor_index in range(4)
+            )
+    return beam_weights
+
+
 def solver_options(name):
     if name == "alternating":
         return {}
     if name == "damped":
         return {"sky_step_size": 0.5}
+    if name == "fast-cg":
+        return {"use_cg": True, "beam_cg_niter": 8, "beam_cg_tol": 1e-2}
+    if name == "cg":
+        return {"use_cg": True}
     if name == "joint":
         return {"use_joint": True}
     raise ValueError(f"unknown solver {name}")
@@ -173,12 +198,14 @@ def main(args):
     beam_map_true = beam_coeffs @ fwd.beam.basis.A.T
     delta_nu_hz = float(np.diff(fwd.beam.freqs_hz).mean())
     tau_s = 86400.0 / (args.ntimes * args.naz * args.nalt)
-    sigma_noise = (sky_map_true.mean(axis=0) + args.t_rx_k) / np.sqrt(
-        delta_nu_hz * tau_s
-    )
+    beam_weight = sampled_beam_weights(geom, beam_coeffs, fwd.beam.basis.A)
+    sigma_noise = (
+        np.abs(np.asarray(antenna_temp))
+        + args.t_rx_k * np.abs(beam_weight)
+    ) / np.sqrt(delta_nu_hz * tau_s)
     rng = np.random.default_rng(args.seed)
     data = np.asarray(antenna_temp) + rng.normal(
-        scale=sigma_noise[None, None, :], size=antenna_temp.shape
+        scale=sigma_noise, size=antenna_temp.shape
     )
     params_ini = {
         "sky_coeffs": sky_coeffs
@@ -187,7 +214,7 @@ def main(args):
         * rng.uniform(0.9, 1.1, size=beam_coeffs.shape),
     }
     solvers = (
-        ["alternating", "damped", "joint"]
+        ["alternating", "damped", "fast-cg", "cg", "joint"]
         if args.solver == "all"
         else [args.solver]
     )
@@ -197,7 +224,7 @@ def main(args):
             fwd,
             geom,
             data,
-            1.0 / sigma_noise[None, :] ** 2,
+            1.0 / sigma_noise.reshape(-1, args.nfreq) ** 2,
             params_ini,
             (sky_map_true, beam_map_true),
             args,
@@ -209,7 +236,7 @@ if __name__ == "__main__":
     parser.add_argument("--sky", choices=["gsm", "synthetic"], default="gsm")
     parser.add_argument(
         "--solver",
-        choices=["alternating", "damped", "joint", "all"],
+        choices=["alternating", "damped", "fast-cg", "cg", "joint", "all"],
         default="alternating",
     )
     parser.add_argument("--nside-sky", type=int, default=16)

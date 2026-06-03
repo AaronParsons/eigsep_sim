@@ -9,7 +9,7 @@ import numpy as np
 
 
 def sample_beam_weights(fwd, geom, freq_index, beam_coeffs=None):
-    """Sample normalized body-frame beams onto Galactic sky pixels.
+    """Sample body-frame beams onto Galactic sky pixels.
 
     Parameters
     ----------
@@ -25,7 +25,7 @@ def sample_beam_weights(fwd, geom, freq_index, beam_coeffs=None):
     Returns
     -------
     ndarray
-        Normalized weights with shape ``(ntime, ndipole, npix)``.
+        Beam weights with shape ``(ntime, ndipole, npix)``.
     """
     if beam_coeffs is None:
         beam_coeffs = fwd.beam.coeffs
@@ -37,7 +37,6 @@ def sample_beam_weights(fwd, geom, freq_index, beam_coeffs=None):
     weights = np.empty(
         (len(rots), beam_maps.shape[0], sky_dirs.shape[1]), dtype=float
     )
-    scale = fwd.sky.npix / fwd.beam.npix
     for time_index, directions in enumerate(body_dirs):
         theta, phi = healjax.vec2ang(
             directions[0], directions[1], directions[2]
@@ -50,9 +49,7 @@ def sample_beam_weights(fwd, geom, freq_index, beam_coeffs=None):
                 beam_map[np.asarray(pixels[k])] * np.asarray(interp_weights[k])
                 for k in range(4)
             )
-            weights[time_index, dipole_index] = sampled / (
-                beam_map.sum() * scale
-            )
+            weights[time_index, dipole_index] = sampled
     return weights
 
 
@@ -71,7 +68,7 @@ def build_surface_design_matrix(
     Parameters
     ----------
     weights : ndarray, shape (nobs, ndipole, npix)
-        Normalized beam weights for sky pixels.
+        Beam weights for sky pixels.
     masks : ndarray, shape (nobs, npix)
         Visibility factors, where one means visible sky.
     unresolved_surface_weight : ndarray, shape (nobs, ndipole), optional

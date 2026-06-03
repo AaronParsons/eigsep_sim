@@ -130,9 +130,9 @@ def main(args):
     ).astype(np.float32)
     inv_noise_var = np.full(data.shape, 1.0 / sigma_noise**2, dtype=np.float32)
 
-    # Scale perturbation (degenerate) — used only for step timing
-    # A uniform scale of beam_coeffs cancels exactly in the normalized antenna
-    # temperature: T_ant = (α·B @ sky) / (α·Σ B) = B @ sky / Σ B for any α.
+    # Scale perturbation used only for step timing. In the unnormalized
+    # simulator, sky and beam carry a coupled scale degeneracy: (α sky, B/α)
+    # leaves the modeled spectra unchanged.
     params_scale_pert = {
         'sky_coeffs':  gsm_coeffs * 1.2,
         'beam_coeffs': beam_coeffs_true * 0.9,

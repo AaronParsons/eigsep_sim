@@ -453,17 +453,13 @@ class Beam:
         # Note: K is limited by min(npix, nfreq)
         max_rank = min(npix, len(freqs_hz))
         K_actual = min(K, max_rank)
-        coeffs = np.zeros((n_dipoles, npix, K_actual), dtype=DTYPE_R_NPY)
-
-        for d in range(n_dipoles):
-            B_d = nominal_beam[d]  # (npix, nfreq)
-            U, s, Vt = np.linalg.svd(B_d, full_matrices=False)
-            coeffs[d] = (U[:, :K_actual] * s[:K_actual])  # (npix, K_actual)
-
-        # Build shared basis from averaged dipole
+        # Build a shared spectral basis from the averaged dipole. Project each
+        # physical dipole map into that basis so coefficient signs and scales
+        # match the shared basis rather than an independent per-dipole SVD.
         B_avg = np.mean(nominal_beam, axis=0)
         U, s, Vt = np.linalg.svd(B_avg, full_matrices=False)
         basis_A = Vt[:K_actual].T  # (nfreq, K_actual)
+        coeffs = nominal_beam @ basis_A  # (n_dipoles, npix, K_actual)
         basis = BeamBasis(basis_A, freqs_hz=freqs_hz)
 
         return cls(nside, freqs_hz, basis, coeffs, u_body=u_body)
