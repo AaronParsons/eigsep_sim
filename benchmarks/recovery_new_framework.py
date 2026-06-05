@@ -120,6 +120,18 @@ def solver_options(name, args):
             "solver": "adaptive-fixed-point",
             "lambda_damp": args.lambda_damp,
         }
+    if name == "adaptive-scheduled":
+        return {
+            "solver": "adaptive-scheduled",
+            "lambda_damp": args.lambda_damp,
+            "schedule_max_every": {
+                "sky": args.schedule_sky_max_every,
+                "beam": args.schedule_beam_max_every,
+                "joint": args.schedule_joint_max_every,
+            },
+            "schedule_eff_alpha": args.schedule_eff_alpha,
+            "schedule_step_gain_factor": args.schedule_step_gain_factor,
+        }
     if name == "hybrid-lbfgs":
         return {
             "solver": "hybrid-lbfgs",
@@ -265,7 +277,14 @@ def main(args):
         * rng.uniform(0.9, 1.1, size=beam_coeffs.shape),
     }
     solvers = (
-        ["adaptive-fixed-point", "fast-cg", "cg", "joint", "alternating"]
+        [
+            "adaptive-scheduled",
+            "adaptive-fixed-point",
+            "fast-cg",
+            "cg",
+            "joint",
+            "alternating",
+        ]
         if args.solver == "all"
         else [args.solver]
     )
@@ -319,6 +338,7 @@ if __name__ == "__main__":
         choices=[
             "adaptive-fixed-point",
             "hybrid-lbfgs",
+            "adaptive-scheduled",
             "alternating",
             "fast-cg",
             "cg",
@@ -341,6 +361,11 @@ if __name__ == "__main__":
     parser.add_argument("--lam-beam", type=float, default=0.01)
     parser.add_argument("--m-anderson", type=int, default=5)
     parser.add_argument("--lambda-damp", type=float, default=1e-1)
+    parser.add_argument("--schedule-sky-max-every", type=int, default=5)
+    parser.add_argument("--schedule-beam-max-every", type=int, default=2)
+    parser.add_argument("--schedule-joint-max-every", type=int, default=4)
+    parser.add_argument("--schedule-eff-alpha", type=float, default=0.3)
+    parser.add_argument("--schedule-step-gain-factor", type=float, default=2.0)
     parser.add_argument("--beam-cg-niter", type=int, default=8)
     parser.add_argument("--beam-cg-tol", type=float, default=1e-2)
     parser.add_argument("--t-rx-k", type=float, default=100.0)

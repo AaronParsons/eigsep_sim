@@ -642,6 +642,50 @@ def test_calibrator_adaptive_fit_monotonic_and_telemetry():
         assert key in result["telemetry"][0]
 
 
+def test_calibrator_adaptive_scheduled_runs_and_records_state():
+    """Scheduled adaptive solver tracks block efficiencies and cadence state."""
+    fwd = setup_forward_model()
+    times = [Time("2000-01-01"), Time("2000-01-01 00:01:00")]
+    geom = fwd.precompute_geometry(times=times)
+    data = np.asarray(
+        fwd.simulate(fwd.sky.init_coeffs(), fwd.beam.coeffs, geom=geom)
+    )
+    cal = Calibrator(fwd, data, lam_beam=0.0)
+    params = cal.init_params(geom=geom)
+    params["sky_coeffs"] = fwd.sky.init_coeffs() * 0.85
+    params["beam_coeffs"] = fwd.beam.coeffs * 1.15
+    loss_before = float(cal._loss(params))
+
+    result = cal.fit(
+        params=params,
+        max_iter=5,
+        verbose=False,
+        solver="adaptive-scheduled",
+        schedule_max_every={"sky": 2, "beam": 2, "joint": 2},
+    )
+
+    assert result["solver"] == "adaptive-scheduled"
+    assert result["losses"][-1] <= loss_before
+    assert len(result["telemetry"]) == result["n_iter"]
+    blocks = {entry["scheduled_block"] for entry in result["telemetry"]}
+    assert len(blocks) >= 2
+    first = result["telemetry"][0]
+    for key in (
+        "scheduled_block",
+        "schedule_reason",
+        "schedule_eff_sky",
+        "schedule_eff_beam",
+        "schedule_eff_joint",
+        "schedule_n_since_sky",
+        "schedule_n_since_beam",
+        "schedule_n_since_joint",
+        "schedule_step_gain_sky",
+        "schedule_step_gain_beam",
+        "schedule_step_gain_joint",
+    ):
+        assert key in first
+
+
 def test_calibrator_scale_projection_preserves_sky_beam_product():
     """Scale projection fixes beam RMS gauge while preserving multiplicative data."""
     fwd = setup_forward_model()

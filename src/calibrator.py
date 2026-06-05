@@ -738,6 +738,7 @@ class Calibrator:
         allow_cg_fallback=True,
         beam_cg_niter=5,
         beam_cg_tol=1e-2,
+        blocks=("joint", "sky", "beam"),
     ):
         pred = self.fwd.simulate(
             params["sky_coeffs"], params["beam_coeffs"], geom=self._geom
@@ -790,7 +791,12 @@ class Calibrator:
         best = params
         best_loss = loss_before
         best_type = "none"
+        all_blocks = ("joint", "sky", "beam")
+        blocks = tuple(blocks)
         candidate_summary = {}
+        for block in all_blocks:
+            candidate_summary[f"{block}_step"] = 0.0
+            candidate_summary[f"{block}_loss"] = np.nan
 
         def make_candidate(block, step):
             candidate = params.copy()
@@ -815,7 +821,7 @@ class Calibrator:
                 )
             return self._project_scale_degeneracy(candidate)
 
-        for block in ("joint", "sky", "beam"):
+        for block in blocks:
             step = float(step0)
             block_best = None
             block_best_loss = loss_before
@@ -890,11 +896,16 @@ class Calibrator:
         beam_cg_niter: int = 50,
         beam_cg_tol: float = 1e-3,
         lambda_damp: float = 1e-2,
+        schedule_max_every: Optional[Dict[str, int]] = None,
+        schedule_eff_alpha: float = 0.3,
+        schedule_step_gain_factor: float = 2.0,
+        schedule_min_step: float = 1e-4,
     ) -> Dict:
         """Run calibration.
 
-        ``solver`` may be ``adaptive-fixed-point`` (default), ``hybrid-lbfgs``,
-        ``fast-cg``, ``cg``, ``joint``, or ``alternating``. The legacy boolean
+        ``solver`` may be ``adaptive-fixed-point`` (default),
+        ``adaptive-scheduled``, ``hybrid-lbfgs``, ``fast-cg``, ``cg``,
+        ``joint``, or ``alternating``. The legacy boolean
         controls remain accepted: ``use_joint=True`` selects ``joint`` and
         ``use_cg=True`` selects ``cg`` when the default solver is not explicitly
         overridden.
@@ -951,19 +962,59 @@ class Calibrator:
         telemetry = []
         converged = False
         previous_loss = float(self._loss(params))
+        scheduler = None
+        if solver == "adaptive-scheduled":
+            max_every = {"sky": 5, "beam": 2, "joint": 4}
+            if schedule_max_every is not None:
+                max_every.update(schedule_max_every)
+            scheduler = {
+                "priority": ("beam", "joint", "sky"),
+                "max_every": max_every,
+                "eff": {"sky": None, "beam": None, "joint": None},
+                "n_since": {"sky": 0, "beam": 0, "joint": 0},
+                "step_gain": {"sky": 1.0, "beam": 1.0, "joint": 1.0},
+            }
+
+        def choose_scheduled_block():
+            overdue = {}
+            for block, max_count in scheduler["max_every"].items():
+                if max_count and max_count > 0:
+                    n_since = scheduler["n_since"][block]
+                    if n_since >= max_count:
+                        overdue[block] = n_since / max_count
+            if overdue:
+                return max(overdue, key=overdue.get), "overdue"
+            for block in scheduler["priority"]:
+                if scheduler["eff"][block] is None:
+                    return block, "unmeasured"
+            return (
+                max(scheduler["priority"], key=lambda b: scheduler["eff"][b]),
+                "efficiency",
+            )
 
         for iteration in range(max_iter):
             tic = time.perf_counter()
             beam_old = params["beam_coeffs"].copy()
             step_extra = {}
 
-            if solver == "adaptive-fixed-point":
+            scheduled_block = None
+            schedule_reason = None
+            if solver in ("adaptive-fixed-point", "adaptive-scheduled"):
+                step0 = 1.0
+                blocks = ("joint", "sky", "beam")
+                if solver == "adaptive-scheduled":
+                    scheduled_block, schedule_reason = choose_scheduled_block()
+                    blocks = (scheduled_block,)
+                    step0 = scheduler["step_gain"][scheduled_block]
                 params, loss, step_type, step_extra = (
                     self._adaptive_fixed_point_step(
                         params,
                         lambda_damp=lambda_damp,
+                        step0=step0,
+                        min_step=schedule_min_step,
                         beam_cg_niter=min(beam_cg_niter, 10),
                         beam_cg_tol=beam_cg_tol,
+                        blocks=blocks,
                     )
                 )
             elif solver == "joint":
@@ -1013,6 +1064,36 @@ class Calibrator:
 
             wall_time = time.perf_counter() - tic
             delta = previous_loss - loss
+            if scheduler is not None:
+                eff = max(0.0, delta) / (
+                    max(abs(previous_loss), 1e-30) * max(wall_time, 1e-30)
+                )
+                block = scheduled_block
+                if block is not None:
+                    old_eff = scheduler["eff"][block]
+                    if old_eff is None:
+                        scheduler["eff"][block] = eff
+                    else:
+                        ema = (
+                            schedule_eff_alpha * eff
+                            + (1.0 - schedule_eff_alpha) * old_eff
+                        )
+                        scheduler["eff"][block] = min(ema, eff)
+                    accepted_step = float(step_extra.get(f"{block}_step", 0.0))
+                    old_gain = scheduler["step_gain"][block]
+                    if accepted_step > 0.0:
+                        if accepted_step >= 0.99 * old_gain:
+                            new_gain = old_gain * schedule_step_gain_factor
+                        else:
+                            new_gain = accepted_step
+                    else:
+                        new_gain = old_gain / schedule_step_gain_factor
+                    scheduler["step_gain"][block] = max(
+                        schedule_min_step, min(1.0, float(new_gain))
+                    )
+                    for name in scheduler["n_since"]:
+                        scheduler["n_since"][name] += 1
+                    scheduler["n_since"][block] = 0
             losses.append(loss)
             entry = {
                 "iteration": iteration,
@@ -1026,6 +1107,30 @@ class Calibrator:
                 "beam_scatter": float(np.std(params["beam_coeffs"])),
                 "beam_roughness": self._beam_roughness(params["beam_coeffs"]),
             }
+            if scheduler is not None:
+                entry.update(
+                    {
+                        "scheduled_block": scheduled_block,
+                        "schedule_reason": schedule_reason,
+                        "schedule_eff_sky": scheduler["eff"]["sky"],
+                        "schedule_eff_beam": scheduler["eff"]["beam"],
+                        "schedule_eff_joint": scheduler["eff"]["joint"],
+                        "schedule_n_since_sky": scheduler["n_since"]["sky"],
+                        "schedule_n_since_beam": scheduler["n_since"]["beam"],
+                        "schedule_n_since_joint": scheduler["n_since"][
+                            "joint"
+                        ],
+                        "schedule_step_gain_sky": scheduler["step_gain"][
+                            "sky"
+                        ],
+                        "schedule_step_gain_beam": scheduler["step_gain"][
+                            "beam"
+                        ],
+                        "schedule_step_gain_joint": scheduler["step_gain"][
+                            "joint"
+                        ],
+                    }
+                )
             entry.update(step_extra)
             telemetry.append(entry)
 
