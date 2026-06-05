@@ -95,6 +95,7 @@ def test_calibrator_basic():
     assert cal._data.shape == data.shape
     assert cal._lam_beam == 0.01
     assert cal._lam_sky == 0.0
+    assert cal._lam_beam_harmonic == 1e5
 
 
 def test_calibrator_init_params():
@@ -686,6 +687,41 @@ def test_calibrator_adaptive_scheduled_runs_and_records_state():
         assert key in first
 
 
+def test_calibrator_beam_harmonic_regularizer_penalizes_shape():
+    """Harmonic beam prior penalizes high-ell shape changes from nominal."""
+    fwd = setup_forward_model()
+    times = [Time("2000-01-01"), Time("2000-01-01 00:01:00")]
+    geom = fwd.precompute_geometry(times=times)
+    data = np.asarray(
+        fwd.simulate(fwd.sky.init_coeffs(), fwd.beam.coeffs, geom=geom)
+    )
+    cal = Calibrator(
+        fwd,
+        data,
+        lam_beam=0.0,
+        lam_beam_harmonic=1e-2,
+        beam_harmonic_lmin=2,
+        beam_harmonic_lmax=5,
+    )
+    params = cal.init_params(geom=geom)
+    assert cal._beam_harmonic_penalty(params["beam_coeffs"]) == 0.0
+
+    pix = np.arange(fwd.beam.npix)
+    perturb = ((pix % 2) * 2.0 - 1.0)[None, :, None]
+    params["beam_coeffs"] = params["beam_coeffs"] + 0.05 * perturb
+    assert cal._beam_harmonic_penalty(params["beam_coeffs"]) > 0.0
+
+    params["sky_coeffs"] = fwd.sky.init_coeffs() * 0.9
+    result = cal.fit(
+        params=params,
+        max_iter=2,
+        verbose=False,
+        solver="adaptive-scheduled",
+        schedule_max_every={"sky": 2, "beam": 1, "joint": 2},
+    )
+    assert "beam_harmonic_penalty" in result["telemetry"][0]
+
+
 def test_calibrator_adaptive_scheduled_lbfgs_block_runs_when_enabled():
     """Scheduled adaptive solver can include short L-BFGS bursts."""
     pytest.importorskip("jaxopt")
@@ -713,10 +749,13 @@ def test_calibrator_adaptive_scheduled_lbfgs_block_runs_when_enabled():
         entry.get("scheduled_block") == "lbfgs"
         for entry in result["telemetry"]
     )
-    assert any(
-        str(entry.get("step_type", "")).startswith("lbfgs")
+    lbfgs_entries = [
+        entry
         for entry in result["telemetry"]
-    )
+        if str(entry.get("step_type", "")).startswith("lbfgs")
+    ]
+    assert len(lbfgs_entries) == 1
+    assert lbfgs_entries[0]["schedule_n_run_lbfgs"] == 1
 
 
 def test_calibrator_scale_projection_preserves_sky_beam_product():

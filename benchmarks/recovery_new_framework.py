@@ -134,6 +134,7 @@ def solver_options(name, args):
             "schedule_lbfgs_max_every": args.schedule_lbfgs_max_every,
             "schedule_lbfgs_min_iter": args.schedule_lbfgs_min_iter,
             "schedule_lbfgs_maxiter": args.schedule_lbfgs_maxiter,
+            "schedule_lbfgs_max_runs": args.schedule_lbfgs_max_runs,
         }
     if name == "hybrid-lbfgs":
         return {
@@ -169,6 +170,10 @@ def run_solver(
         m_anderson=args.m_anderson,
         lam_beam=args.lam_beam,
         lam_sky=0.0,
+        lam_beam_harmonic=args.lam_beam_harmonic,
+        beam_harmonic_lmin=args.beam_harmonic_lmin,
+        beam_harmonic_lmax=args.beam_harmonic_lmax,
+        beam_harmonic_power=args.beam_harmonic_power,
     )
     calibrator._geom = geom
     calibrator._beam_nom = fwd.beam.coeffs.copy()
@@ -213,6 +218,10 @@ def run_solver(
             ),
             "beam_roughness_initial": telemetry[0].get("beam_roughness"),
             "beam_roughness_final": last.get("beam_roughness"),
+            "beam_harmonic_penalty_initial": telemetry[0].get(
+                "beam_harmonic_penalty"
+            ),
+            "beam_harmonic_penalty_final": last.get("beam_harmonic_penalty"),
             "beam_shape_update_rms_final": last.get("beam_shape_update_rms"),
             "beam_scale_update_rms_final": last.get("beam_scale_update_rms"),
             "joint_beam_shape_update_rms_final": last.get(
@@ -367,6 +376,15 @@ if __name__ == "__main__":
     parser.add_argument("--max-iter", type=int, default=30)
     parser.add_argument("--tol", type=float, default=1e-4)
     parser.add_argument("--lam-beam", type=float, default=0.01)
+    parser.add_argument(
+        "--lam-beam-harmonic",
+        type=float,
+        default=1e5,
+        help="High-ell spherical-harmonic beam-shape prior strength.",
+    )
+    parser.add_argument("--beam-harmonic-lmin", type=int, default=4)
+    parser.add_argument("--beam-harmonic-lmax", type=int, default=None)
+    parser.add_argument("--beam-harmonic-power", type=float, default=1.0)
     parser.add_argument("--m-anderson", type=int, default=5)
     parser.add_argument("--lambda-damp", type=float, default=1e-1)
     parser.add_argument("--schedule-sky-max-every", type=int, default=5)
@@ -382,6 +400,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--schedule-lbfgs-min-iter", type=int, default=20)
     parser.add_argument("--schedule-lbfgs-maxiter", type=int, default=3)
+    parser.add_argument(
+        "--schedule-lbfgs-max-runs",
+        type=int,
+        default=1,
+        help="Maximum scheduled L-BFGS blocks; <=0 allows unlimited runs.",
+    )
     parser.add_argument("--beam-cg-niter", type=int, default=8)
     parser.add_argument("--beam-cg-tol", type=float, default=1e-2)
     parser.add_argument("--t-rx-k", type=float, default=100.0)

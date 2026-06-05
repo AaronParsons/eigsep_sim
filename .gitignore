@@ -13,6 +13,7 @@ dist/
 .eigsep_cache/
 .sim_cache/
 notebooks/jax_profile/
+benchmarks/results/
 
 # Jupyter
 .ipynb_checkpoints/

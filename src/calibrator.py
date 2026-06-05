@@ -135,6 +135,10 @@ class Calibrator:
         Beam regularization strength (default 0.01).
     lam_sky : float, optional
         Sky regularization strength (default 0.0).
+    lam_beam_harmonic : float, optional
+        Spherical-harmonic beam-shape regularization strength. Penalizes
+        high-ell structure in reconstructed beam maps relative to the nominal
+        beam. Disabled by default.
     """
 
     def __init__(
@@ -145,6 +149,10 @@ class Calibrator:
         m_anderson: int = 5,
         lam_beam: float = 0.01,
         lam_sky: float = 0.0,
+        lam_beam_harmonic: float = 1e5,
+        beam_harmonic_lmin: int = 4,
+        beam_harmonic_lmax: Optional[int] = None,
+        beam_harmonic_power: float = 1.0,
     ):
         """
         Initialize Calibrator.
@@ -163,6 +171,14 @@ class Calibrator:
             Beam regularization.
         lam_sky : float, optional
             Sky regularization.
+        lam_beam_harmonic : float, optional
+            Spherical-harmonic beam-shape regularization.
+        beam_harmonic_lmin : int, optional
+            Lowest spherical-harmonic ell to penalize.
+        beam_harmonic_lmax : int, optional
+            Maximum ell used to build the harmonic penalty operator.
+        beam_harmonic_power : float, optional
+            Power-law exponent applied to ell(ell+1) weights.
         """
         self.fwd = fwd
         self._data = np.asarray(data, dtype=DTYPE_R_NPY)
@@ -173,6 +189,15 @@ class Calibrator:
         )
         self._lam_beam = float(lam_beam)
         self._lam_sky = float(lam_sky)
+        self._lam_beam_harmonic = float(lam_beam_harmonic)
+        self._beam_harmonic_lmin = int(beam_harmonic_lmin)
+        self._beam_harmonic_lmax = (
+            None if beam_harmonic_lmax is None else int(beam_harmonic_lmax)
+        )
+        self._beam_harmonic_power = float(beam_harmonic_power)
+        self._beam_harmonic_q = None
+        self._beam_harmonic_q_jax = None
+        self._beam_harmonic_diag = None
         self._data_flat_jax = jnp.reshape(
             jnp.asarray(self._data, dtype=DTYPE_R_JAX),
             (-1, self._data.shape[-1]),
@@ -295,6 +320,13 @@ class Calibrator:
             beam_nom_jax = jnp.asarray(self._beam_nom)
             beam_diff = params["beam_coeffs"] - beam_nom_jax
             loss = loss + self._lam_beam * jnp.mean(beam_diff**2)
+
+        # Harmonic beam-shape regularization. This damps high-ell spatial
+        # structure in reconstructed beam maps at each frequency.
+        if self._lam_beam_harmonic > 0:
+            loss = loss + self._lam_beam_harmonic * (
+                self._beam_harmonic_penalty_jax(params["beam_coeffs"])
+            )
 
         # Sky regularization (ridge toward zero)
         if self._lam_sky > 0:
@@ -697,6 +729,122 @@ class Calibrator:
             return 0.0
         return float(np.sqrt(np.mean(np.diff(beam, axis=1) ** 2)))
 
+    def _ensure_beam_harmonic_regularizer(self):
+        """Build the dense pixel-space high-ell harmonic penalty operator."""
+        if self._beam_harmonic_q is not None:
+            return self._beam_harmonic_q
+        if self._lam_beam_harmonic <= 0:
+            return None
+
+        import healpy
+
+        nside = int(self.fwd.beam.nside)
+        npix = int(self.fwd.beam.npix)
+        lmax_default = 3 * nside - 1
+        lmax = (
+            lmax_default
+            if self._beam_harmonic_lmax is None
+            else min(int(self._beam_harmonic_lmax), lmax_default)
+        )
+        lmin = max(0, int(self._beam_harmonic_lmin))
+        if lmax < lmin:
+            q = np.zeros((npix, npix), dtype=DTYPE_R_NPY)
+        else:
+            ell, _ = healpy.Alm.getlm(lmax)
+            weights = np.zeros_like(ell, dtype=DTYPE_R_NPY)
+            active = ell >= lmin
+            if np.any(active):
+                ell_norm = max(float(lmin * (lmin + 1)), 1.0)
+                weights[active] = (
+                    ell[active] * (ell[active] + 1.0) / ell_norm
+                ) ** self._beam_harmonic_power
+
+            q = np.empty((npix, npix), dtype=DTYPE_R_NPY)
+            unit = np.zeros(npix, dtype=DTYPE_R_NPY)
+            for pix in range(npix):
+                unit[pix] = 1.0
+                alm = healpy.map2alm(
+                    unit, lmax=lmax, iter=0, pol=False, use_weights=False
+                )
+                q[:, pix] = healpy.alm2map(
+                    alm * weights, nside, lmax=lmax, pol=False
+                )
+                unit[pix] = 0.0
+            q = 0.5 * (q + q.T)
+
+        self._beam_harmonic_q = np.asarray(q, dtype=DTYPE_R_NPY)
+        self._beam_harmonic_q_jax = jnp.asarray(
+            self._beam_harmonic_q, dtype=DTYPE_R_JAX
+        )
+        q_diag = np.clip(np.diag(self._beam_harmonic_q), 0.0, np.inf)
+        basis_A = self._beam_basis_A_np()
+        basis_power = np.sum(basis_A**2, axis=0) / max(
+            float(basis_A.shape[0]), 1.0
+        )
+        self._beam_harmonic_diag = (
+            q_diag[None, :, None] * basis_power[None, None, :]
+        ).astype(DTYPE_R_NPY)
+        return self._beam_harmonic_q
+
+    def _beam_basis_A_np(self):
+        return np.asarray(self.fwd.beam.basis.A, dtype=DTYPE_R_NPY)
+
+    def _beam_maps_np(self, beam_coeffs):
+        coeffs = np.asarray(beam_coeffs, dtype=DTYPE_R_NPY)
+        return np.asarray(
+            np.einsum("dpk,fk->dpf", coeffs, self._beam_basis_A_np()),
+            dtype=DTYPE_R_NPY,
+        )
+
+    def _beam_reference_maps_np(self, beam_coeffs):
+        if self._beam_nom is None:
+            return np.zeros(
+                (
+                    *np.asarray(beam_coeffs).shape[:2],
+                    self.fwd.beam.basis.nfreq,
+                ),
+                dtype=DTYPE_R_NPY,
+            )
+        return self._beam_maps_np(self._beam_nom)
+
+    def _beam_harmonic_apply_np(self, beam_coeffs):
+        q = self._ensure_beam_harmonic_regularizer()
+        if q is None:
+            return np.zeros_like(np.asarray(beam_coeffs, dtype=DTYPE_R_NPY))
+        beam_maps = self._beam_maps_np(beam_coeffs)
+        diff_maps = beam_maps - self._beam_reference_maps_np(beam_coeffs)
+        filtered_maps = np.einsum("pq,dqf->dpf", q, diff_maps)
+        basis_A = self._beam_basis_A_np()
+        return np.asarray(
+            np.einsum("dpf,fk->dpk", filtered_maps, basis_A)
+            / max(float(basis_A.shape[0]), 1.0),
+            dtype=DTYPE_R_NPY,
+        )
+
+    def _beam_harmonic_penalty_jax(self, beam_coeffs):
+        self._ensure_beam_harmonic_regularizer()
+        q = self._beam_harmonic_q_jax
+        beam = jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
+        basis_A = jnp.asarray(self.fwd.beam.basis.A, dtype=DTYPE_R_JAX)
+        beam_maps = jnp.einsum("dpk,fk->dpf", beam, basis_A)
+        if self._beam_nom is None:
+            ref_maps = jnp.zeros_like(beam_maps)
+        else:
+            ref = jnp.asarray(self._beam_nom, dtype=DTYPE_R_JAX)
+            ref_maps = jnp.einsum("dpk,fk->dpf", ref, basis_A)
+        diff_maps = beam_maps - ref_maps
+        filtered_maps = jnp.einsum("pq,dqf->dpf", q, diff_maps)
+        return jnp.mean(diff_maps * filtered_maps)
+
+    def _beam_harmonic_penalty(self, beam_coeffs):
+        if self._lam_beam_harmonic <= 0:
+            return 0.0
+        q = self._ensure_beam_harmonic_regularizer()
+        beam_maps = self._beam_maps_np(beam_coeffs)
+        diff_maps = beam_maps - self._beam_reference_maps_np(beam_coeffs)
+        filtered_maps = np.einsum("pq,dqf->dpf", q, diff_maps)
+        return float(np.mean(diff_maps * filtered_maps))
+
     def _split_aligned_update(self, delta, reference):
         """Split ``delta`` into components parallel/perpendicular to reference."""
         delta = np.asarray(delta, dtype=DTYPE_R_NPY)
@@ -770,6 +918,14 @@ class Calibrator:
             beam_den = beam_den + self._lam_beam
             beam_num = beam_num - self._lam_beam * (
                 params["beam_coeffs"] - self._beam_nom
+            )
+        if self._lam_beam_harmonic > 0:
+            beam_harmonic_grad = self._beam_harmonic_apply_np(
+                params["beam_coeffs"]
+            )
+            beam_num = beam_num - self._lam_beam_harmonic * beam_harmonic_grad
+            beam_den = beam_den + self._lam_beam_harmonic * (
+                self._beam_harmonic_diag
             )
 
         sky_floor = lambda_damp * max(float(np.max(sky_den)), 1e-30)
@@ -903,6 +1059,7 @@ class Calibrator:
         schedule_lbfgs_max_every: int = 0,
         schedule_lbfgs_min_iter: int = 20,
         schedule_lbfgs_maxiter: int = 3,
+        schedule_lbfgs_max_runs: int = 1,
     ) -> Dict:
         """Run calibration.
 
@@ -981,6 +1138,7 @@ class Calibrator:
                 "eff": {block: None for block in priority},
                 "n_since": {block: 0 for block in priority},
                 "step_gain": {block: 1.0 for block in priority},
+                "n_run": {block: 0 for block in priority},
             }
 
         def choose_scheduled_block():
@@ -988,7 +1146,19 @@ class Calibrator:
             for block in scheduler["priority"]:
                 if block == "lbfgs" and iteration < schedule_lbfgs_min_iter:
                     continue
+                if (
+                    block == "lbfgs"
+                    and schedule_lbfgs_max_runs > 0
+                    and scheduler["n_run"][block] >= schedule_lbfgs_max_runs
+                ):
+                    continue
                 eligible.append(block)
+            if not eligible:
+                eligible = [
+                    block
+                    for block in scheduler["priority"]
+                    if block != "lbfgs"
+                ]
             overdue = {}
             for block in eligible:
                 max_count = scheduler["max_every"].get(block, 0)
@@ -1127,6 +1297,7 @@ class Calibrator:
                     for name in scheduler["n_since"]:
                         scheduler["n_since"][name] += 1
                     scheduler["n_since"][block] = 0
+                    scheduler["n_run"][block] += 1
             losses.append(loss)
             entry = {
                 "iteration": iteration,
@@ -1139,6 +1310,9 @@ class Calibrator:
                 "projected_beam_rms": self._rms(params["beam_coeffs"]),
                 "beam_scatter": float(np.std(params["beam_coeffs"])),
                 "beam_roughness": self._beam_roughness(params["beam_coeffs"]),
+                "beam_harmonic_penalty": self._beam_harmonic_penalty(
+                    params["beam_coeffs"]
+                ),
             }
             if scheduler is not None:
                 entry.update(
@@ -1159,6 +1333,14 @@ class Calibrator:
                             "joint"
                         ),
                         "schedule_n_since_lbfgs": scheduler["n_since"].get(
+                            "lbfgs"
+                        ),
+                        "schedule_n_run_sky": scheduler["n_run"].get("sky"),
+                        "schedule_n_run_beam": scheduler["n_run"].get("beam"),
+                        "schedule_n_run_joint": scheduler["n_run"].get(
+                            "joint"
+                        ),
+                        "schedule_n_run_lbfgs": scheduler["n_run"].get(
                             "lbfgs"
                         ),
                         "schedule_step_gain_sky": scheduler["step_gain"].get(
@@ -1277,6 +1459,9 @@ class Calibrator:
                 "projected_beam_rms": self._rms(out_params["beam_coeffs"]),
                 "beam_scatter": float(np.std(out_params["beam_coeffs"])),
                 "beam_roughness": self._beam_roughness(
+                    out_params["beam_coeffs"]
+                ),
+                "beam_harmonic_penalty": self._beam_harmonic_penalty(
                     out_params["beam_coeffs"]
                 ),
             }
