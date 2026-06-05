@@ -697,6 +697,38 @@ class Calibrator:
             return 0.0
         return float(np.sqrt(np.mean(np.diff(beam, axis=1) ** 2)))
 
+    def _split_aligned_update(self, delta, reference):
+        """Split ``delta`` into components parallel/perpendicular to reference."""
+        delta = np.asarray(delta, dtype=DTYPE_R_NPY)
+        reference = np.asarray(reference, dtype=DTYPE_R_NPY)
+        denom = float(np.sum(reference * reference))
+        if denom <= 0.0 or not np.isfinite(denom):
+            return delta, np.zeros_like(delta), 0.0
+        alpha = float(np.sum(delta * reference) / denom)
+        aligned = np.asarray(alpha * reference, dtype=DTYPE_R_NPY)
+        shape = np.asarray(delta - aligned, dtype=DTYPE_R_NPY)
+        return shape, aligned, alpha
+
+    def _project_joint_scale_tangent(self, sky_delta, beam_delta, params):
+        """Remove the coupled sky/beam multiplicative gauge tangent."""
+        sky = np.asarray(params["sky_coeffs"], dtype=DTYPE_R_NPY)
+        beam = np.asarray(params["beam_coeffs"], dtype=DTYPE_R_NPY)
+        sky_delta = np.asarray(sky_delta, dtype=DTYPE_R_NPY)
+        beam_delta = np.asarray(beam_delta, dtype=DTYPE_R_NPY)
+        denom = float(np.sum(sky * sky) + np.sum(beam * beam))
+        if denom <= 0.0 or not np.isfinite(denom):
+            zeros_sky = np.zeros_like(sky_delta)
+            zeros_beam = np.zeros_like(beam_delta)
+            return sky_delta, beam_delta, zeros_sky, zeros_beam, 0.0
+        alpha = float(
+            (np.sum(sky_delta * sky) - np.sum(beam_delta * beam)) / denom
+        )
+        sky_scale = np.asarray(alpha * sky, dtype=DTYPE_R_NPY)
+        beam_scale = np.asarray(-alpha * beam, dtype=DTYPE_R_NPY)
+        sky_shape = np.asarray(sky_delta - sky_scale, dtype=DTYPE_R_NPY)
+        beam_shape = np.asarray(beam_delta - beam_scale, dtype=DTYPE_R_NPY)
+        return sky_shape, beam_shape, sky_scale, beam_scale, alpha
+
     def _adaptive_fixed_point_step(
         self,
         params,
@@ -743,6 +775,16 @@ class Calibrator:
         beam_floor = lambda_damp * max(float(np.max(beam_den)), 1e-30)
         sky_delta = sky_num / (sky_den + sky_floor)
         beam_delta = beam_num / (beam_den + beam_floor)
+        beam_shape_delta, beam_scale_delta, beam_scale_alpha = (
+            self._split_aligned_update(beam_delta, params["beam_coeffs"])
+        )
+        (
+            joint_sky_delta,
+            joint_beam_delta,
+            joint_sky_scale_delta,
+            joint_beam_scale_delta,
+            joint_scale_alpha,
+        ) = self._project_joint_scale_tangent(sky_delta, beam_delta, params)
 
         loss_before = float(self._loss(params))
         best = params
@@ -752,14 +794,23 @@ class Calibrator:
 
         def make_candidate(block, step):
             candidate = params.copy()
-            if block in ("joint", "sky"):
+            if block == "joint":
+                candidate["sky_coeffs"] = np.asarray(
+                    params["sky_coeffs"] + step * joint_sky_delta,
+                    dtype=DTYPE_R_NPY,
+                )
+                candidate["beam_coeffs"] = np.asarray(
+                    params["beam_coeffs"] + step * joint_beam_delta,
+                    dtype=DTYPE_R_NPY,
+                )
+            elif block == "sky":
                 candidate["sky_coeffs"] = np.asarray(
                     params["sky_coeffs"] + step * sky_delta,
                     dtype=DTYPE_R_NPY,
                 )
-            if block in ("joint", "beam"):
+            elif block == "beam":
                 candidate["beam_coeffs"] = np.asarray(
-                    params["beam_coeffs"] + step * beam_delta,
+                    params["beam_coeffs"] + step * beam_shape_delta,
                     dtype=DTYPE_R_NPY,
                 )
             return self._project_scale_degeneracy(candidate)
@@ -805,6 +856,16 @@ class Calibrator:
             {
                 "sky_update_rms": self._rms(sky_delta),
                 "beam_update_rms": self._rms(beam_delta),
+                "beam_shape_update_rms": self._rms(beam_shape_delta),
+                "beam_scale_update_rms": self._rms(beam_scale_delta),
+                "joint_sky_shape_update_rms": self._rms(joint_sky_delta),
+                "joint_sky_scale_update_rms": self._rms(joint_sky_scale_delta),
+                "joint_beam_shape_update_rms": self._rms(joint_beam_delta),
+                "joint_beam_scale_update_rms": self._rms(
+                    joint_beam_scale_delta
+                ),
+                "beam_scale_alpha": beam_scale_alpha,
+                "joint_scale_alpha": joint_scale_alpha,
                 "sky_diag_floor": sky_floor,
                 "beam_diag_floor": beam_floor,
                 **candidate_summary,

@@ -630,6 +630,14 @@ def test_calibrator_adaptive_fit_monotonic_and_telemetry():
         "joint_loss",
         "sky_loss",
         "beam_loss",
+        "beam_shape_update_rms",
+        "beam_scale_update_rms",
+        "joint_sky_shape_update_rms",
+        "joint_sky_scale_update_rms",
+        "joint_beam_shape_update_rms",
+        "joint_beam_scale_update_rms",
+        "beam_scale_alpha",
+        "joint_scale_alpha",
     ):
         assert key in result["telemetry"][0]
 

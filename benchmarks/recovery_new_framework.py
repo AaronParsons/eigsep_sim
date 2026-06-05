@@ -1,7 +1,8 @@
 """Benchmark the EIGSEP_Recovery_v001_NewFramework notebook core.
 
-The default configuration mirrors the notebook.  Use ``--sky synthetic`` and
-small dimensions for fast solver profiling without the optional GSM dataset.
+The default configuration mirrors the current notebook. It writes a JSON
+summary with fit telemetry so solver changes can be compared without relying
+on notebook state.
 
 Examples
 --------
@@ -14,7 +15,9 @@ Examples
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from pathlib import Path
 
 import astropy.units as u
 import healpy
@@ -111,17 +114,33 @@ def sampled_beam_weights(geom, beam_coeffs, beam_basis_A):
     return beam_weights
 
 
-def solver_options(name):
+def solver_options(name, args):
+    if name == "adaptive-fixed-point":
+        return {
+            "solver": "adaptive-fixed-point",
+            "lambda_damp": args.lambda_damp,
+        }
+    if name == "hybrid-lbfgs":
+        return {
+            "solver": "hybrid-lbfgs",
+            "lambda_damp": args.lambda_damp,
+        }
     if name == "alternating":
-        return {}
-    if name == "damped":
-        return {"sky_step_size": 0.5}
+        return {"solver": "alternating"}
     if name == "fast-cg":
-        return {"use_cg": True, "beam_cg_niter": 8, "beam_cg_tol": 1e-2}
+        return {
+            "solver": "fast-cg",
+            "beam_cg_niter": args.beam_cg_niter,
+            "beam_cg_tol": args.beam_cg_tol,
+        }
     if name == "cg":
-        return {"use_cg": True}
+        return {
+            "solver": "cg",
+            "beam_cg_niter": args.beam_cg_niter,
+            "beam_cg_tol": args.beam_cg_tol,
+        }
     if name == "joint":
-        return {"use_joint": True}
+        return {"solver": "joint"}
     raise ValueError(f"unknown solver {name}")
 
 
@@ -146,7 +165,7 @@ def run_solver(
             max_iter=args.max_iter,
             tol=args.tol,
             verbose=False,
-            **solver_options(name),
+            **solver_options(name, args),
         ),
     )
     sky_map = result["params"]["sky_coeffs"] @ fwd.sky.basis.A.T
@@ -163,13 +182,46 @@ def run_solver(
             projected.params["beam"], maps_true[1]
         ),
     }
+    telemetry = result.get("telemetry", [])
+    if telemetry:
+        last = telemetry[-1]
+        dchi2_total = (
+            telemetry[0].get("loss", result["losses"][0]) - last["loss"]
+        )
+        telemetry_summary = {
+            "last_step_type": last.get("step_type"),
+            "last_delta_chi2_per_sec": last.get("delta_chi2_per_sec"),
+            "total_delta_chi2": dchi2_total,
+            "median_delta_chi2_per_sec": float(
+                np.nanmedian(
+                    [t.get("delta_chi2_per_sec", np.nan) for t in telemetry]
+                )
+            ),
+            "beam_roughness_initial": telemetry[0].get("beam_roughness"),
+            "beam_roughness_final": last.get("beam_roughness"),
+            "beam_shape_update_rms_final": last.get("beam_shape_update_rms"),
+            "beam_scale_update_rms_final": last.get("beam_scale_update_rms"),
+            "joint_beam_shape_update_rms_final": last.get(
+                "joint_beam_shape_update_rms"
+            ),
+            "joint_beam_scale_update_rms_final": last.get(
+                "joint_beam_scale_update_rms"
+            ),
+            "step_type_counts": {
+                step: sum(1 for t in telemetry if t.get("step_type") == step)
+                for step in sorted({t.get("step_type") for t in telemetry})
+            },
+        }
+    else:
+        telemetry_summary = {}
     print(
         f"    iterations={result['n_iter']} converged={result['converged']} "
         f"loss={result['losses'][-1]:.4e} "
         f"sky_err={100 * errors['sky_relative_rms']:.3f}% "
-        f"beam_err={100 * errors['beam_relative_rms']:.3f}%"
+        f"beam_err={100 * errors['beam_relative_rms']:.3f}% "
+        f"last_step={telemetry_summary.get('last_step_type')}"
     )
-    return seconds, result, errors
+    return seconds, result, errors, telemetry_summary
 
 
 def main(args):
@@ -200,8 +252,7 @@ def main(args):
     tau_s = 86400.0 / (args.ntimes * args.naz * args.nalt)
     beam_weight = sampled_beam_weights(geom, beam_coeffs, fwd.beam.basis.A)
     sigma_noise = (
-        np.abs(np.asarray(antenna_temp))
-        + args.t_rx_k * np.abs(beam_weight)
+        np.abs(np.asarray(antenna_temp)) + args.t_rx_k * np.abs(beam_weight)
     ) / np.sqrt(delta_nu_hz * tau_s)
     rng = np.random.default_rng(args.seed)
     data = np.asarray(antenna_temp) + rng.normal(
@@ -214,12 +265,13 @@ def main(args):
         * rng.uniform(0.9, 1.1, size=beam_coeffs.shape),
     }
     solvers = (
-        ["alternating", "damped", "fast-cg", "cg", "joint"]
+        ["adaptive-fixed-point", "fast-cg", "cg", "joint", "alternating"]
         if args.solver == "all"
         else [args.solver]
     )
+    summaries = []
     for solver in solvers:
-        run_solver(
+        seconds, result, errors, telemetry_summary = run_solver(
             solver,
             fwd,
             geom,
@@ -229,6 +281,34 @@ def main(args):
             (sky_map_true, beam_map_true),
             args,
         )
+        summaries.append(
+            {
+                "solver": solver,
+                "seconds": seconds,
+                "n_iter": result["n_iter"],
+                "converged": bool(result["converged"]),
+                "loss_initial": (
+                    float(result["losses"][0]) if result["losses"] else None
+                ),
+                "loss_final": (
+                    float(result["losses"][-1]) if result["losses"] else None
+                ),
+                "sky_relative_rms": float(errors["sky_relative_rms"]),
+                "beam_relative_rms": float(errors["beam_relative_rms"]),
+                "telemetry_summary": telemetry_summary,
+                "telemetry": result.get("telemetry", []),
+            }
+        )
+
+    output = {
+        "config": vars(args),
+        "backend": jax.default_backend(),
+        "summaries": summaries,
+    }
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, default=float))
+    print(f"Wrote telemetry: {out_path}")
 
 
 if __name__ == "__main__":
@@ -236,22 +316,37 @@ if __name__ == "__main__":
     parser.add_argument("--sky", choices=["gsm", "synthetic"], default="gsm")
     parser.add_argument(
         "--solver",
-        choices=["alternating", "damped", "fast-cg", "cg", "joint", "all"],
-        default="alternating",
+        choices=[
+            "adaptive-fixed-point",
+            "hybrid-lbfgs",
+            "alternating",
+            "fast-cg",
+            "cg",
+            "joint",
+            "all",
+        ],
+        default="adaptive-fixed-point",
     )
-    parser.add_argument("--nside-sky", type=int, default=16)
+    parser.add_argument("--nside-sky", type=int, default=8)
     parser.add_argument("--nside-beam", type=int, default=8)
     parser.add_argument("--nfreq", type=int, default=20)
-    parser.add_argument("--ntimes", type=int, default=24)
-    parser.add_argument("--naz", type=int, default=4)
-    parser.add_argument("--nalt", type=int, default=3)
+    parser.add_argument("--ntimes", type=int, default=36)
+    parser.add_argument("--naz", type=int, default=6)
+    parser.add_argument("--nalt", type=int, default=5)
     parser.add_argument("--n-beam-pols", type=int, default=1)
     parser.add_argument("--k-sky", type=int, default=5)
     parser.add_argument("--k-beam", type=int, default=5)
-    parser.add_argument("--max-iter", type=int, default=10)
-    parser.add_argument("--tol", type=float, default=1e-3)
+    parser.add_argument("--max-iter", type=int, default=30)
+    parser.add_argument("--tol", type=float, default=1e-4)
     parser.add_argument("--lam-beam", type=float, default=0.01)
     parser.add_argument("--m-anderson", type=int, default=5)
+    parser.add_argument("--lambda-damp", type=float, default=1e-1)
+    parser.add_argument("--beam-cg-niter", type=int, default=8)
+    parser.add_argument("--beam-cg-tol", type=float, default=1e-2)
     parser.add_argument("--t-rx-k", type=float, default=100.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--output",
+        default="benchmarks/results/recovery_new_framework_latest.json",
+    )
     main(parser.parse_args())
