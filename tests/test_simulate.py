@@ -27,8 +27,15 @@ def test_forward_model_basic():
     nside = 4
 
     # Create minimal basis and objects
-    beam = Beam.from_dipole(nside=nside, freqs_hz=freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(healpy.nside2npix(nside), 3), n_modes=2)
+    beam = Beam.from_dipole(
+        nside=nside, freqs_hz=freqs_hz, arm_lengths_m=3.0, K=2
+    )
+    sky = Sky.from_map(
+        nside,
+        freqs_hz,
+        np.random.randn(healpy.nside2npix(nside), 3),
+        n_modes=2,
+    )
 
     observer = EarthSurface(lat=45.0, lon=0.0)
     observer.set_time("2000-01-01")
@@ -47,7 +54,12 @@ def test_forward_model_with_terrain():
     nside = 4
 
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(healpy.nside2npix(nside), 2), n_modes=2)
+    sky = Sky.from_map(
+        nside,
+        freqs_hz,
+        np.random.randn(healpy.nside2npix(nside), 2),
+        n_modes=2,
+    )
     observer = EarthSurface(lat=0.0, lon=0.0)
     observer.set_time("2000-01-01")
 
@@ -63,7 +75,12 @@ def test_forward_model_precompute_geometry():
     nside = 4
 
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(healpy.nside2npix(nside), 2), n_modes=2)
+    sky = Sky.from_map(
+        nside,
+        freqs_hz,
+        np.random.randn(healpy.nside2npix(nside), 2),
+        n_modes=2,
+    )
     observer = EarthSurface(lat=45.0, lon=0.0)
 
     fwd = ForwardModel(observer, beam, sky)
@@ -71,20 +88,20 @@ def test_forward_model_precompute_geometry():
     times = [Time("2000-01-01") + i for i in range(3)]
     geom = fwd.precompute_geometry(times)
 
-    assert 'rot_gal2top' in geom
-    assert 'crds_top' in geom
-    assert 'masks' in geom
+    assert "rot_gal2top" in geom
+    assert "crds_top" in geom
+    assert "masks" in geom
 
-    assert len(geom['rot_gal2top']) == 3
-    assert len(geom['crds_top']) == 3
-    assert len(geom['masks']) == 3
+    assert len(geom["rot_gal2top"]) == 3
+    assert len(geom["crds_top"]) == 3
+    assert len(geom["masks"]) == 3
 
     # Check shapes
-    for R in geom['rot_gal2top']:
+    for R in geom["rot_gal2top"]:
         assert R.shape == (3, 3)
-    for crds in geom['crds_top']:
+    for crds in geom["crds_top"]:
         assert crds.shape == (3, healpy.nside2npix(nside))
-    for mask in geom['masks']:
+    for mask in geom["masks"]:
         assert mask.shape == (healpy.nside2npix(nside),)
         assert mask.dtype == np.float32
 
@@ -96,20 +113,24 @@ def test_forward_model_simulate_basic():
     npix_sky = healpy.nside2npix(nside)
 
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2)
+    sky = Sky.from_map(
+        nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2
+    )
     observer = EarthSurface(lat=45.0, lon=0.0)
 
     fwd = ForwardModel(observer, beam, sky)
 
     # Random coefficients
     sky_coeffs = np.random.randn(npix_sky, 2).astype(np.float32)
-    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(np.float32)
+    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(
+        np.float32
+    )
 
     times = [Time("2000-01-01")]
     antenna_temp = fwd.simulate(sky_coeffs, beam_coeffs, times=times)
 
     assert antenna_temp.shape == (1, 2, 2)  # (ntimes, n_dipoles, nfreq)
-    assert antenna_temp.dtype == np.float32
+    assert antenna_temp.dtype == np.float64
     assert np.all(np.isfinite(antenna_temp))
 
 
@@ -120,13 +141,17 @@ def test_forward_model_simulate_multiple_times():
     npix_sky = healpy.nside2npix(nside)
 
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2)
+    sky = Sky.from_map(
+        nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2
+    )
     observer = EarthSurface(lat=45.0, lon=0.0)
 
     fwd = ForwardModel(observer, beam, sky)
 
     sky_coeffs = np.random.randn(npix_sky, 2).astype(np.float32)
-    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(np.float32)
+    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(
+        np.float32
+    )
 
     ntimes = 5
     times = [Time("2000-01-01") + i for i in range(ntimes)]
@@ -143,7 +168,9 @@ def test_forward_model_simulate_with_precomputed_geom():
     npix_sky = healpy.nside2npix(nside)
 
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2)
+    sky = Sky.from_map(
+        nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2
+    )
     observer = EarthSurface(lat=45.0, lon=0.0)
 
     fwd = ForwardModel(observer, beam, sky)
@@ -152,7 +179,9 @@ def test_forward_model_simulate_with_precomputed_geom():
     geom = fwd.precompute_geometry(times)
 
     sky_coeffs = np.random.randn(npix_sky, 2).astype(np.float32)
-    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(np.float32)
+    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(
+        np.float32
+    )
 
     antenna_temp = fwd.simulate(sky_coeffs, beam_coeffs, geom=geom)
 
@@ -166,13 +195,17 @@ def test_forward_model_zero_coefficients():
     npix_sky = healpy.nside2npix(nside)
 
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2)
+    sky = Sky.from_map(
+        nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2
+    )
     observer = EarthSurface(lat=45.0, lon=0.0)
 
     fwd = ForwardModel(observer, beam, sky)
 
     sky_coeffs = np.zeros((npix_sky, 2), dtype=np.float32)
-    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(np.float32)
+    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(
+        np.float32
+    )
 
     times = [Time("2000-01-01")]
     antenna_temp = fwd.simulate(sky_coeffs, beam_coeffs, times=times)
@@ -188,16 +221,21 @@ def test_forward_model_orbital_observer():
     npix_sky = healpy.nside2npix(nside)
 
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2)
+    sky = Sky.from_map(
+        nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2
+    )
 
-    observer = LunarOrbit(altitude=100e3, rot_orbit_vec=[0, 0, 1],
-                         rot_spin_vec=[0, 0, 1])
+    observer = LunarOrbit(
+        altitude=100e3, rot_orbit_vec=[0, 0, 1], rot_spin_vec=[0, 0, 1]
+    )
     observer.set_time("2000-01-01")
 
     fwd = ForwardModel(observer, beam, sky)
 
     sky_coeffs = np.random.randn(npix_sky, 2).astype(np.float32)
-    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(np.float32)
+    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(
+        np.float32
+    )
 
     times = [Time("2000-01-01")]
     antenna_temp = fwd.simulate(sky_coeffs, beam_coeffs, times=times)
@@ -213,13 +251,17 @@ def test_forward_model_simulate_no_times_no_geom_error():
     npix_sky = healpy.nside2npix(nside)
 
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky = Sky.from_map(nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2)
+    sky = Sky.from_map(
+        nside, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2
+    )
     observer = EarthSurface(lat=45.0, lon=0.0)
 
     fwd = ForwardModel(observer, beam, sky)
 
     sky_coeffs = np.random.randn(npix_sky, 2).astype(np.float32)
-    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(np.float32)
+    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside), 2).astype(
+        np.float32
+    )
 
     with pytest.raises(ValueError, match="Either times or geom"):
         fwd.simulate(sky_coeffs, beam_coeffs)
@@ -241,11 +283,19 @@ def test_forward_model_sky_beam_scale_degeneracy():
     geom = fwd.precompute_geometry(rots=[observer.rot_gal2top()])
 
     nominal = np.asarray(fwd.simulate(sky_coeffs, beam.coeffs, geom=geom))
-    beam_scaled = np.asarray(fwd.simulate(sky_coeffs, 2.0 * beam.coeffs, geom=geom))
-    sky_scaled = np.asarray(fwd.simulate(2.0 * sky_coeffs, beam.coeffs, geom=geom))
-    coupled_scaled = np.asarray(fwd.simulate(2.0 * sky_coeffs, 0.5 * beam.coeffs, geom=geom))
+    beam_scaled = np.asarray(
+        fwd.simulate(sky_coeffs, 2.0 * beam.coeffs, geom=geom)
+    )
+    sky_scaled = np.asarray(
+        fwd.simulate(2.0 * sky_coeffs, beam.coeffs, geom=geom)
+    )
+    coupled_scaled = np.asarray(
+        fwd.simulate(2.0 * sky_coeffs, 0.5 * beam.coeffs, geom=geom)
+    )
 
-    np.testing.assert_allclose(beam_scaled, 2.0 * nominal, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        beam_scaled, 2.0 * nominal, rtol=1e-6, atol=1e-6
+    )
     np.testing.assert_allclose(sky_scaled, 2.0 * nominal, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(coupled_scaled, nominal, rtol=1e-6, atol=1e-6)
 
@@ -261,14 +311,18 @@ def test_forward_model_different_nside_beam_sky():
 
     # Sky at finer resolution
     npix_sky = healpy.nside2npix(nside_sky)
-    sky = Sky.from_map(nside_sky, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2)
+    sky = Sky.from_map(
+        nside_sky, freqs_hz, np.random.randn(npix_sky, 2), n_modes=2
+    )
 
     observer = EarthSurface(lat=45.0, lon=0.0)
 
     fwd = ForwardModel(observer, beam, sky)
 
     sky_coeffs = np.random.randn(npix_sky, 2).astype(np.float32)
-    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside_beam), 2).astype(np.float32)
+    beam_coeffs = np.random.randn(2, healpy.nside2npix(nside_beam), 2).astype(
+        np.float32
+    )
 
     times = [Time("2000-01-01")]
     antenna_temp = fwd.simulate(sky_coeffs, beam_coeffs, times=times)
@@ -280,6 +334,7 @@ def test_forward_model_different_nside_beam_sky():
 # Fixtures for body_rots / transmitter tests
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def simple_fwd():
     """Minimal 1-dipole ForwardModel: nside=4, 3 freqs."""
@@ -288,7 +343,7 @@ def simple_fwd():
     nside = 4
     npix = healpy.nside2npix(nside)
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
-    sky_map = np.abs(rng.standard_normal((npix, 3))) + 1.0   # positive temps
+    sky_map = np.abs(rng.standard_normal((npix, 3))) + 1.0  # positive temps
     sky = Sky.from_map(nside, freqs_hz, sky_map, n_modes=2)
     observer = EarthSurface(lat=45.0, lon=0.0)
     observer.set_time("2000-01-01")
@@ -302,13 +357,16 @@ def simple_coeffs(simple_fwd):
     npix_sky = fwd.sky.npix
     npix_beam = fwd.beam.npix
     sky_c = rng.standard_normal((npix_sky, 2)).astype(np.float32)
-    beam_c = np.abs(rng.standard_normal((fwd.beam.coeffs.shape[0], npix_beam, 2))).astype(np.float32)
+    beam_c = np.abs(
+        rng.standard_normal((fwd.beam.coeffs.shape[0], npix_beam, 2))
+    ).astype(np.float32)
     return sky_c, beam_c
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # body_rots tests
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_body_rots_identity_matches_none(simple_fwd, simple_coeffs):
     """body_rots=[I]*n is numerically identical to body_rots=None."""
@@ -331,6 +389,7 @@ def test_body_rots_identity_matches_none(simple_fwd, simple_coeffs):
 def test_body_rots_nonidentity_changes_result(simple_fwd, simple_coeffs):
     """A 90-degree body rotation changes the antenna temperature."""
     from eigsep_sim.beam import Beam as _Beam
+
     fwd = simple_fwd
     sky_c, beam_c = simple_coeffs
     R = fwd.observer.rot_gal2top().astype(np.float32)
@@ -341,10 +400,11 @@ def test_body_rots_nonidentity_changes_result(simple_fwd, simple_coeffs):
     geom_rot = fwd.precompute_geometry(rots=rots, body_rots=[R90z])
 
     T_none = np.array(fwd.simulate(sky_c, beam_c, geom=geom_none))
-    T_rot  = np.array(fwd.simulate(sky_c, beam_c, geom=geom_rot))
+    T_rot = np.array(fwd.simulate(sky_c, beam_c, geom=geom_rot))
 
-    assert not np.allclose(T_none, T_rot, atol=1e-4), \
-        "90-degree rotation should change antenna temperature for asymmetric beam"
+    assert not np.allclose(
+        T_none, T_rot, atol=1e-4
+    ), "90-degree rotation should change antenna temperature for asymmetric beam"
 
 
 def test_precompute_geometry_rots_matches_times(simple_fwd, simple_coeffs):
@@ -357,10 +417,10 @@ def test_precompute_geometry_rots_matches_times(simple_fwd, simple_coeffs):
     R = fwd.observer.rot_gal2top().astype(np.float32)
 
     geom_times = fwd.precompute_geometry(times=[t])
-    geom_rots  = fwd.precompute_geometry(rots=[R])
+    geom_rots = fwd.precompute_geometry(rots=[R])
 
     T_times = np.array(fwd.simulate(sky_c, beam_c, geom=geom_times))
-    T_rots  = np.array(fwd.simulate(sky_c, beam_c, geom=geom_rots))
+    T_rots = np.array(fwd.simulate(sky_c, beam_c, geom=geom_rots))
 
     np.testing.assert_allclose(T_times, T_rots, atol=1e-4, rtol=1e-4)
 
@@ -373,29 +433,33 @@ def test_precompute_geometry_rots_shape(simple_fwd):
     geom = fwd.precompute_geometry(rots=[R] * ntimes)
 
     npix_sky = fwd.sky.npix
-    assert geom['rots_jax'].shape          == (ntimes, 3, 3)
-    assert geom['body_rots_jax'].shape     == (ntimes, 3, 3)
-    assert geom['terrain_masks_jax'].shape == (ntimes, npix_sky)
-    assert geom['terrain_emissions_jax'].shape == (
-        ntimes, npix_sky, len(fwd.beam.freqs_hz)
+    assert geom["rots_jax"].shape == (ntimes, 3, 3)
+    assert geom["body_rots_jax"].shape == (ntimes, 3, 3)
+    assert geom["terrain_masks_jax"].shape == (ntimes, npix_sky)
+    assert geom["terrain_emissions_jax"].shape == (
+        ntimes,
+        npix_sky,
+        len(fwd.beam.freqs_hz),
     )
-    assert geom['default_emission_masks_jax'].shape == (ntimes, npix_sky)
-    assert geom['crds_gal_jax'].shape      == (3, npix_sky)
-    assert geom['tx_crds_jax'].shape       == (ntimes, 0, 3)
-    assert geom['beam_px_jax'].shape       == (ntimes, 4, npix_sky)
-    assert geom['beam_wgts_jax'].shape     == (ntimes, 4, npix_sky)
-    assert geom['tx_px_jax'].shape         == (ntimes, 4, 0)
-    assert geom['tx_wgts_jax'].shape       == (ntimes, 4, 0)
+    assert geom["default_emission_masks_jax"].shape == (ntimes, npix_sky)
+    assert geom["crds_gal_jax"].shape == (3, npix_sky)
+    assert geom["tx_crds_jax"].shape == (ntimes, 0, 3)
+    assert geom["beam_px_jax"].shape == (ntimes, 4, npix_sky)
+    assert geom["beam_wgts_jax"].shape == (ntimes, 4, npix_sky)
+    assert geom["tx_px_jax"].shape == (ntimes, 4, 0)
+    assert geom["tx_wgts_jax"].shape == (ntimes, 4, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Transmitter tests
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _make_tx_fwd(observer, beam, sky, tx_dir, tx_freqs, tx_power):
     """Helper: build a ForwardModel with one transmitter."""
-    return ForwardModel(observer, beam, sky,
-                        transmitters=[(tx_dir, tx_freqs, tx_power)])
+    return ForwardModel(
+        observer, beam, sky, transmitters=[(tx_dir, tx_freqs, tx_power)]
+    )
 
 
 def test_transmitter_zero_power_no_effect(simple_fwd, simple_coeffs):
@@ -406,14 +470,18 @@ def test_transmitter_zero_power_no_effect(simple_fwd, simple_coeffs):
     R = fwd.observer.rot_gal2top().astype(np.float32)
 
     fwd_no_tx = ForwardModel(fwd.observer, fwd.beam, fwd.sky)
-    fwd_zero  = ForwardModel(fwd.observer, fwd.beam, fwd.sky,
-                             transmitters=[(np.array([0.,0.,1.]), freqs_hz, 0.0)])
+    fwd_zero = ForwardModel(
+        fwd.observer,
+        fwd.beam,
+        fwd.sky,
+        transmitters=[(np.array([0.0, 0.0, 1.0]), freqs_hz, 0.0)],
+    )
 
     geom = fwd_no_tx.precompute_geometry(rots=[R])
     T_no_tx = np.array(fwd_no_tx.simulate(sky_c, beam_c, geom=geom))
 
     geom_z = fwd_zero.precompute_geometry(rots=[R])
-    T_zero  = np.array(fwd_zero.simulate(sky_c, beam_c, geom=geom_z))
+    T_zero = np.array(fwd_zero.simulate(sky_c, beam_c, geom=geom_z))
 
     np.testing.assert_allclose(T_no_tx, T_zero, atol=1e-6)
 
@@ -429,28 +497,38 @@ def test_transmitter_channel_selectivity(simple_fwd):
     freqs_hz = fwd.beam.freqs_hz
     R = fwd.observer.rot_gal2top().astype(np.float32)
 
-    sky_c  = np.zeros((fwd.sky.npix, 2), dtype=np.float32)
-    beam_c = fwd.beam.coeffs                                 # physical, non-negative
-    tx_dir   = np.array([0., 0., 1.], dtype=np.float32)     # zenith (topocentric)
-    tx_freqs = freqs_hz[1:2]                                 # middle channel only
+    sky_c = np.zeros((fwd.sky.npix, 2), dtype=np.float32)
+    beam_c = fwd.beam.coeffs  # physical, non-negative
+    tx_dir = np.array(
+        [0.0, 0.0, 1.0], dtype=np.float32
+    )  # zenith (topocentric)
+    tx_freqs = freqs_hz[1:2]  # middle channel only
     tx_power = np.array([1e4], dtype=np.float32)
 
     fwd_no_tx = ForwardModel(fwd.observer, fwd.beam, fwd.sky)
-    fwd_tx    = ForwardModel(fwd.observer, fwd.beam, fwd.sky,
-                             transmitters=[(tx_dir, tx_freqs, tx_power)])
+    fwd_tx = ForwardModel(
+        fwd.observer,
+        fwd.beam,
+        fwd.sky,
+        transmitters=[(tx_dir, tx_freqs, tx_power)],
+    )
 
     geom_no = fwd_no_tx.precompute_geometry(rots=[R])
-    T_no_tx = np.array(fwd_no_tx.simulate(sky_c, beam_c, geom=geom_no, T_gnd=0.0))
+    T_no_tx = np.array(
+        fwd_no_tx.simulate(sky_c, beam_c, geom=geom_no, T_gnd=0.0)
+    )
 
     geom_tx = fwd_tx.precompute_geometry(rots=[R])
-    T_tx    = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_tx, T_gnd=0.0))
+    T_tx = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_tx, T_gnd=0.0))
 
-    delta = T_tx - T_no_tx   # (1, n_dipoles, nfreq)
+    delta = T_tx - T_no_tx  # (1, n_dipoles, nfreq)
     # Channels 0 and 2 must be exactly unchanged (tx_T_internal=0 at those channels)
     np.testing.assert_allclose(delta[..., 0], 0.0, atol=1e-6)
     np.testing.assert_allclose(delta[..., 2], 0.0, atol=1e-6)
     # Channel 1 should increase (horizontal dipoles have non-zero response at zenith)
-    assert np.all(delta[..., 1] > 0), "Zenith transmitter should raise Tant at its channel"
+    assert np.all(
+        delta[..., 1] > 0
+    ), "Zenith transmitter should raise Tant at its channel"
 
 
 def test_transmitter_linearity(simple_fwd, simple_coeffs):
@@ -460,16 +538,26 @@ def test_transmitter_linearity(simple_fwd, simple_coeffs):
     freqs_hz = fwd.beam.freqs_hz
     R = fwd.observer.rot_gal2top().astype(np.float32)
 
-    tx_dir   = np.array([0., 0., 1.], dtype=np.float32)
+    tx_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     tx_freqs = freqs_hz
     tx_power = 1e4 * np.ones_like(tx_freqs)
 
-    fwd_1tx = ForwardModel(fwd.observer, fwd.beam, fwd.sky,
-                           transmitters=[(tx_dir, tx_freqs, tx_power)])
-    fwd_2tx = ForwardModel(fwd.observer, fwd.beam, fwd.sky,
-                           transmitters=[(tx_dir, tx_freqs, tx_power),
-                                         (tx_dir, tx_freqs, tx_power)])
-    fwd_no  = ForwardModel(fwd.observer, fwd.beam, fwd.sky)
+    fwd_1tx = ForwardModel(
+        fwd.observer,
+        fwd.beam,
+        fwd.sky,
+        transmitters=[(tx_dir, tx_freqs, tx_power)],
+    )
+    fwd_2tx = ForwardModel(
+        fwd.observer,
+        fwd.beam,
+        fwd.sky,
+        transmitters=[
+            (tx_dir, tx_freqs, tx_power),
+            (tx_dir, tx_freqs, tx_power),
+        ],
+    )
+    fwd_no = ForwardModel(fwd.observer, fwd.beam, fwd.sky)
 
     geom_1 = fwd_1tx.precompute_geometry(rots=[R])
     geom_2 = fwd_2tx.precompute_geometry(rots=[R])
@@ -496,33 +584,41 @@ def test_transmitter_physics_formula(simple_fwd):
 
     # Use zenith (topocentric [0,0,1]) as transmitter direction.
     # With body_rots=None the body frame = topocentric, so d_body = [0,0,1].
-    tx_dir   = np.array([0., 0., 1.], dtype=np.float32)
-    T_eff    = 1e6
+    tx_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    T_eff = 1e6
     tx_freqs = freqs_hz
     tx_power = T_eff * np.ones(nfreq)
 
     # Build a no-transmitter model for baseline sky Tant
     fwd_no = ForwardModel(fwd.observer, fwd.beam, fwd.sky)
-    fwd_tx = ForwardModel(fwd.observer, fwd.beam, fwd.sky,
-                          transmitters=[(tx_dir, tx_freqs, tx_power)])
+    fwd_tx = ForwardModel(
+        fwd.observer,
+        fwd.beam,
+        fwd.sky,
+        transmitters=[(tx_dir, tx_freqs, tx_power)],
+    )
 
-    sky_c  = np.zeros((fwd.sky.npix, 2), dtype=np.float32)   # zero sky → delta is pure TX
-    beam_c = fwd.beam.coeffs                                   # nominal beam
+    sky_c = np.zeros(
+        (fwd.sky.npix, 2), dtype=np.float32
+    )  # zero sky → delta is pure TX
+    beam_c = fwd.beam.coeffs  # nominal beam
 
     geom_no = fwd_no.precompute_geometry(rots=[R])
     geom_tx = fwd_tx.precompute_geometry(rots=[R])
     T_no = np.array(fwd_no.simulate(sky_c, beam_c, geom=geom_no))
     T_tx = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_tx))
-    delta = (T_tx - T_no)[0, 0, :]   # (nfreq,) — single time, single dipole
+    delta = (T_tx - T_no)[0, 0, :]  # (nfreq,) — single time, single dipole
 
     # Closed-form: B(d_body) * T_eff
     # beam_recon: (npix_beam, nfreq)
     beam_recon = fwd.beam.coeffs[0] @ fwd.beam.basis.A.T
     # Beam value at zenith (body frame [0,0,1]) via healpy interpolation
-    th_z, ph_z = healpy.vec2ang(np.array([[0., 0., 1.]]))
+    th_z, ph_z = healpy.vec2ang(np.array([[0.0, 0.0, 1.0]]))
     px_z, wgts_z = healpy.get_interp_weights(fwd.beam.nside, th_z, ph_z)
-    B_at_zenith = np.sum(beam_recon[px_z[:, 0]] * wgts_z[:, 0, None], axis=0)   # (nfreq,)
-    expected = T_eff * B_at_zenith                                               # (nfreq,)
+    B_at_zenith = np.sum(
+        beam_recon[px_z[:, 0]] * wgts_z[:, 0, None], axis=0
+    )  # (nfreq,)
+    expected = T_eff * B_at_zenith  # (nfreq,)
 
     np.testing.assert_allclose(delta, expected, rtol=1e-4)
 
@@ -536,57 +632,73 @@ def test_transmitter_geom_shapes(simple_fwd):
     n_sources = 2
 
     # Build ForwardModel with two transmitters
-    fwd_tx = ForwardModel(fwd.observer, fwd.beam, fwd.sky,
-                          transmitters=[
-                              (np.array([0., 0., 1.]), freqs_hz, 1e4),
-                              (np.array([1., 0., 0.]), freqs_hz, 1e3),
-                          ])
+    fwd_tx = ForwardModel(
+        fwd.observer,
+        fwd.beam,
+        fwd.sky,
+        transmitters=[
+            (np.array([0.0, 0.0, 1.0]), freqs_hz, 1e4),
+            (np.array([1.0, 0.0, 0.0]), freqs_hz, 1e3),
+        ],
+    )
     geom = fwd_tx.precompute_geometry(rots=[R] * ntimes)
 
-    assert 'tx_crds_jax' in geom
-    assert geom['tx_crds_jax'].shape == (ntimes, n_sources, 3)
+    assert "tx_crds_jax" in geom
+    assert geom["tx_crds_jax"].shape == (ntimes, n_sources, 3)
 
     # Directions should be unit vectors (norm ≈ 1)
-    crds = np.array(geom['tx_crds_jax'])
-    norms = np.linalg.norm(crds, axis=-1)   # (ntimes, n_sources)
+    crds = np.array(geom["tx_crds_jax"])
+    norms = np.linalg.norm(crds, axis=-1)  # (ntimes, n_sources)
     np.testing.assert_allclose(norms, 1.0, atol=1e-5)
 
 
 def test_transmitter_body_rots_coupling(simple_fwd):
     """body_rots changes which body-frame direction a fixed topocentric TX maps to."""
     from eigsep_sim.beam import Beam as _Beam
+
     fwd = simple_fwd
     freqs_hz = fwd.beam.freqs_hz
-    sky_c  = np.zeros((fwd.sky.npix, 2), dtype=np.float32)
+    sky_c = np.zeros((fwd.sky.npix, 2), dtype=np.float32)
     beam_c = fwd.beam.coeffs
     R = fwd.observer.rot_gal2top().astype(np.float32)
 
     # Transmitter at zenith (topo [0,0,1])
-    tx_dir   = np.array([0., 0., 1.], dtype=np.float32)
+    tx_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     tx_power = 1e6 * np.ones_like(freqs_hz)
-    fwd_tx = ForwardModel(fwd.observer, fwd.beam, fwd.sky,
-                          transmitters=[(tx_dir, freqs_hz, tx_power)])
+    fwd_tx = ForwardModel(
+        fwd.observer,
+        fwd.beam,
+        fwd.sky,
+        transmitters=[(tx_dir, freqs_hz, tx_power)],
+    )
 
     # No body rotation: tx is at body [0,0,1]
     geom_no_rot = fwd_tx.precompute_geometry(rots=[R], body_rots=None)
     # Use T_gnd=0 to isolate the TX contribution from sky coupling changes.
-    T_no_rot = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_no_rot, T_gnd=0.0))
+    T_no_rot = np.array(
+        fwd_tx.simulate(sky_c, beam_c, geom=geom_no_rot, T_gnd=0.0)
+    )
 
     # 90-degree body rotation around z: topocentric [0,0,1] maps to body [0,0,1]
     # (z-rotation leaves the z-axis fixed, so TX coupling must be identical)
     R90z = _Beam.rot_z(np.pi / 2).astype(np.float32)
     geom_rz = fwd_tx.precompute_geometry(rots=[R], body_rots=[R90z])
     T_rz = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_rz, T_gnd=0.0))
-    np.testing.assert_allclose(T_no_rot, T_rz, atol=1e-4,
-                                err_msg="z-rotation should not change coupling to zenith TX")
+    np.testing.assert_allclose(
+        T_no_rot,
+        T_rz,
+        atol=1e-4,
+        err_msg="z-rotation should not change coupling to zenith TX",
+    )
 
     # 90-degree body rotation around x: topocentric [0,0,1] maps to body [0,1,0]
     # (different beam response) — Tant should change
     R90x = _Beam.rot_x(np.pi / 2).astype(np.float32)
     geom_rx = fwd_tx.precompute_geometry(rots=[R], body_rots=[R90x])
     T_rx = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_rx, T_gnd=0.0))
-    assert not np.allclose(T_no_rot, T_rx, atol=1e-4), \
-        "x-rotation moves TX to different beam direction, should change coupling"
+    assert not np.allclose(
+        T_no_rot, T_rx, atol=1e-4
+    ), "x-rotation moves TX to different beam direction, should change coupling"
 
 
 def test_transmitter_no_sources_geom_shapes(simple_fwd):
@@ -595,18 +707,23 @@ def test_transmitter_no_sources_geom_shapes(simple_fwd):
     R = simple_fwd.observer.rot_gal2top().astype(np.float32)
     geom = fwd_no.precompute_geometry(rots=[R])
 
-    assert geom['tx_crds_jax'].shape == (1, 0, 3)
+    assert geom["tx_crds_jax"].shape == (1, 0, 3)
 
-    sky_c  = np.zeros((fwd_no.sky.npix, 2), dtype=np.float32)
+    sky_c = np.zeros((fwd_no.sky.npix, 2), dtype=np.float32)
     beam_c = fwd_no.beam.coeffs
     T = np.array(fwd_no.simulate(sky_c, beam_c, geom=geom))
-    assert T.shape == (1, fwd_no.beam.coeffs.shape[0], len(fwd_no.beam.freqs_hz))
+    assert T.shape == (
+        1,
+        fwd_no.beam.coeffs.shape[0],
+        len(fwd_no.beam.freqs_hz),
+    )
     assert np.all(np.isfinite(T))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # sky_mask tests
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_build_sky_mask_rots(simple_fwd):
     """build_sky_mask returns bool (npix_sky,) covering ever-visible pixels."""
@@ -631,22 +748,26 @@ def test_sky_mask_reduces_crds_shape(simple_fwd):
     geom_full = fwd.precompute_geometry(rots=[R] * ntimes)
     geom_mask = fwd.precompute_geometry(rots=[R] * ntimes, sky_mask=mask)
 
-    assert geom_mask['crds_gal_jax'].shape      == (3, npix_vis)
-    assert geom_mask['terrain_masks_jax'].shape == (ntimes, npix_vis)
-    assert geom_mask['terrain_emissions_jax'].shape == (
-        ntimes, npix_vis, len(fwd.beam.freqs_hz)
-    )
-    assert geom_mask['default_emission_masks_jax'].shape == (ntimes, npix_vis)
-    assert geom_mask['unresolved_emission_jax'].shape == (len(fwd.beam.freqs_hz),)
-    assert geom_mask['unresolved_default_emission_jax'].shape == (
+    assert geom_mask["crds_gal_jax"].shape == (3, npix_vis)
+    assert geom_mask["terrain_masks_jax"].shape == (ntimes, npix_vis)
+    assert geom_mask["terrain_emissions_jax"].shape == (
+        ntimes,
+        npix_vis,
         len(fwd.beam.freqs_hz),
     )
-    assert 'sky_indices_jax' in geom_mask
-    assert geom_mask['sky_indices_jax'].shape == (npix_vis,)
+    assert geom_mask["default_emission_masks_jax"].shape == (ntimes, npix_vis)
+    assert geom_mask["unresolved_emission_jax"].shape == (
+        len(fwd.beam.freqs_hz),
+    )
+    assert geom_mask["unresolved_default_emission_jax"].shape == (
+        len(fwd.beam.freqs_hz),
+    )
+    assert "sky_indices_jax" in geom_mask
+    assert geom_mask["sky_indices_jax"].shape == (npix_vis,)
 
     # Full geom is unaffected
-    assert geom_full['crds_gal_jax'].shape == (3, fwd.sky.npix)
-    assert 'sky_indices_jax' not in geom_full
+    assert geom_full["crds_gal_jax"].shape == (3, fwd.sky.npix)
+    assert "sky_indices_jax" not in geom_full
 
 
 def test_sky_mask_same_result_at_zero_T_gnd(simple_fwd):
@@ -657,8 +778,9 @@ def test_sky_mask_same_result_at_zero_T_gnd(simple_fwd):
     """
     fwd = simple_fwd
     R = fwd.observer.rot_gal2top().astype(np.float32)
-    sky_c  = np.abs(np.random.default_rng(42).standard_normal(
-        (fwd.sky.npix, 2))).astype(np.float32)
+    sky_c = np.abs(
+        np.random.default_rng(42).standard_normal((fwd.sky.npix, 2))
+    ).astype(np.float32)
     beam_c = fwd.beam.coeffs
 
     mask = fwd.build_sky_mask(rots=[R])

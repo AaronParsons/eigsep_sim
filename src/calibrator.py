@@ -12,6 +12,8 @@ Architecture:
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -90,13 +92,15 @@ class AndersonAccelerator:
         #   g(x_k) - (ΔX_k + ΔF_k) γ,
         # where γ minimizes ||f_k - ΔF_k γ||₂.
         k = len(self.x_history) - 1
-        x_diffs = np.column_stack([
-            self.x_history[i + 1] - self.x_history[i] for i in range(k)
-        ])
-        fx_diffs = np.column_stack([
-            self.fx_diff_history[i + 1] - self.fx_diff_history[i]
-            for i in range(k)
-        ])
+        x_diffs = np.column_stack(
+            [self.x_history[i + 1] - self.x_history[i] for i in range(k)]
+        )
+        fx_diffs = np.column_stack(
+            [
+                self.fx_diff_history[i + 1] - self.fx_diff_history[i]
+                for i in range(k)
+            ]
+        )
         gram = fx_diffs.T @ fx_diffs
         rhs = fx_diffs.T @ fx
         try:
@@ -133,11 +137,15 @@ class Calibrator:
         Sky regularization strength (default 0.0).
     """
 
-    def __init__(self, fwd: ForwardModel, data: np.ndarray,
-                 inv_noise_var: Optional[np.ndarray] = None,
-                 m_anderson: int = 5,
-                 lam_beam: float = 0.01,
-                 lam_sky: float = 0.0):
+    def __init__(
+        self,
+        fwd: ForwardModel,
+        data: np.ndarray,
+        inv_noise_var: Optional[np.ndarray] = None,
+        m_anderson: int = 5,
+        lam_beam: float = 0.01,
+        lam_sky: float = 0.0,
+    ):
         """
         Initialize Calibrator.
 
@@ -183,20 +191,24 @@ class Calibrator:
         # Precomputed geometry (cached from init_params or fit)
         self._geom = None
 
-    def _resolve_geom(self, times=None, rots=None, body_rots=None,
-                      geom=None, sky_mask=None):
+    def _resolve_geom(
+        self, times=None, rots=None, body_rots=None, geom=None, sky_mask=None
+    ):
         """Compute and cache geometry from whichever source is provided."""
         if geom is not None:
             self._geom = geom
         elif rots is not None:
             self._geom = self.fwd.precompute_geometry(
-                rots=rots, body_rots=body_rots, sky_mask=sky_mask)
+                rots=rots, body_rots=body_rots, sky_mask=sky_mask
+            )
         elif times is not None:
             self._geom = self.fwd.precompute_geometry(
-                times=times, sky_mask=sky_mask)
+                times=times, sky_mask=sky_mask
+            )
 
-    def init_params(self, times=None, rots=None, body_rots=None,
-                    geom=None, sky_mask=None) -> Dict[str, np.ndarray]:
+    def init_params(
+        self, times=None, rots=None, body_rots=None, geom=None, sky_mask=None
+    ) -> Dict[str, np.ndarray]:
         """
         Initialize parameters with nominal beam and zero sky coefficients.
 
@@ -224,13 +236,18 @@ class Calibrator:
         beam_coeffs = self.fwd.beam.coeffs.astype(DTYPE_R_NPY)
 
         params = {
-            'sky_coeffs': np.zeros((sky_npix, sky_nmodes), dtype=DTYPE_R_NPY),
-            'beam_coeffs': beam_coeffs.copy(),
+            "sky_coeffs": np.zeros((sky_npix, sky_nmodes), dtype=DTYPE_R_NPY),
+            "beam_coeffs": beam_coeffs.copy(),
         }
         self._beam_nom = beam_coeffs.copy()
 
-        self._resolve_geom(times=times, rots=rots, body_rots=body_rots,
-                           geom=geom, sky_mask=sky_mask)
+        self._resolve_geom(
+            times=times,
+            rots=rots,
+            body_rots=body_rots,
+            geom=geom,
+            sky_mask=sky_mask,
+        )
         return params
 
     def _loss(self, params: Dict[str, np.ndarray]) -> float:
@@ -250,33 +267,49 @@ class Calibrator:
 
         # Forward simulation (returns JAX array)
         pred = self.fwd.simulate(
-            params['sky_coeffs'],
-            params['beam_coeffs'],
-            geom=self._geom
+            params["sky_coeffs"], params["beam_coeffs"], geom=self._geom
         )
 
         # Reshape pred and data to (ntimes*n_dipoles, nfreq) for consistent loss computation
+        pred_shape = tuple(int(dim) for dim in pred.shape)
+        data = self.fwd._match_observation_shape(
+            self._data, pred_shape, name="data"
+        )
+        inv_noise_var = self.fwd._match_observation_shape(
+            self._inv_noise_var, pred_shape, name="inv_noise_var"
+        )
         pred_flat = jnp.reshape(pred, (-1, pred.shape[-1]))
+        data_flat = jnp.reshape(
+            jnp.asarray(data, dtype=DTYPE_R_JAX), (-1, pred.shape[-1])
+        )
+        inv_noise_var_flat = jnp.reshape(
+            jnp.asarray(inv_noise_var, dtype=DTYPE_R_JAX),
+            (-1, pred.shape[-1]),
+        )
         # Data residual
-        resid = pred_flat - self._data_flat_jax
-        loss = jnp.mean(self._inv_noise_var_flat_jax * resid**2)
+        resid = pred_flat - data_flat
+        loss = jnp.mean(inv_noise_var_flat * resid**2)
 
         # Beam regularization (ridge toward nominal)
         if self._lam_beam > 0 and self._beam_nom is not None:
             beam_nom_jax = jnp.asarray(self._beam_nom)
-            beam_diff = params['beam_coeffs'] - beam_nom_jax
+            beam_diff = params["beam_coeffs"] - beam_nom_jax
             loss = loss + self._lam_beam * jnp.mean(beam_diff**2)
 
         # Sky regularization (ridge toward zero)
         if self._lam_sky > 0:
-            loss = loss + self._lam_sky * jnp.mean(params['sky_coeffs']**2)
+            loss = loss + self._lam_sky * jnp.mean(params["sky_coeffs"] ** 2)
 
         return loss
 
-    def sky_step(self, params: Dict[str, np.ndarray],
-                 n_cg: int = 50, lam: float = 1e-4,
-                 rcond: float = 1e-6,
-                 step_size: float = 1.0) -> Dict[str, np.ndarray]:
+    def sky_step(
+        self,
+        params: Dict[str, np.ndarray],
+        n_cg: int = 50,
+        lam: float = 1e-4,
+        rcond: float = 1e-6,
+        step_size: float = 1.0,
+    ) -> Dict[str, np.ndarray]:
         """
         Sky coefficient update via Newton-CG step (exact for quadratic loss).
 
@@ -303,11 +336,15 @@ class Calibrator:
         params_new : dict
             Updated parameters with optimized sky_coeffs.
         """
+
         def loss_sky(sky_coeffs):
-            p = {'sky_coeffs': sky_coeffs, 'beam_coeffs': params['beam_coeffs']}
+            p = {
+                "sky_coeffs": sky_coeffs,
+                "beam_coeffs": params["beam_coeffs"],
+            }
             return self._loss(p)
 
-        sky_jax = jnp.asarray(params['sky_coeffs'])
+        sky_jax = jnp.asarray(params["sky_coeffs"])
         grad_fn = jax.grad(loss_sky)
         loss_before = float(loss_sky(sky_jax))
         grad_val = grad_fn(sky_jax)
@@ -327,7 +364,9 @@ class Calibrator:
             return h.ravel() + lam_abs * v
 
         b = -grad_val.ravel()
-        delta, _ = jax.scipy.sparse.linalg.cg(hvp_flat, b, maxiter=n_cg, tol=1e-3)
+        delta, _ = jax.scipy.sparse.linalg.cg(
+            hvp_flat, b, maxiter=n_cg, tol=1e-3
+        )
 
         # Apply step_size damping before checking improvement.
         # step_size < 1 is intentional for joint sky+beam recovery: a full
@@ -340,25 +379,33 @@ class Calibrator:
 
         if loss_new < loss_before:
             params_new = params.copy()
-            params_new['sky_coeffs'] = np.asarray(sky_new, dtype=DTYPE_R_NPY)
+            params_new["sky_coeffs"] = np.asarray(sky_new, dtype=DTYPE_R_NPY)
             return params_new
 
         # CG failed to improve; fall back to gradient descent with line search
         current_lr = step_size
         for _ in range(20):
-            sky_new = (sky_jax.ravel() - current_lr * grad_val.ravel()).reshape(sky_jax.shape)
+            sky_new = (
+                sky_jax.ravel() - current_lr * grad_val.ravel()
+            ).reshape(sky_jax.shape)
             loss_new = float(loss_sky(sky_new))
             if loss_new <= loss_before:
                 params_new = params.copy()
-                params_new['sky_coeffs'] = np.asarray(sky_new, dtype=DTYPE_R_NPY)
+                params_new["sky_coeffs"] = np.asarray(
+                    sky_new, dtype=DTYPE_R_NPY
+                )
                 return params_new
             current_lr *= 0.5
 
         return params.copy()
 
-    def beam_cg_step(self, params: Dict[str, np.ndarray],
-                     n_cg: int = 50, lam: float = 1e-4,
-                     cg_tol: float = 1e-3) -> Dict[str, np.ndarray]:
+    def beam_cg_step(
+        self,
+        params: Dict[str, np.ndarray],
+        n_cg: int = 50,
+        lam: float = 1e-4,
+        cg_tol: float = 1e-3,
+    ) -> Dict[str, np.ndarray]:
         """
         Beam coefficient update via Newton-CG (mirrors sky_step for the beam).
 
@@ -382,11 +429,15 @@ class Calibrator:
         params_new : dict
             Updated parameters with optimized beam_coeffs.
         """
+
         def loss_beam(beam_coeffs):
-            p = {'sky_coeffs': params['sky_coeffs'], 'beam_coeffs': beam_coeffs}
+            p = {
+                "sky_coeffs": params["sky_coeffs"],
+                "beam_coeffs": beam_coeffs,
+            }
             return self._loss(p)
 
-        beam_jax = jnp.asarray(params['beam_coeffs'])
+        beam_jax = jnp.asarray(params["beam_coeffs"])
         grad_fn = jax.grad(loss_beam)
         loss_before = float(loss_beam(beam_jax))
         grad_val = grad_fn(beam_jax)
@@ -396,9 +447,13 @@ class Calibrator:
         # far from minimum, which makes gradient-scaled lam_abs >> H and causes CG
         # to ignore curvature (reduces to over-damped gradient descent).
         rng_key = jax.random.PRNGKey(0)
-        v_probe = jax.random.rademacher(rng_key, beam_jax.shape, dtype=beam_jax.dtype)
+        v_probe = jax.random.rademacher(
+            rng_key, beam_jax.shape, dtype=beam_jax.dtype
+        )
         _, h_probe = jax.jvp(grad_fn, (beam_jax,), (v_probe,))
-        h_diag_est = float(jnp.sum(h_probe * v_probe) / jnp.sum(v_probe * v_probe))
+        h_diag_est = float(
+            jnp.sum(h_probe * v_probe) / jnp.sum(v_probe * v_probe)
+        )
         lam_abs = lam * max(abs(h_diag_est), 1e-12) + 1e-12
 
         def hvp_flat(v):
@@ -414,7 +469,7 @@ class Calibrator:
 
         if loss_new < loss_before:
             params_new = params.copy()
-            params_new['beam_coeffs'] = np.asarray(beam_new, dtype=DTYPE_R_NPY)
+            params_new["beam_coeffs"] = np.asarray(beam_new, dtype=DTYPE_R_NPY)
             return params_new
 
         # CG didn't improve; fall back to gradient descent with adaptive lr.
@@ -424,14 +479,17 @@ class Calibrator:
             loss_new = float(loss_beam(beam_new))
             if loss_new <= loss_before:
                 params_new = params.copy()
-                params_new['beam_coeffs'] = np.asarray(beam_new, dtype=DTYPE_R_NPY)
+                params_new["beam_coeffs"] = np.asarray(
+                    beam_new, dtype=DTYPE_R_NPY
+                )
                 return params_new
             current_lr *= 0.5
 
         return params.copy()
 
-    def joint_step(self, params: Dict[str, np.ndarray],
-                   n_cg: int = 100, lam: float = 1e-4) -> Dict[str, np.ndarray]:
+    def joint_step(
+        self, params: Dict[str, np.ndarray], n_cg: int = 100, lam: float = 1e-4
+    ) -> Dict[str, np.ndarray]:
         """
         Joint sky+beam Newton-CG step with block-diagonal preconditioner.
 
@@ -466,8 +524,8 @@ class Calibrator:
         params_new : dict
             Updated parameters with jointly optimized sky_coeffs and beam_coeffs.
         """
-        sky_jax = jnp.asarray(params['sky_coeffs'])
-        beam_jax = jnp.asarray(params['beam_coeffs'])
+        sky_jax = jnp.asarray(params["sky_coeffs"])
+        beam_jax = jnp.asarray(params["beam_coeffs"])
         sky_shape, beam_shape = sky_jax.shape, beam_jax.shape
         n_sky = sky_jax.size
         n_beam = beam_jax.size
@@ -476,11 +534,13 @@ class Calibrator:
             return jnp.concatenate([sky.ravel(), beam.ravel()])
 
         def unpack(theta):
-            return theta[:n_sky].reshape(sky_shape), theta[n_sky:].reshape(beam_shape)
+            return theta[:n_sky].reshape(sky_shape), theta[n_sky:].reshape(
+                beam_shape
+            )
 
         def loss_joint(theta):
             s, b = unpack(theta)
-            return self._loss({'sky_coeffs': s, 'beam_coeffs': b})
+            return self._loss({"sky_coeffs": s, "beam_coeffs": b})
 
         theta = pack(sky_jax, beam_jax)
         grad_fn = jax.grad(loss_joint)
@@ -493,7 +553,7 @@ class Calibrator:
         # for one of the two blocks.  Two probes cost two HVP evaluations (same as
         # one probe + one fallback) but give block-appropriate regularization.
         zeros_beam = jnp.zeros(n_beam, dtype=theta.dtype)
-        zeros_sky  = jnp.zeros(n_sky,  dtype=theta.dtype)
+        zeros_sky = jnp.zeros(n_sky, dtype=theta.dtype)
 
         rng_key = jax.random.PRNGKey(0)
         v_sky = jax.random.rademacher(rng_key, (n_sky,), dtype=theta.dtype)
@@ -511,7 +571,9 @@ class Calibrator:
 
         def hvp_flat(v):
             _, h = jax.jvp(grad_fn, (theta,), (v,))
-            reg = jnp.concatenate([lam_abs_sky * v[:n_sky], lam_abs_beam * v[n_sky:]])
+            reg = jnp.concatenate(
+                [lam_abs_sky * v[:n_sky], lam_abs_beam * v[n_sky:]]
+            )
             return h + reg
 
         delta, _ = jax.scipy.sparse.linalg.cg(
@@ -524,8 +586,8 @@ class Calibrator:
         if loss_new < loss_before:
             sky_new, beam_new = unpack(theta_new)
             return {
-                'sky_coeffs':  np.asarray(sky_new,  dtype=DTYPE_R_NPY),
-                'beam_coeffs': np.asarray(beam_new, dtype=DTYPE_R_NPY),
+                "sky_coeffs": np.asarray(sky_new, dtype=DTYPE_R_NPY),
+                "beam_coeffs": np.asarray(beam_new, dtype=DTYPE_R_NPY),
             }
 
         # Newton step didn't improve; fall back to gradient descent with line search.
@@ -536,15 +598,19 @@ class Calibrator:
             if loss_new <= loss_before:
                 sky_new, beam_new = unpack(theta_new)
                 return {
-                    'sky_coeffs':  np.asarray(sky_new,  dtype=DTYPE_R_NPY),
-                    'beam_coeffs': np.asarray(beam_new, dtype=DTYPE_R_NPY),
+                    "sky_coeffs": np.asarray(sky_new, dtype=DTYPE_R_NPY),
+                    "beam_coeffs": np.asarray(beam_new, dtype=DTYPE_R_NPY),
                 }
             current_lr *= 0.5
 
         return params.copy()
 
-    def beam_step(self, params: Dict[str, np.ndarray],
-                  lr: float = 0.01, line_search: bool = True) -> Dict[str, np.ndarray]:
+    def beam_step(
+        self,
+        params: Dict[str, np.ndarray],
+        lr: float = 0.01,
+        line_search: bool = True,
+    ) -> Dict[str, np.ndarray]:
         """
         Optimize beam coefficients given fixed sky (JAX gradient step with line search).
 
@@ -566,15 +632,16 @@ class Calibrator:
         params_new : dict
             Updated parameters with optimized beam_coeffs.
         """
+
         # Define loss function for beam only (keep sky fixed)
         def loss_beam(beam_coeffs):
             p = params.copy()
-            p['beam_coeffs'] = beam_coeffs
+            p["beam_coeffs"] = beam_coeffs
             return self._loss(p)
 
         # Compute gradient
-        grad = jax.grad(loss_beam)(params['beam_coeffs'])
-        loss_before = float(loss_beam(params['beam_coeffs']))
+        grad = jax.grad(loss_beam)(params["beam_coeffs"])
+        loss_before = float(loss_beam(params["beam_coeffs"]))
 
         # Normalize lr so the largest parameter change is lr (not lr * ||grad||).
         # Without this, a fixed lr=0.01 with gradient of O(1e8) gives steps of
@@ -586,8 +653,10 @@ class Calibrator:
         # Gradient step with line search
         for _ in range(30):  # up to 30 halvings to handle large dynamic range
             params_new = params.copy()
-            params_new['beam_coeffs'] = params['beam_coeffs'] - current_lr * grad
-            loss_new = float(loss_beam(params_new['beam_coeffs']))
+            params_new["beam_coeffs"] = (
+                params["beam_coeffs"] - current_lr * grad
+            )
+            loss_new = float(loss_beam(params_new["beam_coeffs"]))
 
             # Accept step if loss decreased (or line search disabled)
             if not line_search or loss_new <= loss_before:
@@ -599,141 +668,319 @@ class Calibrator:
         # If all attempts failed, return original params
         return params.copy()
 
-    def fit(self, params: Optional[Dict[str, np.ndarray]] = None,
-            times=None, rots=None, body_rots=None, geom=None, sky_mask=None,
-            max_iter: int = 30,
-            tol: float = 1e-6,
-            verbose: bool = True,
-            use_cg: bool = False,
-            use_joint: bool = False,
-            sky_step_size: float = 1.0,
-            beam_cg_niter: int = 50,
-            beam_cg_tol: float = 1e-3) -> Dict:
-        """
-        Run calibration with Anderson-accelerated alternating sky/beam iteration.
+    def _project_scale_degeneracy(
+        self, params: Dict[str, np.ndarray]
+    ) -> Dict[str, np.ndarray]:
+        """Project the multiplicative sky/beam scale gauge in-place."""
+        if self._beam_nom is None:
+            return params
+        beam = np.asarray(params["beam_coeffs"], dtype=DTYPE_R_NPY)
+        sky = np.asarray(params["sky_coeffs"], dtype=DTYPE_R_NPY)
+        nom = np.asarray(self._beam_nom, dtype=DTYPE_R_NPY)
+        nom_rms = float(np.sqrt(np.mean(nom**2)))
+        beam_rms = float(np.sqrt(np.mean(beam**2)))
+        if nom_rms == 0.0 or beam_rms == 0.0 or not np.isfinite(beam_rms):
+            return params
+        scale = beam_rms / nom_rms
+        out = params.copy()
+        out["sky_coeffs"] = np.asarray(sky * scale, dtype=DTYPE_R_NPY)
+        out["beam_coeffs"] = np.asarray(beam / scale, dtype=DTYPE_R_NPY)
+        return out
 
-        Each iteration:
-          1. sky_step  — near-exact Newton-CG solve (quadratic in sky_coeffs)
-          2. beam_cg_step (use_cg=True), joint_step (use_joint=True), or beam_step
-          3. Anderson Acceleration on the beam coefficients
+    def _rms(self, value):
+        value = np.asarray(value, dtype=np.float64)
+        return float(np.sqrt(np.mean(value**2)))
 
-        Parameters
-        ----------
-        params : dict, optional
-            Initial parameters. If None, calls init_params().
-        times : list of Time, optional
-            Observation epochs. Mutually exclusive with rots.
-        rots : list of (3, 3) ndarray, optional
-            Pre-computed gal→top rotation matrices (mutually exclusive with times).
-        body_rots : list of (3, 3) ndarray, optional
-            Per-step top→body rotations.
-        geom : dict, optional
-            Pre-computed geometry from ForwardModel.precompute_geometry().
-            Takes priority over times/rots when provided.
-        sky_mask : ndarray of bool, optional
-            Pixel-reduction mask from ForwardModel.build_sky_mask().
-        max_iter : int, optional
-            Maximum iterations (default 30).
-        tol : float, optional
-            Convergence tolerance on relative loss change (default 1e-6).
-        verbose : bool, optional
-            Print per-iteration progress (default True).
-        use_cg : bool, optional
-            If True, use beam_cg_step (Newton-CG) for the beam step. Default
-            False: use beam_step (gradient descent with line search), which is
-            more stable for joint sky+beam recovery.
-        use_joint : bool, optional
-            If True, replace sky_step + beam_step with a single joint_step that
-            optimizes sky and beam simultaneously via Newton-CG with block-diagonal
-            regularization.  This uses the off-diagonal Hessian coupling to avoid
-            the alternating trap (sky absorbing beam error), enabling beam
-            convergence even when the alternating steps stall.
-            Overrides use_cg when True.
-        sky_step_size : float, optional
-            Damping factor for the sky Newton step in alternating mode (default
-            1.0 = full step). Ignored when use_joint=True.
-        beam_cg_niter : int, optional
-            Inner CG iterations for the beam step when use_cg=True (default 50).
-            Use small values such as 5-10 for a fast truncated Newton beam
-            update.
-        beam_cg_tol : float, optional
-            Inner CG tolerance for the beam step when use_cg=True (default 1e-3).
+    def _beam_roughness(self, beam_coeffs):
+        beam = np.asarray(beam_coeffs, dtype=np.float64)
+        if beam.shape[1] < 2:
+            return 0.0
+        return float(np.sqrt(np.mean(np.diff(beam, axis=1) ** 2)))
 
-        Returns
-        -------
-        result : dict
-            - 'params': final optimized parameters
-            - 'losses': loss at each iteration
-            - 'converged': whether tolerance was met
-            - 'n_iter': iterations completed
+    def _adaptive_fixed_point_step(
+        self,
+        params,
+        lambda_damp=1e-2,
+        step0=1.0,
+        min_step=1e-4,
+        allow_cg_fallback=True,
+        beam_cg_niter=5,
+        beam_cg_tol=1e-2,
+    ):
+        pred = self.fwd.simulate(
+            params["sky_coeffs"], params["beam_coeffs"], geom=self._geom
+        )
+        pred_np = np.asarray(pred)
+        data = self.fwd._match_observation_shape(
+            self._data, pred_np.shape, name="data"
+        )
+        inv_noise_var = self.fwd._match_observation_shape(
+            self._inv_noise_var, pred_np.shape, name="inv_noise_var"
+        )
+        residual = pred_np - data
+        adj = self.fwd.accumulate_sky_beam_adjoint(
+            params["sky_coeffs"],
+            params["beam_coeffs"],
+            residual,
+            inv_noise_var,
+            self._geom,
+        )
+        sky_num = np.asarray(adj["sky_num"], dtype=DTYPE_R_NPY)
+        sky_den = np.asarray(adj["sky_den"], dtype=DTYPE_R_NPY)
+        beam_num = np.asarray(adj["beam_num"], dtype=DTYPE_R_NPY)
+        beam_den = np.asarray(adj["beam_den"], dtype=DTYPE_R_NPY)
+
+        if self._lam_sky > 0:
+            sky_den = sky_den + self._lam_sky
+            sky_num = sky_num - self._lam_sky * params["sky_coeffs"]
+        if self._lam_beam > 0 and self._beam_nom is not None:
+            beam_den = beam_den + self._lam_beam
+            beam_num = beam_num - self._lam_beam * (
+                params["beam_coeffs"] - self._beam_nom
+            )
+
+        sky_floor = lambda_damp * max(float(np.max(sky_den)), 1e-30)
+        beam_floor = lambda_damp * max(float(np.max(beam_den)), 1e-30)
+        sky_delta = sky_num / (sky_den + sky_floor)
+        beam_delta = beam_num / (beam_den + beam_floor)
+
+        loss_before = float(self._loss(params))
+        best = params
+        best_loss = loss_before
+        best_type = "none"
+        candidate_summary = {}
+
+        def make_candidate(block, step):
+            candidate = params.copy()
+            if block in ("joint", "sky"):
+                candidate["sky_coeffs"] = np.asarray(
+                    params["sky_coeffs"] + step * sky_delta,
+                    dtype=DTYPE_R_NPY,
+                )
+            if block in ("joint", "beam"):
+                candidate["beam_coeffs"] = np.asarray(
+                    params["beam_coeffs"] + step * beam_delta,
+                    dtype=DTYPE_R_NPY,
+                )
+            return self._project_scale_degeneracy(candidate)
+
+        for block in ("joint", "sky", "beam"):
+            step = float(step0)
+            block_best = None
+            block_best_loss = loss_before
+            block_best_step = 0.0
+            while step >= min_step:
+                candidate = make_candidate(block, step)
+                loss_candidate = float(self._loss(candidate))
+                if loss_candidate <= block_best_loss:
+                    block_best = candidate
+                    block_best_loss = loss_candidate
+                    block_best_step = step
+                    break
+                step *= 0.5
+
+            candidate_summary[f"{block}_step"] = block_best_step
+            candidate_summary[f"{block}_loss"] = block_best_loss
+            if block_best is not None and block_best_loss < best_loss:
+                best = block_best
+                best_loss = block_best_loss
+                best_type = f"adjoint-{block}:{block_best_step:.3g}"
+
+        if best_type == "none" and allow_cg_fallback:
+            candidate = self.sky_step(params, step_size=0.5)
+            candidate = self.beam_cg_step(
+                candidate, n_cg=beam_cg_niter, cg_tol=beam_cg_tol
+            )
+            candidate = self._project_scale_degeneracy(candidate)
+            loss_candidate = float(self._loss(candidate))
+            if loss_candidate <= best_loss:
+                best = candidate
+                best_loss = loss_candidate
+                best_type = "fast-cg"
+
+        return (
+            best,
+            best_loss,
+            best_type,
+            {
+                "sky_update_rms": self._rms(sky_delta),
+                "beam_update_rms": self._rms(beam_delta),
+                "sky_diag_floor": sky_floor,
+                "beam_diag_floor": beam_floor,
+                **candidate_summary,
+            },
+        )
+
+    def fit(
+        self,
+        params: Optional[Dict[str, np.ndarray]] = None,
+        times=None,
+        rots=None,
+        body_rots=None,
+        geom=None,
+        sky_mask=None,
+        max_iter: int = 30,
+        tol: float = 1e-6,
+        verbose: bool = True,
+        solver: str = "adaptive-fixed-point",
+        use_cg: bool = False,
+        use_joint: bool = False,
+        sky_step_size: float = 1.0,
+        beam_cg_niter: int = 50,
+        beam_cg_tol: float = 1e-3,
+        lambda_damp: float = 1e-2,
+    ) -> Dict:
+        """Run calibration.
+
+        ``solver`` may be ``adaptive-fixed-point`` (default), ``hybrid-lbfgs``,
+        ``fast-cg``, ``cg``, ``joint``, or ``alternating``. The legacy boolean
+        controls remain accepted: ``use_joint=True`` selects ``joint`` and
+        ``use_cg=True`` selects ``cg`` when the default solver is not explicitly
+        overridden.
         """
         if params is None:
-            params = self.init_params(times=times, rots=rots,
-                                      body_rots=body_rots, geom=geom,
-                                      sky_mask=sky_mask)
+            params = self.init_params(
+                times=times,
+                rots=rots,
+                body_rots=body_rots,
+                geom=geom,
+                sky_mask=sky_mask,
+            )
         elif self._geom is None:
-            self._resolve_geom(times=times, rots=rots, body_rots=body_rots,
-                               geom=geom, sky_mask=sky_mask)
+            self._resolve_geom(
+                times=times,
+                rots=rots,
+                body_rots=body_rots,
+                geom=geom,
+                sky_mask=sky_mask,
+            )
+            if self._beam_nom is None:
+                self._beam_nom = np.asarray(
+                    params["beam_coeffs"], dtype=DTYPE_R_NPY
+                ).copy()
 
         if self._geom is None:
             raise ValueError(
                 "Provide times, rots, or geom to specify observation geometry"
             )
 
+        if solver == "adaptive-fixed-point":
+            if use_joint:
+                solver = "joint"
+            elif use_cg:
+                solver = "cg"
+        if solver == "hybrid-lbfgs":
+            first = self.fit(
+                params=params,
+                max_iter=max_iter,
+                tol=tol,
+                verbose=verbose,
+                solver="adaptive-fixed-point",
+                sky_step_size=sky_step_size,
+                beam_cg_niter=beam_cg_niter,
+                beam_cg_tol=beam_cg_tol,
+                lambda_damp=lambda_damp,
+            )
+            return self.fit_lbfgs(
+                first["params"], maxiter=20, history=first.get("telemetry", [])
+            )
+
         self._aa.reset()
         losses = []
+        telemetry = []
         converged = False
+        previous_loss = float(self._loss(params))
 
         for iteration in range(max_iter):
-            beam_old = params['beam_coeffs'].copy()
+            tic = time.perf_counter()
+            beam_old = params["beam_coeffs"].copy()
+            step_extra = {}
 
-            if use_joint:
-                # Joint Newton-CG: sky + beam updated simultaneously.
-                # Block-diagonal regularization prevents the sky Hessian (O(1e-5))
-                # and beam Hessian (O(1e4)) from interfering with each other.
-                params = self.joint_step(params)
-            else:
-                # Alternating: sky first (near-exact quadratic solve), then beam.
-                params = self.sky_step(params, step_size=sky_step_size)
-                if use_cg:
-                    params = self.beam_cg_step(
-                        params, n_cg=beam_cg_niter, cg_tol=beam_cg_tol
+            if solver == "adaptive-fixed-point":
+                params, loss, step_type, step_extra = (
+                    self._adaptive_fixed_point_step(
+                        params,
+                        lambda_damp=lambda_damp,
+                        beam_cg_niter=min(beam_cg_niter, 10),
+                        beam_cg_tol=beam_cg_tol,
                     )
-                else:
-                    params = self.beam_step(params)
-
-            # Anderson Acceleration on beam coefficients.
-            # The fixed-point residual is (new_beam - old_beam); AA extrapolates
-            # toward the fixed point using the history of residuals.
-            beam_new = params['beam_coeffs']
-            beam_res = beam_new - beam_old
-            beam_acc = self._aa.apply(beam_old, beam_res)
-            params_aa = params.copy()
-            params_aa['beam_coeffs'] = np.asarray(beam_acc, dtype=DTYPE_R_NPY)
-
-            # Accept AA point only if it doesn't raise the loss. The first
-            # call returns the ordinary fixed-point update, so avoid evaluating
-            # the same loss twice before acceleration has enough history.
-            loss_step = float(self._loss(params))
-            if len(self._aa.x_history) < 2:
-                loss = loss_step
+                )
+            elif solver == "joint":
+                params = self._project_scale_degeneracy(
+                    self.joint_step(params)
+                )
+                loss = float(self._loss(params))
+                step_type = "joint"
             else:
-                loss_aa = float(self._loss(params_aa))
-                if loss_aa <= loss_step:
-                    params = params_aa
-                    loss = loss_aa
+                params = self.sky_step(params, step_size=sky_step_size)
+                if solver in ("cg", "fast-cg"):
+                    n_cg = (
+                        min(beam_cg_niter, 10)
+                        if solver == "fast-cg"
+                        else beam_cg_niter
+                    )
+                    params = self.beam_cg_step(
+                        params, n_cg=n_cg, cg_tol=beam_cg_tol
+                    )
+                    step_type = solver
+                elif solver == "alternating":
+                    params = self.beam_step(params)
+                    step_type = "gradient"
                 else:
-                    loss = loss_step
+                    raise ValueError(f"unknown solver: {solver}")
+                params = self._project_scale_degeneracy(params)
 
+                beam_new = params["beam_coeffs"]
+                beam_res = beam_new - beam_old
+                beam_acc = self._aa.apply(beam_old, beam_res)
+                params_aa = params.copy()
+                params_aa["beam_coeffs"] = np.asarray(
+                    beam_acc, dtype=DTYPE_R_NPY
+                )
+                params_aa = self._project_scale_degeneracy(params_aa)
+                loss_step = float(self._loss(params))
+                if len(self._aa.x_history) < 2:
+                    loss = loss_step
+                else:
+                    loss_aa = float(self._loss(params_aa))
+                    if loss_aa <= loss_step:
+                        params = params_aa
+                        loss = loss_aa
+                        step_type = step_type + "+aa"
+                    else:
+                        loss = loss_step
+
+            wall_time = time.perf_counter() - tic
+            delta = previous_loss - loss
             losses.append(loss)
+            entry = {
+                "iteration": iteration,
+                "wall_time": wall_time,
+                "loss": loss,
+                "delta_chi2": delta,
+                "delta_chi2_per_sec": delta / max(wall_time, 1e-30),
+                "step_type": step_type,
+                "projected_sky_rms": self._rms(params["sky_coeffs"]),
+                "projected_beam_rms": self._rms(params["beam_coeffs"]),
+                "beam_scatter": float(np.std(params["beam_coeffs"])),
+                "beam_roughness": self._beam_roughness(params["beam_coeffs"]),
+            }
+            entry.update(step_extra)
+            telemetry.append(entry)
 
             if verbose:
                 if iteration == 0:
-                    print(f"iter {iteration:3d}: loss = {loss:.6e}")
+                    print(
+                        f"iter {iteration:3d}: loss = {loss:.6e}  "
+                        f"step = {step_type}  dt = {wall_time:.3f}s"
+                    )
                 else:
                     rel = abs(losses[-2] - loss) / (abs(losses[-2]) + 1e-30)
-                    print(f"iter {iteration:3d}: loss = {loss:.6e}  "
-                          f"rel_Δ = {rel:.2e}")
+                    print(
+                        f"iter {iteration:3d}: loss = {loss:.6e}  "
+                        f"rel_D = {rel:.2e}  step = {step_type}  "
+                        f"dchi2/s = {entry['delta_chi2_per_sec']:.3e}"
+                    )
 
             if iteration > 0:
                 rel = abs(losses[-2] - loss) / (abs(losses[-2]) + 1e-30)
@@ -742,10 +989,117 @@ class Calibrator:
                         print(f"Converged after {iteration + 1} iterations")
                     converged = True
                     break
+            previous_loss = loss
 
         return {
-            'params': params,
-            'losses': losses,
-            'converged': converged,
-            'n_iter': iteration + 1,
+            "params": params,
+            "losses": losses,
+            "telemetry": telemetry,
+            "converged": converged,
+            "n_iter": iteration + 1,
+            "solver": solver,
         }
+
+    def fit_lbfgs(
+        self,
+        params: Dict[str, np.ndarray],
+        maxiter: int = 50,
+        scales: Optional[Dict[str, np.ndarray]] = None,
+        history=None,
+    ) -> Dict:
+        """Refine a near-minimum solution with scaled jaxopt L-BFGS."""
+        try:
+            import jaxopt
+        except ImportError as exc:
+            raise ImportError(
+                "fit_lbfgs requires the jaxopt dependency"
+            ) from exc
+
+        sky0 = jnp.asarray(params["sky_coeffs"], dtype=DTYPE_R_JAX)
+        beam0 = jnp.asarray(params["beam_coeffs"], dtype=DTYPE_R_JAX)
+        sky_shape = sky0.shape
+        beam_shape = beam0.shape
+        n_sky = sky0.size
+        if scales is None:
+            scales = {
+                "sky_coeffs": np.maximum(
+                    np.sqrt(np.mean(np.asarray(sky0) ** 2)), 1.0
+                ),
+                "beam_coeffs": np.maximum(
+                    np.sqrt(np.mean(np.asarray(beam0) ** 2)), 1.0
+                ),
+            }
+        sky_scale = jnp.asarray(scales["sky_coeffs"], dtype=DTYPE_R_JAX)
+        beam_scale = jnp.asarray(scales["beam_coeffs"], dtype=DTYPE_R_JAX)
+
+        def pack(sky, beam):
+            return jnp.concatenate(
+                [(sky / sky_scale).ravel(), (beam / beam_scale).ravel()]
+            )
+
+        def unpack(theta):
+            sky = theta[:n_sky].reshape(sky_shape) * sky_scale
+            beam = theta[n_sky:].reshape(beam_shape) * beam_scale
+            return sky, beam
+
+        def objective(theta):
+            sky, beam = unpack(theta)
+            return self._loss({"sky_coeffs": sky, "beam_coeffs": beam})
+
+        solver = jaxopt.LBFGS(fun=objective, maxiter=maxiter)
+        theta0 = pack(sky0, beam0)
+        result = solver.run(theta0)
+        sky_new, beam_new = unpack(result.params)
+        out_params = self._project_scale_degeneracy(
+            {
+                "sky_coeffs": np.asarray(sky_new, dtype=DTYPE_R_NPY),
+                "beam_coeffs": np.asarray(beam_new, dtype=DTYPE_R_NPY),
+            }
+        )
+        loss = float(self._loss(out_params))
+        telemetry = list(history or [])
+        telemetry.append(
+            {
+                "iteration": len(telemetry),
+                "wall_time": 0.0,
+                "loss": loss,
+                "delta_chi2": np.nan,
+                "delta_chi2_per_sec": np.nan,
+                "step_type": "lbfgs",
+                "projected_sky_rms": self._rms(out_params["sky_coeffs"]),
+                "projected_beam_rms": self._rms(out_params["beam_coeffs"]),
+                "beam_scatter": float(np.std(out_params["beam_coeffs"])),
+                "beam_roughness": self._beam_roughness(
+                    out_params["beam_coeffs"]
+                ),
+            }
+        )
+        return {
+            "params": out_params,
+            "losses": [loss],
+            "telemetry": telemetry,
+            "converged": bool(getattr(result.state, "error", np.inf) < 1e-6),
+            "n_iter": int(getattr(result.state, "iter_num", maxiter)),
+            "solver": "lbfgs",
+            "state": result.state,
+        }
+
+    def fit_hybrid(
+        self,
+        params: Optional[Dict[str, np.ndarray]] = None,
+        max_iter: int = 30,
+        lbfgs_iter: int = 20,
+        **kwargs,
+    ) -> Dict:
+        """Run adaptive fixed-point iterations followed by L-BFGS refinement."""
+        first = self.fit(
+            params=params,
+            max_iter=max_iter,
+            solver="adaptive-fixed-point",
+            **kwargs,
+        )
+        return self.fit_lbfgs(
+            first["params"],
+            maxiter=lbfgs_iter,
+            history=first.get("telemetry", []),
+        )

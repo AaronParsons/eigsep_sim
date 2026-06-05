@@ -8,50 +8,55 @@ See description() for a dictionary of constants and their descriptions.
 import numpy as np
 from astropy import constants as const
 from astropy import units as u
+import jax
 import jax.numpy as jnp
 
-# Data types — use float32 throughout for memory efficiency
-DTYPE_R_NPY = np.float32  # NumPy dtype for real arrays
-DTYPE_R_JAX = jnp.float32  # JAX dtype for real arrays
+# Calibration is curvature-limited and benefits from consistent 64-bit
+# arithmetic. Set this before other modules create JAX arrays.
+jax.config.update("jax_enable_x64", True)
+
+# Data types for real arrays
+DTYPE_R_NPY = np.float64
+DTYPE_R_JAX = jnp.float64
 
 # Fundamental constants (SI)
 pi = np.pi
-c = const.c.value                 # speed of light [m / s]
-G = const.G.value                 # gravitational constant [m^3 / kg / s^2]
-h = const.h.value                 # Planck constant [J s]
-e = const.e.value                 # elementary charge [C]
-m_e = const.m_e.value             # electron mass [kg]
-m_p = const.m_p.value             # proton mass [kg]
-k_B = const.k_B.value             # Boltzmann constant [J / K]
-sigma_sb = const.sigma_sb.value   # Stefan-Boltzmann constant [W / m^2 / K^4]
+c = const.c.value  # speed of light [m / s]
+G = const.G.value  # gravitational constant [m^3 / kg / s^2]
+h = const.h.value  # Planck constant [J s]
+e = const.e.value  # elementary charge [C]
+m_e = const.m_e.value  # electron mass [kg]
+m_p = const.m_p.value  # proton mass [kg]
+k_B = const.k_B.value  # Boltzmann constant [J / K]
+sigma_sb = const.sigma_sb.value  # Stefan-Boltzmann constant [W / m^2 / K^4]
 
 # Astronomical quantities
-au = const.au.value               # meters in 1 AU
-r_sun = const.R_sun.value         # radius of sun [m]
-m_sun = const.M_sun.value         # mass of sun [kg]
-pc = const.pc.value               # meters in 1 parsec
+au = const.au.value  # meters in 1 AU
+r_sun = const.R_sun.value  # radius of sun [m]
+m_sun = const.M_sun.value  # mass of sun [kg]
+pc = const.pc.value  # meters in 1 parsec
 
 # Time quantities
-s_per_day = u.day.to(u.s)         # seconds in a solar Earth day
-s_per_yr = u.yr.to(u.s)           # seconds in a Julian year
-sidereal_day = u.sday.to(u.s)     # seconds in a sidereal day
+s_per_day = u.day.to(u.s)  # seconds in a solar Earth day
+s_per_yr = u.yr.to(u.s)  # seconds in a Julian year
+sidereal_day = u.sday.to(u.s)  # seconds in a sidereal day
 
 # Derived quantities
-len_ns = c * 1e-9                 # length of a nanosecond in meters
-eta_0 = 376.73                    # Impedance of free space (Ohms)
-deg = np.pi / 180.0               # degrees in radians
-sq_deg = deg ** 2                 # square degree in steradians
-arcmin = deg / 60.0               # arcminute in radians
-arcsec = arcmin / 60.0            # arcsecond in radians
-ft = u.imperial.ft.to(u.m)        # length of a foot in meters
+len_ns = c * 1e-9  # length of a nanosecond in meters
+eta_0 = 376.73  # Impedance of free space (Ohms)
+deg = np.pi / 180.0  # degrees in radians
+sq_deg = deg**2  # square degree in steradians
+arcmin = deg / 60.0  # arcminute in radians
+arcsec = arcmin / 60.0  # arcsecond in radians
+ft = u.imperial.ft.to(u.m)  # length of a foot in meters
 
 # Radii
-R_MOON = 1_737_400.0              # radius of moon [m] (not in astropy)
-R_SUN = const.R_sun.value         # radius of sun [m]
-R_EARTH = const.R_earth.value     # radius of earth [m]
+R_MOON = 1_737_400.0  # radius of moon [m] (not in astropy)
+R_SUN = const.R_sun.value  # radius of sun [m]
+R_EARTH = const.R_earth.value  # radius of earth [m]
 
 # Gravitational parameters (GM, m³/s²)
-GM_MOON = 4.9048695e12            # standard gravitational parameter of the Moon
+GM_MOON = 4.9048695e12  # standard gravitational parameter of the Moon
 
 # Flux units
 Jy = u.Jy.to(u.W / u.m**2 / u.Hz)  # Jansky [W / m^2 / Hz]
