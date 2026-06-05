@@ -131,6 +131,9 @@ def solver_options(name, args):
             },
             "schedule_eff_alpha": args.schedule_eff_alpha,
             "schedule_step_gain_factor": args.schedule_step_gain_factor,
+            "schedule_lbfgs_max_every": args.schedule_lbfgs_max_every,
+            "schedule_lbfgs_min_iter": args.schedule_lbfgs_min_iter,
+            "schedule_lbfgs_maxiter": args.schedule_lbfgs_maxiter,
         }
     if name == "hybrid-lbfgs":
         return {
@@ -371,6 +374,14 @@ if __name__ == "__main__":
     parser.add_argument("--schedule-joint-max-every", type=int, default=4)
     parser.add_argument("--schedule-eff-alpha", type=float, default=0.3)
     parser.add_argument("--schedule-step-gain-factor", type=float, default=2.0)
+    parser.add_argument(
+        "--schedule-lbfgs-max-every",
+        type=int,
+        default=0,
+        help="Run short L-BFGS as an adaptive-scheduled block every N steps; 0 disables it.",
+    )
+    parser.add_argument("--schedule-lbfgs-min-iter", type=int, default=20)
+    parser.add_argument("--schedule-lbfgs-maxiter", type=int, default=3)
     parser.add_argument("--beam-cg-niter", type=int, default=8)
     parser.add_argument("--beam-cg-tol", type=float, default=1e-2)
     parser.add_argument("--t-rx-k", type=float, default=100.0)

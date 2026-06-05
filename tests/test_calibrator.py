@@ -686,6 +686,39 @@ def test_calibrator_adaptive_scheduled_runs_and_records_state():
         assert key in first
 
 
+def test_calibrator_adaptive_scheduled_lbfgs_block_runs_when_enabled():
+    """Scheduled adaptive solver can include short L-BFGS bursts."""
+    pytest.importorskip("jaxopt")
+    fwd = setup_forward_model()
+    times = [Time("2000-01-01"), Time("2000-01-01 00:01:00")]
+    geom = fwd.precompute_geometry(times=times)
+    data = np.asarray(
+        fwd.simulate(fwd.sky.init_coeffs(), fwd.beam.coeffs, geom=geom)
+    )
+    cal = Calibrator(fwd, data, lam_beam=0.0)
+    params = cal.init_params(geom=geom)
+    params["sky_coeffs"] = fwd.sky.init_coeffs() * 0.9
+    params["beam_coeffs"] = fwd.beam.coeffs * 1.1
+    result = cal.fit(
+        params=params,
+        max_iter=4,
+        verbose=False,
+        solver="adaptive-scheduled",
+        schedule_max_every={"sky": 3, "beam": 3, "joint": 3},
+        schedule_lbfgs_max_every=1,
+        schedule_lbfgs_min_iter=1,
+        schedule_lbfgs_maxiter=1,
+    )
+    assert any(
+        entry.get("scheduled_block") == "lbfgs"
+        for entry in result["telemetry"]
+    )
+    assert any(
+        str(entry.get("step_type", "")).startswith("lbfgs")
+        for entry in result["telemetry"]
+    )
+
+
 def test_calibrator_scale_projection_preserves_sky_beam_product():
     """Scale projection fixes beam RMS gauge while preserving multiplicative data."""
     fwd = setup_forward_model()

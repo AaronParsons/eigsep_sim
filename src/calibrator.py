@@ -900,6 +900,9 @@ class Calibrator:
         schedule_eff_alpha: float = 0.3,
         schedule_step_gain_factor: float = 2.0,
         schedule_min_step: float = 1e-4,
+        schedule_lbfgs_max_every: int = 0,
+        schedule_lbfgs_min_iter: int = 20,
+        schedule_lbfgs_maxiter: int = 3,
     ) -> Dict:
         """Run calibration.
 
@@ -965,30 +968,41 @@ class Calibrator:
         scheduler = None
         if solver == "adaptive-scheduled":
             max_every = {"sky": 5, "beam": 2, "joint": 4}
+            if schedule_lbfgs_max_every and schedule_lbfgs_max_every > 0:
+                max_every["lbfgs"] = int(schedule_lbfgs_max_every)
             if schedule_max_every is not None:
                 max_every.update(schedule_max_every)
+            priority = ["beam", "joint", "sky"]
+            if max_every.get("lbfgs", 0) > 0:
+                priority.append("lbfgs")
             scheduler = {
-                "priority": ("beam", "joint", "sky"),
+                "priority": tuple(priority),
                 "max_every": max_every,
-                "eff": {"sky": None, "beam": None, "joint": None},
-                "n_since": {"sky": 0, "beam": 0, "joint": 0},
-                "step_gain": {"sky": 1.0, "beam": 1.0, "joint": 1.0},
+                "eff": {block: None for block in priority},
+                "n_since": {block: 0 for block in priority},
+                "step_gain": {block: 1.0 for block in priority},
             }
 
         def choose_scheduled_block():
+            eligible = []
+            for block in scheduler["priority"]:
+                if block == "lbfgs" and iteration < schedule_lbfgs_min_iter:
+                    continue
+                eligible.append(block)
             overdue = {}
-            for block, max_count in scheduler["max_every"].items():
+            for block in eligible:
+                max_count = scheduler["max_every"].get(block, 0)
                 if max_count and max_count > 0:
                     n_since = scheduler["n_since"][block]
                     if n_since >= max_count:
                         overdue[block] = n_since / max_count
             if overdue:
                 return max(overdue, key=overdue.get), "overdue"
-            for block in scheduler["priority"]:
+            for block in eligible:
                 if scheduler["eff"][block] is None:
                     return block, "unmeasured"
             return (
-                max(scheduler["priority"], key=lambda b: scheduler["eff"][b]),
+                max(eligible, key=lambda b: scheduler["eff"][b]),
                 "efficiency",
             )
 
@@ -1004,19 +1018,35 @@ class Calibrator:
                 blocks = ("joint", "sky", "beam")
                 if solver == "adaptive-scheduled":
                     scheduled_block, schedule_reason = choose_scheduled_block()
-                    blocks = (scheduled_block,)
-                    step0 = scheduler["step_gain"][scheduled_block]
-                params, loss, step_type, step_extra = (
-                    self._adaptive_fixed_point_step(
-                        params,
-                        lambda_damp=lambda_damp,
-                        step0=step0,
-                        min_step=schedule_min_step,
-                        beam_cg_niter=min(beam_cg_niter, 10),
-                        beam_cg_tol=beam_cg_tol,
-                        blocks=blocks,
+                    if scheduled_block == "lbfgs":
+                        lbfgs_result = self.fit_lbfgs(
+                            params, maxiter=schedule_lbfgs_maxiter
+                        )
+                        params = lbfgs_result["params"]
+                        loss = float(lbfgs_result["losses"][-1])
+                        step_type = f"lbfgs:{schedule_lbfgs_maxiter}"
+                        step_extra = {
+                            "lbfgs_maxiter": schedule_lbfgs_maxiter,
+                            "lbfgs_inner_iter": lbfgs_result.get("n_iter"),
+                        }
+                    else:
+                        blocks = (scheduled_block,)
+                        step0 = scheduler["step_gain"][scheduled_block]
+                if (
+                    solver != "adaptive-scheduled"
+                    or scheduled_block != "lbfgs"
+                ):
+                    params, loss, step_type, step_extra = (
+                        self._adaptive_fixed_point_step(
+                            params,
+                            lambda_damp=lambda_damp,
+                            step0=step0,
+                            min_step=schedule_min_step,
+                            beam_cg_niter=min(beam_cg_niter, 10),
+                            beam_cg_tol=beam_cg_tol,
+                            blocks=blocks,
+                        )
                     )
-                )
             elif solver == "joint":
                 params = self._project_scale_degeneracy(
                     self.joint_step(params)
@@ -1079,18 +1109,21 @@ class Calibrator:
                             + (1.0 - schedule_eff_alpha) * old_eff
                         )
                         scheduler["eff"][block] = min(ema, eff)
-                    accepted_step = float(step_extra.get(f"{block}_step", 0.0))
-                    old_gain = scheduler["step_gain"][block]
-                    if accepted_step > 0.0:
-                        if accepted_step >= 0.99 * old_gain:
-                            new_gain = old_gain * schedule_step_gain_factor
+                    if block != "lbfgs":
+                        accepted_step = float(
+                            step_extra.get(f"{block}_step", 0.0)
+                        )
+                        old_gain = scheduler["step_gain"][block]
+                        if accepted_step > 0.0:
+                            if accepted_step >= 0.99 * old_gain:
+                                new_gain = old_gain * schedule_step_gain_factor
+                            else:
+                                new_gain = accepted_step
                         else:
-                            new_gain = accepted_step
-                    else:
-                        new_gain = old_gain / schedule_step_gain_factor
-                    scheduler["step_gain"][block] = max(
-                        schedule_min_step, min(1.0, float(new_gain))
-                    )
+                            new_gain = old_gain / schedule_step_gain_factor
+                        scheduler["step_gain"][block] = max(
+                            schedule_min_step, min(1.0, float(new_gain))
+                        )
                     for name in scheduler["n_since"]:
                         scheduler["n_since"][name] += 1
                     scheduler["n_since"][block] = 0
@@ -1112,23 +1145,31 @@ class Calibrator:
                     {
                         "scheduled_block": scheduled_block,
                         "schedule_reason": schedule_reason,
-                        "schedule_eff_sky": scheduler["eff"]["sky"],
-                        "schedule_eff_beam": scheduler["eff"]["beam"],
-                        "schedule_eff_joint": scheduler["eff"]["joint"],
-                        "schedule_n_since_sky": scheduler["n_since"]["sky"],
-                        "schedule_n_since_beam": scheduler["n_since"]["beam"],
-                        "schedule_n_since_joint": scheduler["n_since"][
-                            "joint"
-                        ],
-                        "schedule_step_gain_sky": scheduler["step_gain"][
+                        "schedule_eff_sky": scheduler["eff"].get("sky"),
+                        "schedule_eff_beam": scheduler["eff"].get("beam"),
+                        "schedule_eff_joint": scheduler["eff"].get("joint"),
+                        "schedule_eff_lbfgs": scheduler["eff"].get("lbfgs"),
+                        "schedule_n_since_sky": scheduler["n_since"].get(
                             "sky"
-                        ],
-                        "schedule_step_gain_beam": scheduler["step_gain"][
+                        ),
+                        "schedule_n_since_beam": scheduler["n_since"].get(
                             "beam"
-                        ],
-                        "schedule_step_gain_joint": scheduler["step_gain"][
+                        ),
+                        "schedule_n_since_joint": scheduler["n_since"].get(
                             "joint"
-                        ],
+                        ),
+                        "schedule_n_since_lbfgs": scheduler["n_since"].get(
+                            "lbfgs"
+                        ),
+                        "schedule_step_gain_sky": scheduler["step_gain"].get(
+                            "sky"
+                        ),
+                        "schedule_step_gain_beam": scheduler["step_gain"].get(
+                            "beam"
+                        ),
+                        "schedule_step_gain_joint": scheduler["step_gain"].get(
+                            "joint"
+                        ),
                     }
                 )
             entry.update(step_extra)
