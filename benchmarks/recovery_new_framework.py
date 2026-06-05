@@ -170,6 +170,7 @@ def run_solver(
     calibrator._geom = geom
     calibrator._beam_nom = fwd.beam.coeffs.copy()
     params = {key: value.copy() for key, value in params_ini.items()}
+    loss_initial = float(calibrator._loss(params))
     result, seconds = elapsed(
         f"fit [{name}]",
         lambda: calibrator.fit(
@@ -197,9 +198,7 @@ def run_solver(
     telemetry = result.get("telemetry", [])
     if telemetry:
         last = telemetry[-1]
-        dchi2_total = (
-            telemetry[0].get("loss", result["losses"][0]) - last["loss"]
-        )
+        dchi2_total = loss_initial - last["loss"]
         telemetry_summary = {
             "last_step_type": last.get("step_type"),
             "last_delta_chi2_per_sec": last.get("delta_chi2_per_sec"),
@@ -233,7 +232,7 @@ def run_solver(
         f"beam_err={100 * errors['beam_relative_rms']:.3f}% "
         f"last_step={telemetry_summary.get('last_step_type')}"
     )
-    return seconds, result, errors, telemetry_summary
+    return seconds, result, errors, telemetry_summary, loss_initial
 
 
 def main(args):
@@ -266,15 +265,18 @@ def main(args):
     sigma_noise = (
         np.abs(np.asarray(antenna_temp)) + args.t_rx_k * np.abs(beam_weight)
     ) / np.sqrt(delta_nu_hz * tau_s)
-    rng = np.random.default_rng(args.seed)
-    data = np.asarray(antenna_temp) + rng.normal(
+    seed_seq = np.random.SeedSequence(args.seed)
+    noise_seed, init_seed = seed_seq.spawn(2)
+    noise_rng = np.random.default_rng(noise_seed)
+    init_rng = np.random.default_rng(init_seed)
+    data = np.asarray(antenna_temp) + noise_rng.normal(
         scale=sigma_noise, size=antenna_temp.shape
     )
     params_ini = {
         "sky_coeffs": sky_coeffs
-        * rng.uniform(0.9, 1.1, size=sky_coeffs.shape),
+        * init_rng.uniform(0.9, 1.1, size=sky_coeffs.shape),
         "beam_coeffs": beam_coeffs
-        * rng.uniform(0.9, 1.1, size=beam_coeffs.shape),
+        * init_rng.uniform(0.9, 1.1, size=beam_coeffs.shape),
     }
     solvers = (
         [
@@ -290,7 +292,7 @@ def main(args):
     )
     summaries = []
     for solver in solvers:
-        seconds, result, errors, telemetry_summary = run_solver(
+        seconds, result, errors, telemetry_summary, loss_initial = run_solver(
             solver,
             fwd,
             geom,
@@ -306,9 +308,7 @@ def main(args):
                 "seconds": seconds,
                 "n_iter": result["n_iter"],
                 "converged": bool(result["converged"]),
-                "loss_initial": (
-                    float(result["losses"][0]) if result["losses"] else None
-                ),
+                "loss_initial": loss_initial,
                 "loss_final": (
                     float(result["losses"][-1]) if result["losses"] else None
                 ),
@@ -322,6 +322,11 @@ def main(args):
     output = {
         "config": vars(args),
         "backend": jax.default_backend(),
+        "rng": {
+            "seed": args.seed,
+            "noise_spawn_key": noise_seed.spawn_key,
+            "init_spawn_key": init_seed.spawn_key,
+        },
         "summaries": summaries,
     }
     out_path = Path(args.output)
