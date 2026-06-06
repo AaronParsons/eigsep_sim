@@ -338,57 +338,20 @@ class LunarDisk(Terrain):
         ndarray, shape (npix,)
             Boolean mask: True = sky visible, False = lunar disk blocks.
         """
-        if self.spacecraft_pos_gal is None:
-            # No spacecraft position set: all sky visible
-            if crds_top.shape[0] == 3:
-                return np.ones(crds_top.shape[1], dtype=bool)
-            else:
-                return np.ones(crds_top.shape[0], dtype=bool)
-
-        # Normalize input
         if crds_top.shape[0] == 3:
-            # (3, npix) format
-            sky_dirs = crds_top  # (3, npix)
-            npix = crds_top.shape[1]
+            sky_dirs = np.asarray(crds_top, dtype=np.float64)
         else:
-            # (npix, 3) format
-            sky_dirs = crds_top.T  # (3, npix)
-            npix = crds_top.shape[0]
+            sky_dirs = np.asarray(crds_top, dtype=np.float64).T
 
-        # Lunar position (at origin in galactic frame)
-        moon_pos = np.array([0.0, 0.0, 0.0])
+        npix = sky_dirs.shape[1]
+        if self.spacecraft_pos_gal is None:
+            return np.ones(npix, dtype=bool)
 
-        # For each sky pixel, compute ray-sphere intersection
-        # Ray from spacecraft toward sky pixel: P(t) = pos_sc + t * dir
-        # Sphere: |P - moon_pos|^2 = R^2
-        # Solve: |pos_sc + t*dir|^2 = R^2
-
-        # Vector from moon to spacecraft
-        sc_to_moon = self.spacecraft_pos_gal - moon_pos  # (3,)
-        d = sc_to_moon / np.linalg.norm(sc_to_moon)  # normalized
-
-        # For each direction, check if ray intersects sphere
-        visible = np.ones(npix, dtype=bool)
-
-        for i in range(npix):
-            ray_dir = sky_dirs[:, i] / np.linalg.norm(sky_dirs[:, i])
-
-            # Quadratic coefficients for ray-sphere intersection
-            # |P(t)|^2 = |sc + t*dir|^2 = R^2
-            a = np.dot(ray_dir, ray_dir)  # should be 1
-            b = 2 * np.dot(ray_dir, sc_to_moon)
-            c = np.dot(sc_to_moon, sc_to_moon) - self.moon_radius**2
-
-            discriminant = b**2 - 4*a*c
-            if discriminant >= 0:
-                # Ray intersects sphere; check if in front of spacecraft
-                t1 = (-b - np.sqrt(discriminant)) / (2*a)
-                t2 = (-b + np.sqrt(discriminant)) / (2*a)
-                # Pixel is blocked if sphere is in front (t > 0)
-                if t1 > 1e-6 or (t2 > 1e-6 and t1 < 1e-6):
-                    visible[i] = False
-
-        return visible
+        sky_dirs = sky_dirs / np.linalg.norm(sky_dirs, axis=0, keepdims=True)
+        distance = float(np.linalg.norm(self.spacecraft_pos_gal))
+        moon_to_spacecraft = self.spacecraft_pos_gal / distance
+        limb_dot = -np.sqrt(max(0.0, 1.0 - (self.moon_radius / distance) ** 2))
+        return (moon_to_spacecraft @ sky_dirs) > limb_dot
 
     def emission(self, crds_top, freqs_hz):
         """Return regolith temperature for lunar disk.

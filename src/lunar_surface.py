@@ -1,8 +1,13 @@
-"""Lunar surface geometry and emission models for orbital simulations."""
+"""Compatibility classes for uniform lunar occultation emission.
+
+Lunar occultation geometry is owned by :class:`eigsep_sim.observer.LunarOrbit`
+and consumed by :class:`eigsep_sim.simulate.ForwardModel`.  These classes remain
+as light-weight compatibility helpers for older code that used
+``ForwardModel(..., surface_model=UniformLunarSurface(...))``.
+"""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,7 +17,7 @@ from .const import R_MOON
 
 @dataclass(frozen=True)
 class LunarSurfaceGeometry:
-    """Ray intersections with the lunar surface."""
+    """Deprecated container for legacy lunar-surface intersection results."""
 
     blocked: np.ndarray
     intercepts_gal_m: np.ndarray
@@ -24,14 +29,18 @@ class LunarSurfaceGeometry:
         return ~self.blocked
 
 
-class LunarSurfaceModel(ABC):
-    """Abstract lunar surface emission model."""
+class LunarSurfaceModel:
+    """Deprecated base class for lunar occultation emission compatibility."""
 
     def __init__(self, moon_radius_m=R_MOON):
         self.moon_radius_m = float(moon_radius_m)
 
     def prepare_geometry(self, spacecraft_positions_gal_m, sky_dirs_gal):
-        """Intersect spacecraft rays with a spherical Moon."""
+        """Intersect spacecraft rays with a spherical Moon.
+
+        New code should use ``LunarOrbit.above_horizon*`` for visibility. This
+        method remains for callers that inspect legacy geometry diagnostics.
+        """
         positions = np.asarray(spacecraft_positions_gal_m, dtype=float)
         if positions.ndim == 1:
             positions = positions[None, :]
@@ -55,9 +64,9 @@ class LunarSurfaceModel(ABC):
         normals = intercepts / self.moon_radius_m
         return LunarSurfaceGeometry(blocked, intercepts, normals)
 
-    @abstractmethod
     def thermal_emission(self, geometry, freqs_hz):
-        """Return lunar thermal brightness, shape ``(ntimes, npix, nfreq)``."""
+        """Return lunar thermal brightness for legacy geometry."""
+        raise NotImplementedError
 
     def unresolved_emission(self, freqs_hz):
         """Return the omitted-pixel spectrum, or ``None`` if inexact."""
@@ -65,7 +74,7 @@ class LunarSurfaceModel(ABC):
 
 
 class UniformLunarSurface(LunarSurfaceModel):
-    """Uniform-temperature spherical lunar surface."""
+    """Uniform-temperature lunar occultation emission compatibility helper."""
 
     def __init__(self, T_regolith_K=300.0, moon_radius_m=R_MOON):
         super().__init__(moon_radius_m=moon_radius_m)
