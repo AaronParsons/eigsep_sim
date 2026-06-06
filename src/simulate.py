@@ -29,7 +29,6 @@ from .beam import Beam
 from .sky import Sky
 from .observer import Observer
 from .terrain import Terrain
-from .lunar_surface import LunarSurfaceModel
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ForwardModel
@@ -58,8 +57,9 @@ class ForwardModel:
     terrain : Terrain, optional
         Terrain model for explicit sky blocking. If None, no surface horizon
         is applied; lunar orbit occultation is handled by the observer.
-    surface_model : LunarSurfaceModel, optional
-        Lunar surface emission model. Mutually exclusive with ``terrain``.
+    surface_model : object, optional
+        Deprecated compatibility path for uniform lunar regolith emission.
+        Prefer ``LunarOrbit(..., occultation_temperature_K=...)``.
     """
 
     def __init__(
@@ -69,17 +69,27 @@ class ForwardModel:
         sky: Sky,
         terrain: Terrain | None = None,
         transmitters=None,
-        surface_model: LunarSurfaceModel | None = None,
+        surface_model=None,
     ):
         if terrain is not None and surface_model is not None:
             raise ValueError(
                 "terrain and surface_model are mutually exclusive"
             )
+        if surface_model is not None:
+            if not getattr(observer, "occludes_sky", False):
+                raise TypeError("surface_model requires an occulting observer")
+            if not hasattr(surface_model, "T_regolith_K"):
+                raise TypeError(
+                    "surface_model compatibility supports uniform lunar "
+                    "surface models only"
+                )
+            observer.occultation_temperature_K = float(
+                surface_model.T_regolith_K
+            )
         self.observer = observer
         self.beam = beam
         self.sky = sky
         self.terrain = terrain
-        self.surface_model = surface_model
 
         # Transmitters: list of (direction_topo, freqs_tx_hz, power_K) tuples.
         # direction_topo : (3,) unit vector in topocentric frame
@@ -198,6 +208,17 @@ class ForwardModel:
                 mask |= step_mask
             self.observer.set_time(times[-1])
             return mask
+
+    def _observer_occultation_emission(self):
+        """Return observer-provided emission for occulted rays, if any."""
+        if not getattr(self.observer, "occludes_sky", False):
+            return None
+        if not hasattr(self.observer, "occultation_emission"):
+            return None
+        emission = self.observer.occultation_emission(self.beam.freqs_hz)
+        if emission is None:
+            return None
+        return np.asarray(emission, dtype=np.float32)
 
     def _ensure_jax_arrays(self):
         """Convert and cache basis matrices as JAX arrays; build JIT-compiled sim kernel."""
@@ -640,9 +661,9 @@ class ForwardModel:
             crds_gal = self._crds_gal  # (3, npix_sky)
 
         npix_vis = crds_gal.shape[1]
-        if self.terrain is not None or self.surface_model is not None:
-            emission_model = self.terrain or self.surface_model
-            unresolved_emission = emission_model.unresolved_emission(
+        observer_occultation_emission = self._observer_occultation_emission()
+        if self.terrain is not None:
+            unresolved_emission = self.terrain.unresolved_emission(
                 self.beam.freqs_hz
             )
             unresolved_default_emission = np.zeros(
@@ -651,8 +672,9 @@ class ForwardModel:
             if unresolved_emission is None:
                 if sky_mask is not None and npix_vis != self.sky.npix:
                     raise ValueError(
-                        "sky_mask with surface emission requires unresolved_emission() "
-                        "or full geometry for exact omitted-pixel emission"
+                        "sky_mask with terrain emission requires "
+                        "unresolved_emission() or full geometry for exact "
+                        "omitted-pixel emission"
                     )
                 unresolved_emission = np.zeros(
                     len(self.beam.freqs_hz), dtype=np.float32
@@ -661,6 +683,11 @@ class ForwardModel:
                 unresolved_emission = np.asarray(
                     unresolved_emission, dtype=np.float32
                 )
+        elif observer_occultation_emission is not None:
+            unresolved_emission = observer_occultation_emission
+            unresolved_default_emission = np.zeros(
+                len(self.beam.freqs_hz), dtype=np.float32
+            )
         else:
             unresolved_emission = np.zeros(
                 len(self.beam.freqs_hz), dtype=np.float32
@@ -707,18 +734,33 @@ class ForwardModel:
                     t_emit = self.terrain.emission(
                         crds_top_arr[i], self.beam.freqs_hz
                     ).astype(np.float32)
+                    if observer_occultation_emission is not None:
+                        t_emit = t_emit + (
+                            (1.0 - obs_masks[i])[:, None]
+                            * observer_occultation_emission[None, :]
+                        )
+                        default_mask = np.zeros(npix_vis, dtype=np.float32)
+                    else:
+                        default_mask = 1.0 - obs_masks[i]
                     terrain_emissions_list.append(t_emit)
-                    default_emission_masks_list.append(1.0 - obs_masks[i])
+                    default_emission_masks_list.append(default_mask)
                 terrain_masks = np.stack(terrain_masks_list)
                 terrain_emissions = np.stack(terrain_emissions_list)
                 default_emission_masks = np.stack(default_emission_masks_list)
             else:
                 terrain_masks = obs_masks
-                terrain_emissions = np.zeros(
-                    (ntimes, npix_vis, len(self.beam.freqs_hz)),
-                    dtype=np.float32,
-                )
-                default_emission_masks = 1.0 - obs_masks
+                if observer_occultation_emission is not None:
+                    terrain_emissions = (
+                        (1.0 - obs_masks)[:, :, None]
+                        * observer_occultation_emission[None, None, :]
+                    ).astype(np.float32)
+                    default_emission_masks = np.zeros_like(obs_masks)
+                else:
+                    terrain_emissions = np.zeros(
+                        (ntimes, npix_vis, len(self.beam.freqs_hz)),
+                        dtype=np.float32,
+                    )
+                    default_emission_masks = 1.0 - obs_masks
 
         elif times is not None:
             times = [Time(t) if not isinstance(t, Time) else t for t in times]
@@ -785,17 +827,36 @@ class ForwardModel:
                     t_emit = self.terrain.emission(
                         crds_top, self.beam.freqs_hz
                     ).astype(np.float32)
+                    if observer_occultation_emission is not None:
+                        t_emit = t_emit + (
+                            (1.0 - obs_mask)[:, None]
+                            * observer_occultation_emission[None, :]
+                        )
+                        default_mask = np.zeros(npix_vis, dtype=np.float32)
+                    else:
+                        default_mask = 1.0 - obs_mask
                     emissions_list.append(t_emit)
-                    default_emission_masks_list.append(1.0 - obs_mask)
+                    default_emission_masks_list.append(default_mask)
                 else:
                     masks_list.append(obs_mask)
-                    emissions_list.append(
-                        np.zeros(
-                            (npix_vis, len(self.beam.freqs_hz)),
-                            dtype=np.float32,
+                    if observer_occultation_emission is not None:
+                        emissions_list.append(
+                            (
+                                (1.0 - obs_mask)[:, None]
+                                * observer_occultation_emission[None, :]
+                            ).astype(np.float32)
                         )
-                    )
-                    default_emission_masks_list.append(1.0 - obs_mask)
+                        default_emission_masks_list.append(
+                            np.zeros(npix_vis, dtype=np.float32)
+                        )
+                    else:
+                        emissions_list.append(
+                            np.zeros(
+                                (npix_vis, len(self.beam.freqs_hz)),
+                                dtype=np.float32,
+                            )
+                        )
+                        default_emission_masks_list.append(1.0 - obs_mask)
 
             R_arr = np.stack(rot_list)
             geom.update(
@@ -813,35 +874,6 @@ class ForwardModel:
             self.observer.set_time(times[-1])
         else:
             raise ValueError("Either times or rots must be provided")
-
-        if self.surface_model is not None:
-            if not hasattr(self.observer, "spacecraft_position"):
-                raise TypeError("surface_model requires an orbital observer")
-            if times is not None:
-                if hasattr(self.observer, "spacecraft_position_stack"):
-                    positions = self.observer.spacecraft_position_stack(times)
-                else:
-                    positions = []
-                    for time in times:
-                        self.observer.set_time(time)
-                        positions.append(self.observer.spacecraft_position())
-                    positions = np.stack(positions)
-            else:
-                # With rots=, evaluate the current orbital phase and repeat it.
-                positions = np.broadcast_to(
-                    self.observer.spacecraft_position(), (ntimes, 3)
-                )
-            surface_geometry = self.surface_model.prepare_geometry(
-                positions, crds_gal
-            )
-            terrain_masks = surface_geometry.sky_mask.astype(np.float32)
-            terrain_emissions = self.surface_model.thermal_emission(
-                surface_geometry, self.beam.freqs_hz
-            ).astype(np.float32)
-            default_emission_masks = np.zeros_like(terrain_masks)
-            geom["surface_geometry"] = surface_geometry
-            if "masks" in geom:
-                geom["masks"] = terrain_masks
 
         # Build body_rots array: identity if not provided.
         if body_rots is not None:

@@ -141,16 +141,20 @@ def test_forward_model_uniform_surface_matches_scalar_fallback_and_reduction():
     _, _, sky, sky_coeffs, beam, observer = _simple_objects()
     times = observer.t0 + np.array([0.0, 900.0]) * u.s
     scalar = ForwardModel(observer, beam, sky)
-    surface = ForwardModel(
-        observer, beam, sky, surface_model=UniformLunarSurface(300.0)
-    )
+
+    _, _, _, _, _, emitting_observer = _simple_objects()
+    emitting_observer.occultation_temperature_K = 300.0
+    surface = ForwardModel(emitting_observer, beam, sky)
+
     scalar_geom = scalar.precompute_geometry(times=times)
     surface_geom = surface.precompute_geometry(times=times)
     scalar_truth = np.asarray(
         scalar.simulate(sky_coeffs, beam.coeffs, geom=scalar_geom, T_gnd=300.0)
     )
     surface_truth = np.asarray(
-        surface.simulate(sky_coeffs, beam.coeffs, geom=surface_geom)
+        surface.simulate(
+            sky_coeffs, beam.coeffs, geom=surface_geom, T_gnd=999.0
+        )
     )
     np.testing.assert_allclose(
         surface_truth, scalar_truth, rtol=2e-5, atol=2e-4
@@ -158,11 +162,20 @@ def test_forward_model_uniform_surface_matches_scalar_fallback_and_reduction():
     sky_mask = surface.build_sky_mask(times=times)
     reduced_geom = surface.precompute_geometry(times=times, sky_mask=sky_mask)
     reduced_truth = np.asarray(
-        surface.simulate(sky_coeffs, beam.coeffs, geom=reduced_geom)
+        surface.simulate(
+            sky_coeffs, beam.coeffs, geom=reduced_geom, T_gnd=999.0
+        )
     )
     np.testing.assert_allclose(
         reduced_truth, surface_truth, rtol=2e-5, atol=2e-4
     )
+
+    _, _, _, _, _, legacy_observer = _simple_objects()
+    legacy = ForwardModel(
+        legacy_observer, beam, sky, surface_model=UniformLunarSurface(300.0)
+    )
+    assert legacy.terrain is None
+    assert legacy_observer.occultation_temperature_K == 300.0
     with pytest.raises(ValueError, match="mutually exclusive"):
         ForwardModel(
             observer,

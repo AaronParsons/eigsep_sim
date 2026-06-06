@@ -16,7 +16,6 @@ from scipy.integrate import solve_ivp
 from scipy.spatial.transform import Rotation, Slerp
 
 from .beam import Beam
-from .lunar_surface import UniformLunarSurface
 from .models import T21cmModel
 from .observer import LunarOrbit
 from .simulate import ForwardModel
@@ -246,9 +245,7 @@ class LunarCampaign:
         self.source_config = config.get(
             "sources", {"earth": {"enabled": False}, "sun": {"enabled": False}}
         )
-        self.surface_model = UniformLunarSurface(
-            config["surface"]["T_regolith_K"]
-        )
+        self.T_regolith_K = float(config["surface"]["T_regolith_K"])
         epoch = Time(orbit_cfg["epoch"])
         self.observers = [
             LunarOrbit(
@@ -257,14 +254,12 @@ class LunarCampaign:
                 rot_spin_vec=[0.0, 0.0, 1.0],
                 spin_period=0.0,
                 t0=epoch,
+                occultation_temperature_K=self.T_regolith_K,
             )
             for normal in self.orbit_normals_gal
         ]
         self.forward_models = [
-            ForwardModel(
-                obs, self.beam, self.sky, surface_model=self.surface_model
-            )
-            for obs in self.observers
+            ForwardModel(obs, self.beam, self.sky) for obs in self.observers
         ]
 
     def make_times(self):

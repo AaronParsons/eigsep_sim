@@ -342,6 +342,7 @@ class LunarOrbit(Observer):
         start_pos=None,
         spin_period=0.0,
         t0=None,
+        occultation_temperature_K=None,
     ):
         self.altitude = altitude
         self.orbital_radius = R_MOON + altitude
@@ -360,6 +361,11 @@ class LunarOrbit(Observer):
 
         self.spin_period = float(spin_period)
         self.t0 = Time("J2000") if t0 is None else Time(t0)
+        self.occultation_temperature_K = (
+            None
+            if occultation_temperature_K is None
+            else float(occultation_temperature_K)
+        )
         super().__init__()
         self.time = self.t0
 
@@ -478,3 +484,11 @@ class LunarOrbit(Observer):
         dot = moon_dir @ self._pix_vecs(nside)
         limb_dot = -np.sqrt(max(0.0, 1.0 - (R_MOON / d) ** 2))
         return dot > limb_dot
+
+    def occultation_emission(self, freqs_hz):
+        """Uniform thermal brightness for Moon-blocked directions, if set."""
+        if self.occultation_temperature_K is None:
+            return None
+        return np.full(
+            len(freqs_hz), self.occultation_temperature_K, dtype=np.float32
+        )
