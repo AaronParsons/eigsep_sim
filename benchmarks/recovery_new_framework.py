@@ -101,16 +101,14 @@ def sampled_beam_weights(geom, beam_coeffs, beam_basis_A):
     ntimes = pixels.shape[0]
     n_dipoles, _, nfreq = beam_maps.shape
     beam_weights = np.zeros((ntimes, n_dipoles, nfreq), dtype=float)
-    for freq_index in range(nfreq):
-        for dipole_index in range(n_dipoles):
-            beam_map = beam_maps[dipole_index, :, freq_index]
-            beam_weights[:, dipole_index, freq_index] = sum(
-                (
-                    beam_map[pixels[:, neighbor_index, :]]
-                    * weights[:, neighbor_index, :]
-                ).sum(axis=1)
-                for neighbor_index in range(4)
-            )
+    for neighbor_index in range(4):
+        sampled = beam_maps[:, pixels[:, neighbor_index, :], :]
+        beam_weights += np.einsum(
+            "dtpf,tp->tdf",
+            sampled,
+            weights[:, neighbor_index, :],
+            optimize=True,
+        )
     return beam_weights
 
 
@@ -179,6 +177,7 @@ def run_solver(
     calibrator._beam_nom = fwd.beam.coeffs.copy()
     params = {key: value.copy() for key, value in params_ini.items()}
     loss_initial = float(calibrator._loss(params))
+    data_loss_initial = float(calibrator.data_loss(params))
     result, seconds = elapsed(
         f"fit [{name}]",
         lambda: calibrator.fit(
@@ -206,11 +205,20 @@ def run_solver(
     telemetry = result.get("telemetry", [])
     if telemetry:
         last = telemetry[-1]
+        data_loss_final = float(calibrator.data_loss(result["params"]))
         dchi2_total = loss_initial - last["loss"]
+        data_dchi2_total = data_loss_initial - data_loss_final
         telemetry_summary = {
             "last_step_type": last.get("step_type"),
             "last_delta_chi2_per_sec": last.get("delta_chi2_per_sec"),
             "total_delta_chi2": dchi2_total,
+            "total_delta_data_chi2": data_dchi2_total,
+            "data_chi2_initial": data_loss_initial,
+            "data_chi2_final": data_loss_final,
+            "data_chi2_delta": data_dchi2_total,
+            "data_chi2_per_sec": (
+                data_dchi2_total / seconds if seconds > 0 else None
+            ),
             "median_delta_chi2_per_sec": float(
                 np.nanmedian(
                     [t.get("delta_chi2_per_sec", np.nan) for t in telemetry]
@@ -324,6 +332,14 @@ def main(args):
                 "loss_final": (
                     float(result["losses"][-1]) if result["losses"] else None
                 ),
+                "data_chi2_initial": telemetry_summary.get(
+                    "data_chi2_initial"
+                ),
+                "data_chi2_final": telemetry_summary.get("data_chi2_final"),
+                "data_chi2_delta": telemetry_summary.get("data_chi2_delta"),
+                "data_chi2_per_sec": telemetry_summary.get(
+                    "data_chi2_per_sec"
+                ),
                 "sky_relative_rms": float(errors["sky_relative_rms"]),
                 "beam_relative_rms": float(errors["beam_relative_rms"]),
                 "telemetry_summary": telemetry_summary,
@@ -362,7 +378,7 @@ if __name__ == "__main__":
             "joint",
             "all",
         ],
-        default="adaptive-fixed-point",
+        default="adaptive-scheduled",
     )
     parser.add_argument("--nside-sky", type=int, default=8)
     parser.add_argument("--nside-beam", type=int, default=8)

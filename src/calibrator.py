@@ -23,6 +23,8 @@ from .const import DTYPE_R_NPY, DTYPE_R_JAX
 from .simulate import ForwardModel
 from .linear_solver import normal_solve
 
+_BEAM_HARMONIC_Q_CACHE = {}
+
 
 class AndersonAccelerator:
     """
@@ -197,6 +199,9 @@ class Calibrator:
         self._beam_harmonic_power = float(beam_harmonic_power)
         self._beam_harmonic_q = None
         self._beam_harmonic_q_jax = None
+        self._beam_harmonic_gram = None
+        self._beam_harmonic_gram_jax = None
+        self._beam_harmonic_penalty_jit = None
         self._beam_harmonic_diag = None
         self._data_flat_jax = jnp.reshape(
             jnp.asarray(self._data, dtype=DTYPE_R_JAX),
@@ -206,6 +211,7 @@ class Calibrator:
             jnp.asarray(self._inv_noise_var, dtype=DTYPE_R_JAX),
             (-1, self._inv_noise_var.shape[-1]),
         )
+        self._observation_cache = {}
 
         # Anderson accelerator
         self._aa = AndersonAccelerator(m=m_anderson)
@@ -215,6 +221,33 @@ class Calibrator:
 
         # Precomputed geometry (cached from init_params or fit)
         self._geom = None
+
+    def _matched_observations(self, pred_shape):
+        """Return cached observations matched to a simulator output shape."""
+        pred_shape = tuple(int(dim) for dim in pred_shape)
+        cached = self._observation_cache.get(pred_shape)
+        if cached is not None:
+            return cached
+
+        nfreq = pred_shape[-1]
+        data = self.fwd._match_observation_shape(
+            self._data, pred_shape, name="data"
+        )
+        inv_noise_var = self.fwd._match_observation_shape(
+            self._inv_noise_var, pred_shape, name="inv_noise_var"
+        )
+        cached = {
+            "data": data,
+            "inv_noise_var": inv_noise_var,
+            "data_flat_jax": jnp.reshape(
+                jnp.asarray(data, dtype=DTYPE_R_JAX), (-1, nfreq)
+            ),
+            "inv_noise_var_flat_jax": jnp.reshape(
+                jnp.asarray(inv_noise_var, dtype=DTYPE_R_JAX), (-1, nfreq)
+            ),
+        }
+        self._observation_cache[pred_shape] = cached
+        return cached
 
     def _resolve_geom(
         self, times=None, rots=None, body_rots=None, geom=None, sky_mask=None
@@ -296,21 +329,10 @@ class Calibrator:
         )
 
         # Reshape pred and data to (ntimes*n_dipoles, nfreq) for consistent loss computation
-        pred_shape = tuple(int(dim) for dim in pred.shape)
-        data = self.fwd._match_observation_shape(
-            self._data, pred_shape, name="data"
-        )
-        inv_noise_var = self.fwd._match_observation_shape(
-            self._inv_noise_var, pred_shape, name="inv_noise_var"
-        )
+        obs = self._matched_observations(pred.shape)
         pred_flat = jnp.reshape(pred, (-1, pred.shape[-1]))
-        data_flat = jnp.reshape(
-            jnp.asarray(data, dtype=DTYPE_R_JAX), (-1, pred.shape[-1])
-        )
-        inv_noise_var_flat = jnp.reshape(
-            jnp.asarray(inv_noise_var, dtype=DTYPE_R_JAX),
-            (-1, pred.shape[-1]),
-        )
+        data_flat = obs["data_flat_jax"]
+        inv_noise_var_flat = obs["inv_noise_var_flat_jax"]
         # Data residual
         resid = pred_flat - data_flat
         loss = jnp.mean(inv_noise_var_flat * resid**2)
@@ -333,6 +355,20 @@ class Calibrator:
             loss = loss + self._lam_sky * jnp.mean(params["sky_coeffs"] ** 2)
 
         return loss
+
+    def data_loss(self, params: Dict[str, np.ndarray]) -> float:
+        """Return the unregularized weighted residual loss."""
+        import jax.numpy as jnp
+
+        pred = self.fwd.simulate(
+            params["sky_coeffs"], params["beam_coeffs"], geom=self._geom
+        )
+        obs = self._matched_observations(pred.shape)
+        pred_flat = jnp.reshape(pred, (-1, pred.shape[-1]))
+        data_flat = obs["data_flat_jax"]
+        inv_noise_var_flat = obs["inv_noise_var_flat_jax"]
+        resid = pred_flat - data_flat
+        return float(jnp.mean(inv_noise_var_flat * resid**2))
 
     def sky_step(
         self,
@@ -747,40 +783,82 @@ class Calibrator:
             else min(int(self._beam_harmonic_lmax), lmax_default)
         )
         lmin = max(0, int(self._beam_harmonic_lmin))
-        if lmax < lmin:
-            q = np.zeros((npix, npix), dtype=DTYPE_R_NPY)
-        else:
-            ell, _ = healpy.Alm.getlm(lmax)
-            weights = np.zeros_like(ell, dtype=DTYPE_R_NPY)
-            active = ell >= lmin
-            if np.any(active):
-                ell_norm = max(float(lmin * (lmin + 1)), 1.0)
-                weights[active] = (
-                    ell[active] * (ell[active] + 1.0) / ell_norm
-                ) ** self._beam_harmonic_power
-
-            q = np.empty((npix, npix), dtype=DTYPE_R_NPY)
-            unit = np.zeros(npix, dtype=DTYPE_R_NPY)
-            for pix in range(npix):
-                unit[pix] = 1.0
-                alm = healpy.map2alm(
-                    unit, lmax=lmax, iter=0, pol=False, use_weights=False
-                )
-                q[:, pix] = healpy.alm2map(
-                    alm * weights, nside, lmax=lmax, pol=False
-                )
-                unit[pix] = 0.0
-            q = 0.5 * (q + q.T)
-
-        self._beam_harmonic_q = np.asarray(q, dtype=DTYPE_R_NPY)
-        self._beam_harmonic_q_jax = jnp.asarray(
-            self._beam_harmonic_q, dtype=DTYPE_R_JAX
+        cache_key = (
+            nside,
+            npix,
+            lmin,
+            lmax,
+            float(self._beam_harmonic_power),
         )
-        q_diag = np.clip(np.diag(self._beam_harmonic_q), 0.0, np.inf)
+        q = _BEAM_HARMONIC_Q_CACHE.get(cache_key)
+        if q is None:
+            if lmax < lmin:
+                q = np.zeros((npix, npix), dtype=DTYPE_R_NPY)
+            else:
+                ell, _ = healpy.Alm.getlm(lmax)
+                weights = np.zeros_like(ell, dtype=DTYPE_R_NPY)
+                active = ell >= lmin
+                if np.any(active):
+                    ell_norm = max(float(lmin * (lmin + 1)), 1.0)
+                    weights[active] = (
+                        ell[active] * (ell[active] + 1.0) / ell_norm
+                    ) ** self._beam_harmonic_power
+
+                q = np.empty((npix, npix), dtype=DTYPE_R_NPY)
+                # map2alm/alm2map accept a stack of maps. Chunking avoids one
+                # HEALPix transform call per pixel while keeping memory bounded.
+                chunk = max(1, min(npix, 256))
+                for start in range(0, npix, chunk):
+                    stop = min(start + chunk, npix)
+                    unit_maps = np.zeros(
+                        (stop - start, npix), dtype=DTYPE_R_NPY
+                    )
+                    unit_maps[
+                        np.arange(stop - start), np.arange(start, stop)
+                    ] = 1.0
+                    alm = healpy.map2alm(
+                        unit_maps,
+                        lmax=lmax,
+                        iter=0,
+                        pol=False,
+                        use_weights=False,
+                    )
+                    filtered = healpy.alm2map(
+                        alm * weights[None, :],
+                        nside,
+                        lmax=lmax,
+                        pol=False,
+                    )
+                    q[:, start:stop] = filtered.T
+                q = 0.5 * (q + q.T)
+                q = np.asarray(q, dtype=DTYPE_R_NPY)
+            _BEAM_HARMONIC_Q_CACHE[cache_key] = q
+
+        self._beam_harmonic_q = q
+        self._beam_harmonic_q_jax = jnp.asarray(q, dtype=DTYPE_R_JAX)
+        self._beam_harmonic_penalty_jit = None
+        q_diag = np.clip(np.diag(q), 0.0, np.inf)
         basis_A = self._beam_basis_A_np()
-        basis_power = np.sum(basis_A**2, axis=0) / max(
-            float(basis_A.shape[0]), 1.0
+        self._beam_harmonic_gram = (
+            basis_A.T @ basis_A / max(float(basis_A.shape[0]), 1.0)
+        ).astype(DTYPE_R_NPY)
+        self._beam_harmonic_gram_jax = jnp.asarray(
+            self._beam_harmonic_gram, dtype=DTYPE_R_JAX
         )
+
+        q_jax = self._beam_harmonic_q_jax
+        gram_jax = self._beam_harmonic_gram_jax
+
+        @jax.jit
+        def penalty_jit(beam_coeffs, reference_coeffs):
+            diff_coeffs = beam_coeffs - reference_coeffs
+            q_diff = jnp.einsum("pq,dqk->dpk", q_jax, diff_coeffs)
+            grad_like = jnp.einsum("dpl,lk->dpk", q_diff, gram_jax)
+            norm = max(float(beam_coeffs.shape[0] * beam_coeffs.shape[1]), 1.0)
+            return jnp.sum(diff_coeffs * grad_like) / norm
+
+        self._beam_harmonic_penalty_jit = penalty_jit
+        basis_power = np.clip(np.diag(self._beam_harmonic_gram), 0.0, np.inf)
         self._beam_harmonic_diag = (
             q_diag[None, :, None] * basis_power[None, None, :]
         ).astype(DTYPE_R_NPY)
@@ -807,43 +885,42 @@ class Calibrator:
             )
         return self._beam_maps_np(self._beam_nom)
 
-    def _beam_harmonic_apply_np(self, beam_coeffs):
+    def _beam_harmonic_apply_np(self, beam_coeffs, return_penalty=False):
         q = self._ensure_beam_harmonic_regularizer()
+        coeffs = np.asarray(beam_coeffs, dtype=DTYPE_R_NPY)
         if q is None:
-            return np.zeros_like(np.asarray(beam_coeffs, dtype=DTYPE_R_NPY))
-        beam_maps = self._beam_maps_np(beam_coeffs)
-        diff_maps = beam_maps - self._beam_reference_maps_np(beam_coeffs)
-        filtered_maps = np.einsum("pq,dqf->dpf", q, diff_maps)
-        basis_A = self._beam_basis_A_np()
-        return np.asarray(
-            np.einsum("dpf,fk->dpk", filtered_maps, basis_A)
-            / max(float(basis_A.shape[0]), 1.0),
+            grad = np.zeros_like(coeffs)
+            return (grad, 0.0) if return_penalty else grad
+        if self._beam_nom is None:
+            diff_coeffs = coeffs
+        else:
+            diff_coeffs = coeffs - self._beam_nom
+        q_diff = np.einsum("pq,dqk->dpk", q, diff_coeffs)
+        grad = np.asarray(
+            np.einsum("dpl,lk->dpk", q_diff, self._beam_harmonic_gram),
             dtype=DTYPE_R_NPY,
         )
+        if return_penalty:
+            norm = max(float(diff_coeffs.shape[0] * diff_coeffs.shape[1]), 1.0)
+            return grad, float(np.sum(diff_coeffs * grad) / norm)
+        return grad
 
     def _beam_harmonic_penalty_jax(self, beam_coeffs):
         self._ensure_beam_harmonic_regularizer()
-        q = self._beam_harmonic_q_jax
         beam = jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
-        basis_A = jnp.asarray(self.fwd.beam.basis.A, dtype=DTYPE_R_JAX)
-        beam_maps = jnp.einsum("dpk,fk->dpf", beam, basis_A)
         if self._beam_nom is None:
-            ref_maps = jnp.zeros_like(beam_maps)
+            ref = jnp.zeros_like(beam)
         else:
             ref = jnp.asarray(self._beam_nom, dtype=DTYPE_R_JAX)
-            ref_maps = jnp.einsum("dpk,fk->dpf", ref, basis_A)
-        diff_maps = beam_maps - ref_maps
-        filtered_maps = jnp.einsum("pq,dqf->dpf", q, diff_maps)
-        return jnp.mean(diff_maps * filtered_maps)
+        return self._beam_harmonic_penalty_jit(beam, ref)
 
     def _beam_harmonic_penalty(self, beam_coeffs):
         if self._lam_beam_harmonic <= 0:
             return 0.0
-        q = self._ensure_beam_harmonic_regularizer()
-        beam_maps = self._beam_maps_np(beam_coeffs)
-        diff_maps = beam_maps - self._beam_reference_maps_np(beam_coeffs)
-        filtered_maps = np.einsum("pq,dqf->dpf", q, diff_maps)
-        return float(np.mean(diff_maps * filtered_maps))
+        _, penalty = self._beam_harmonic_apply_np(
+            beam_coeffs, return_penalty=True
+        )
+        return penalty
 
     def _split_aligned_update(self, delta, reference):
         """Split ``delta`` into components parallel/perpendicular to reference."""
@@ -892,12 +969,9 @@ class Calibrator:
             params["sky_coeffs"], params["beam_coeffs"], geom=self._geom
         )
         pred_np = np.asarray(pred)
-        data = self.fwd._match_observation_shape(
-            self._data, pred_np.shape, name="data"
-        )
-        inv_noise_var = self.fwd._match_observation_shape(
-            self._inv_noise_var, pred_np.shape, name="inv_noise_var"
-        )
+        obs = self._matched_observations(pred_np.shape)
+        data = obs["data"]
+        inv_noise_var = obs["inv_noise_var"]
         residual = pred_np - data
         adj = self.fwd.accumulate_sky_beam_adjoint(
             params["sky_coeffs"],
@@ -911,21 +985,32 @@ class Calibrator:
         beam_num = np.asarray(adj["beam_num"], dtype=DTYPE_R_NPY)
         beam_den = np.asarray(adj["beam_den"], dtype=DTYPE_R_NPY)
 
+        regularization_loss = 0.0
         if self._lam_sky > 0:
             sky_den = sky_den + self._lam_sky
             sky_num = sky_num - self._lam_sky * params["sky_coeffs"]
+            regularization_loss += self._lam_sky * float(
+                np.mean(params["sky_coeffs"] ** 2)
+            )
         if self._lam_beam > 0 and self._beam_nom is not None:
+            beam_diff = params["beam_coeffs"] - self._beam_nom
             beam_den = beam_den + self._lam_beam
-            beam_num = beam_num - self._lam_beam * (
-                params["beam_coeffs"] - self._beam_nom
+            beam_num = beam_num - self._lam_beam * beam_diff
+            regularization_loss += self._lam_beam * float(
+                np.mean(beam_diff**2)
             )
         if self._lam_beam_harmonic > 0:
-            beam_harmonic_grad = self._beam_harmonic_apply_np(
-                params["beam_coeffs"]
+            beam_harmonic_grad, beam_harmonic_penalty = (
+                self._beam_harmonic_apply_np(
+                    params["beam_coeffs"], return_penalty=True
+                )
             )
             beam_num = beam_num - self._lam_beam_harmonic * beam_harmonic_grad
             beam_den = beam_den + self._lam_beam_harmonic * (
                 self._beam_harmonic_diag
+            )
+            regularization_loss += (
+                self._lam_beam_harmonic * beam_harmonic_penalty
             )
 
         sky_floor = lambda_damp * max(float(np.max(sky_den)), 1e-30)
@@ -943,7 +1028,8 @@ class Calibrator:
             joint_scale_alpha,
         ) = self._project_joint_scale_tangent(sky_delta, beam_delta, params)
 
-        loss_before = float(self._loss(params))
+        loss_before = float(np.mean(inv_noise_var * residual**2))
+        loss_before += regularization_loss
         best = params
         best_loss = loss_before
         best_type = "none"

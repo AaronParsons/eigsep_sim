@@ -112,6 +112,21 @@ def test_calibrator_init_params():
     assert np.all(params["sky_coeffs"] == 0.0)
 
 
+def test_calibrator_data_loss_matches_loss_without_regularization():
+    """data_loss() should match _loss() when regularizers are disabled."""
+    fwd = setup_forward_model()
+    times = [Time("2000-01-01"), Time("2000-01-01 00:01:00")]
+    geom = fwd.precompute_geometry(times=times)
+    data = np.asarray(
+        fwd.simulate(fwd.sky.init_coeffs(), fwd.beam.coeffs, geom=geom)
+    )
+    cal = Calibrator(
+        fwd, data, lam_beam=0.0, lam_sky=0.0, lam_beam_harmonic=0.0
+    )
+    params = cal.init_params(geom=geom)
+    assert np.isclose(cal.data_loss(params), cal._loss(params))
+
+
 def test_calibrator_init_params_with_times():
     """Calibrator: init_params() precomputes geometry when times provided."""
     fwd = setup_forward_model()
@@ -685,6 +700,45 @@ def test_calibrator_adaptive_scheduled_runs_and_records_state():
         "schedule_step_gain_joint",
     ):
         assert key in first
+
+
+def test_calibrator_beam_harmonic_coefficient_penalty_matches_map_space():
+    """Coefficient-space harmonic prior matches the explicit map penalty."""
+    fwd = setup_forward_model()
+    times = [Time("2000-01-01"), Time("2000-01-01 00:01:00")]
+    geom = fwd.precompute_geometry(times=times)
+    data = np.asarray(
+        fwd.simulate(fwd.sky.init_coeffs(), fwd.beam.coeffs, geom=geom)
+    )
+    cal = Calibrator(
+        fwd,
+        data,
+        lam_beam=0.0,
+        lam_beam_harmonic=1e-2,
+        beam_harmonic_lmin=2,
+        beam_harmonic_lmax=5,
+    )
+    params = cal.init_params(geom=geom)
+    rng = np.random.default_rng(0)
+    beam_coeffs = params["beam_coeffs"] + 0.03 * rng.normal(
+        size=params["beam_coeffs"].shape
+    )
+
+    q = cal._ensure_beam_harmonic_regularizer()
+    basis_A = cal._beam_basis_A_np()
+    diff_maps = cal._beam_maps_np(beam_coeffs) - cal._beam_maps_np(
+        cal._beam_nom
+    )
+    map_penalty = float(
+        np.mean(diff_maps * np.einsum("pq,dqf->dpf", q, diff_maps))
+    )
+
+    np.testing.assert_allclose(
+        cal._beam_harmonic_penalty(beam_coeffs),
+        map_penalty,
+        rtol=1e-10,
+        atol=1e-12,
+    )
 
 
 def test_calibrator_beam_harmonic_regularizer_penalizes_shape():
