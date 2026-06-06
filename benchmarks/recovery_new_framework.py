@@ -185,6 +185,7 @@ def run_solver(
             max_iter=args.max_iter,
             tol=args.tol,
             verbose=False,
+            telemetry_level="summary",
             **solver_options(name, args),
         ),
     )

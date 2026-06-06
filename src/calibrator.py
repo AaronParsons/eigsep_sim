@@ -203,14 +203,6 @@ class Calibrator:
         self._beam_harmonic_gram_jax = None
         self._beam_harmonic_penalty_jit = None
         self._beam_harmonic_diag = None
-        self._data_flat_jax = jnp.reshape(
-            jnp.asarray(self._data, dtype=DTYPE_R_JAX),
-            (-1, self._data.shape[-1]),
-        )
-        self._inv_noise_var_flat_jax = jnp.reshape(
-            jnp.asarray(self._inv_noise_var, dtype=DTYPE_R_JAX),
-            (-1, self._inv_noise_var.shape[-1]),
-        )
         self._observation_cache = {}
 
         # Anderson accelerator
@@ -964,6 +956,7 @@ class Calibrator:
         beam_cg_niter=5,
         beam_cg_tol=1e-2,
         blocks=("joint", "sky", "beam"),
+        diagnostics=True,
     ):
         pred = self.fwd.simulate(
             params["sky_coeffs"], params["beam_coeffs"], geom=self._geom
@@ -1097,28 +1090,29 @@ class Calibrator:
                 best_loss = loss_candidate
                 best_type = "fast-cg"
 
-        return (
-            best,
-            best_loss,
-            best_type,
-            {
-                "sky_update_rms": self._rms(sky_delta),
-                "beam_update_rms": self._rms(beam_delta),
-                "beam_shape_update_rms": self._rms(beam_shape_delta),
-                "beam_scale_update_rms": self._rms(beam_scale_delta),
-                "joint_sky_shape_update_rms": self._rms(joint_sky_delta),
-                "joint_sky_scale_update_rms": self._rms(joint_sky_scale_delta),
-                "joint_beam_shape_update_rms": self._rms(joint_beam_delta),
-                "joint_beam_scale_update_rms": self._rms(
-                    joint_beam_scale_delta
-                ),
-                "beam_scale_alpha": beam_scale_alpha,
-                "joint_scale_alpha": joint_scale_alpha,
-                "sky_diag_floor": sky_floor,
-                "beam_diag_floor": beam_floor,
-                **candidate_summary,
-            },
-        )
+        step_info = {**candidate_summary}
+        if diagnostics:
+            step_info.update(
+                {
+                    "sky_update_rms": self._rms(sky_delta),
+                    "beam_update_rms": self._rms(beam_delta),
+                    "beam_shape_update_rms": self._rms(beam_shape_delta),
+                    "beam_scale_update_rms": self._rms(beam_scale_delta),
+                    "joint_sky_shape_update_rms": self._rms(joint_sky_delta),
+                    "joint_sky_scale_update_rms": self._rms(
+                        joint_sky_scale_delta
+                    ),
+                    "joint_beam_shape_update_rms": self._rms(joint_beam_delta),
+                    "joint_beam_scale_update_rms": self._rms(
+                        joint_beam_scale_delta
+                    ),
+                    "beam_scale_alpha": beam_scale_alpha,
+                    "joint_scale_alpha": joint_scale_alpha,
+                    "sky_diag_floor": sky_floor,
+                    "beam_diag_floor": beam_floor,
+                }
+            )
+        return best, best_loss, best_type, step_info
 
     def fit(
         self,
@@ -1146,6 +1140,7 @@ class Calibrator:
         schedule_lbfgs_min_iter: int = 20,
         schedule_lbfgs_maxiter: int = 3,
         schedule_lbfgs_max_runs: int = 1,
+        telemetry_level: str = "full",
     ) -> Dict:
         """Run calibration.
 
@@ -1156,6 +1151,10 @@ class Calibrator:
         ``use_cg=True`` selects ``cg`` when the default solver is not explicitly
         overridden.
         """
+        if telemetry_level not in ("summary", "full"):
+            raise ValueError("telemetry_level must be 'summary' or 'full'")
+        full_telemetry = telemetry_level == "full"
+
         if params is None:
             params = self.init_params(
                 times=times,
@@ -1198,6 +1197,7 @@ class Calibrator:
                 beam_cg_niter=beam_cg_niter,
                 beam_cg_tol=beam_cg_tol,
                 lambda_damp=lambda_damp,
+                telemetry_level=telemetry_level,
             )
             return self.fit_lbfgs(
                 first["params"], maxiter=20, history=first.get("telemetry", [])
@@ -1301,6 +1301,7 @@ class Calibrator:
                             beam_cg_niter=min(beam_cg_niter, 10),
                             beam_cg_tol=beam_cg_tol,
                             blocks=blocks,
+                            diagnostics=full_telemetry,
                         )
                     )
             elif solver == "joint":
@@ -1392,54 +1393,74 @@ class Calibrator:
                 "delta_chi2": delta,
                 "delta_chi2_per_sec": delta / max(wall_time, 1e-30),
                 "step_type": step_type,
-                "projected_sky_rms": self._rms(params["sky_coeffs"]),
-                "projected_beam_rms": self._rms(params["beam_coeffs"]),
-                "beam_scatter": float(np.std(params["beam_coeffs"])),
-                "beam_roughness": self._beam_roughness(params["beam_coeffs"]),
-                "beam_harmonic_penalty": self._beam_harmonic_penalty(
-                    params["beam_coeffs"]
-                ),
             }
+            if full_telemetry:
+                entry.update(
+                    {
+                        "projected_sky_rms": self._rms(params["sky_coeffs"]),
+                        "projected_beam_rms": self._rms(params["beam_coeffs"]),
+                        "beam_scatter": float(np.std(params["beam_coeffs"])),
+                        "beam_roughness": self._beam_roughness(
+                            params["beam_coeffs"]
+                        ),
+                        "beam_harmonic_penalty": self._beam_harmonic_penalty(
+                            params["beam_coeffs"]
+                        ),
+                    }
+                )
             if scheduler is not None:
                 entry.update(
                     {
                         "scheduled_block": scheduled_block,
                         "schedule_reason": schedule_reason,
-                        "schedule_eff_sky": scheduler["eff"].get("sky"),
-                        "schedule_eff_beam": scheduler["eff"].get("beam"),
-                        "schedule_eff_joint": scheduler["eff"].get("joint"),
-                        "schedule_eff_lbfgs": scheduler["eff"].get("lbfgs"),
-                        "schedule_n_since_sky": scheduler["n_since"].get(
-                            "sky"
-                        ),
-                        "schedule_n_since_beam": scheduler["n_since"].get(
-                            "beam"
-                        ),
-                        "schedule_n_since_joint": scheduler["n_since"].get(
-                            "joint"
-                        ),
-                        "schedule_n_since_lbfgs": scheduler["n_since"].get(
-                            "lbfgs"
-                        ),
-                        "schedule_n_run_sky": scheduler["n_run"].get("sky"),
-                        "schedule_n_run_beam": scheduler["n_run"].get("beam"),
-                        "schedule_n_run_joint": scheduler["n_run"].get(
-                            "joint"
-                        ),
-                        "schedule_n_run_lbfgs": scheduler["n_run"].get(
-                            "lbfgs"
-                        ),
-                        "schedule_step_gain_sky": scheduler["step_gain"].get(
-                            "sky"
-                        ),
-                        "schedule_step_gain_beam": scheduler["step_gain"].get(
-                            "beam"
-                        ),
-                        "schedule_step_gain_joint": scheduler["step_gain"].get(
-                            "joint"
-                        ),
                     }
                 )
+                if full_telemetry:
+                    entry.update(
+                        {
+                            "schedule_eff_sky": scheduler["eff"].get("sky"),
+                            "schedule_eff_beam": scheduler["eff"].get("beam"),
+                            "schedule_eff_joint": scheduler["eff"].get(
+                                "joint"
+                            ),
+                            "schedule_eff_lbfgs": scheduler["eff"].get(
+                                "lbfgs"
+                            ),
+                            "schedule_n_since_sky": scheduler["n_since"].get(
+                                "sky"
+                            ),
+                            "schedule_n_since_beam": scheduler["n_since"].get(
+                                "beam"
+                            ),
+                            "schedule_n_since_joint": scheduler["n_since"].get(
+                                "joint"
+                            ),
+                            "schedule_n_since_lbfgs": scheduler["n_since"].get(
+                                "lbfgs"
+                            ),
+                            "schedule_n_run_sky": scheduler["n_run"].get(
+                                "sky"
+                            ),
+                            "schedule_n_run_beam": scheduler["n_run"].get(
+                                "beam"
+                            ),
+                            "schedule_n_run_joint": scheduler["n_run"].get(
+                                "joint"
+                            ),
+                            "schedule_n_run_lbfgs": scheduler["n_run"].get(
+                                "lbfgs"
+                            ),
+                            "schedule_step_gain_sky": scheduler[
+                                "step_gain"
+                            ].get("sky"),
+                            "schedule_step_gain_beam": scheduler[
+                                "step_gain"
+                            ].get("beam"),
+                            "schedule_step_gain_joint": scheduler[
+                                "step_gain"
+                            ].get("joint"),
+                        }
+                    )
             entry.update(step_extra)
             telemetry.append(entry)
 
