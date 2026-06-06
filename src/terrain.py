@@ -3,7 +3,6 @@ Terrain models for radio observations.
 
 Provides abstract Terrain base class and concrete implementations:
 - HorizonTerrain: HEALPix-based horizon distance map
-- LunarDisk: Lunar occultation for orbital observers
 - DEMTerrain: Digital elevation model (optional, requires eigsep_terrain)
 
 All terrains provide a consistent interface: mask() for visibility and
@@ -15,7 +14,6 @@ import numpy as np
 import healpy
 from abc import ABC, abstractmethod
 
-from .const import R_MOON, GM_MOON
 
 HORIZON_MODELS_NPZ = os.path.join(
     os.path.dirname(__file__), "data", "horizon_models_v000.npz"
@@ -25,7 +23,7 @@ HORIZON_MODELS_NPZ = os.path.join(
 class Terrain(ABC):
     """Abstract terrain model providing visibility mask and thermal emission.
 
-    Subclasses implement specific terrain types (horizon maps, lunar disk, DEM).
+    Subclasses implement specific terrain types (horizon maps, DEM).
     """
 
     @abstractmethod
@@ -287,118 +285,6 @@ class HorizonTerrain(Terrain):
             # Per-pixel temperature not yet implemented
             raise NotImplementedError("Per-pixel temperature not yet supported")
 
-
-class LunarDisk(Terrain):
-    """Lunar occultation mask for an orbiting observer.
-
-    For a spacecraft at position pos_gal (galactic frame), computes which
-    sky directions are blocked by the lunar disk.
-
-    Parameters
-    ----------
-    nside : int
-        HEALPix resolution.
-    moon_radius_m : float, optional
-        Lunar radius [m] (default 1,737,400 m).
-    T_regolith : float, optional
-        Lunar surface temperature [K] (default 300 K).
-    """
-
-    def __init__(self, nside, moon_radius_m=R_MOON, T_regolith=300.0):
-        self.nside = int(nside)
-        self.npix = healpy.nside2npix(self.nside)
-        self.moon_radius = float(moon_radius_m)
-        self.T_regolith = float(T_regolith)
-        self.spacecraft_pos_gal = None  # Set via update()
-
-    def update(self, spacecraft_position_gal):
-        """Update spacecraft position (galactic frame, meters).
-
-        Parameters
-        ----------
-        spacecraft_position_gal : ndarray, shape (3,)
-            Spacecraft position [m] in galactic Cartesian coordinates.
-        """
-        self.spacecraft_pos_gal = np.asarray(spacecraft_position_gal,
-                                            dtype=np.float64)
-
-    def mask(self, crds_top):
-        """Compute lunar occultation mask.
-
-        A pixel is blocked if the ray from spacecraft toward that sky direction
-        intersects the lunar sphere.
-
-        Parameters
-        ----------
-        crds_top : ndarray, shape (3, npix) or (npix, 3)
-            Sky directions in galactic frame.
-
-        Returns
-        -------
-        ndarray, shape (npix,)
-            Boolean mask: True = sky visible, False = lunar disk blocks.
-        """
-        if crds_top.shape[0] == 3:
-            sky_dirs = np.asarray(crds_top, dtype=np.float64)
-        else:
-            sky_dirs = np.asarray(crds_top, dtype=np.float64).T
-
-        npix = sky_dirs.shape[1]
-        if self.spacecraft_pos_gal is None:
-            return np.ones(npix, dtype=bool)
-
-        sky_dirs = sky_dirs / np.linalg.norm(sky_dirs, axis=0, keepdims=True)
-        distance = float(np.linalg.norm(self.spacecraft_pos_gal))
-        moon_to_spacecraft = self.spacecraft_pos_gal / distance
-        limb_dot = -np.sqrt(max(0.0, 1.0 - (self.moon_radius / distance) ** 2))
-        return (moon_to_spacecraft @ sky_dirs) > limb_dot
-
-    def emission(self, crds_top, freqs_hz):
-        """Return regolith temperature for lunar disk.
-
-        Parameters
-        ----------
-        crds_top : ndarray
-            Sky directions.
-        freqs_hz : ndarray
-            Frequencies [Hz].
-
-        Returns
-        -------
-        ndarray, shape (npix, nfreq)
-            Lunar surface temperature for blocked pixels, zero elsewhere.
-        """
-        # Normalize input
-        if crds_top.shape[0] == 3:
-            npix = crds_top.shape[1]
-        else:
-            npix = crds_top.shape[0]
-
-        nfreq = len(freqs_hz)
-        emission = np.zeros((npix, nfreq), dtype=np.float32)
-
-        # Blocked pixels get lunar regolith temperature
-        mask = ~self.mask(crds_top)  # True = blocked
-        emission[mask] = self.T_regolith
-
-        return emission
-
-    def unresolved_emission(self, freqs_hz):
-        """Uniform regolith temperature for lunar-disk omitted pixels."""
-        return np.full(len(freqs_hz), self.T_regolith, dtype=np.float32)
-
-    def set_temperature(self, T):
-        """Set lunar surface temperature.
-
-        Parameters
-        ----------
-        T : float or ndarray
-            Temperature [K]. If float, sets uniform temperature.
-        """
-        if np.ndim(T) == 0:
-            self.T_regolith = float(T)
-        else:
-            raise NotImplementedError("Per-pixel temperature not yet supported")
 
 
 class DEMTerrain(Terrain):

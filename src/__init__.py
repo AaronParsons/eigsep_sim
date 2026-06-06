@@ -9,18 +9,12 @@ from .terrain import (
     Terrain,
     NullTerrain,
     HorizonTerrain,
-    LunarDisk,
     DEMTerrain,
 )
 from .observer import Observer, EarthSurface, LunarSurface, LunarOrbit
 from .sky import Sky
 from .simulate import ForwardModel
 from .calibrator import Calibrator
-from .lunar_surface import (
-    LunarSurfaceGeometry,
-    LunarSurfaceModel,
-    UniformLunarSurface,
-)
 from .lunar import (
     LunarCampaign,
     LunarCampaignResult,
@@ -51,7 +45,6 @@ __all__ = [
     "Terrain",
     "NullTerrain",
     "HorizonTerrain",
-    "LunarDisk",
     "DEMTerrain",
     "Observer",
     "EarthSurface",
@@ -60,9 +53,6 @@ __all__ = [
     "Sky",
     "ForwardModel",
     "Calibrator",
-    "LunarSurfaceGeometry",
-    "LunarSurfaceModel",
-    "UniformLunarSurface",
     "LunarCampaign",
     "LunarCampaignResult",
     "LunarRecoveryAdapter",

@@ -20,8 +20,6 @@ from eigsep_sim.lunar import (
     make_ecliptic_orbit_normals,
 )
 from eigsep_sim.lunar_recovery import LunarRecoveryAdapter
-from eigsep_sim.lunar_surface import UniformLunarSurface
-from eigsep_sim.terrain import NullTerrain
 
 
 def _simple_objects(nside=4, nfreq=3):
@@ -122,21 +120,6 @@ def test_torque_free_conserves_norm_momentum_and_energy():
     )
 
 
-def test_uniform_surface_intercepts_emission_and_unresolved_spectrum():
-    model = UniformLunarSurface(300.0)
-    position = np.array([2.0e6, 0.0, 0.0])
-    directions = np.array([[-1.0, 1.0], [0.0, 0.0], [0.0, 0.0]])
-    geometry = model.prepare_geometry(position, directions)
-    assert geometry.blocked.tolist() == [[True, False]]
-    np.testing.assert_allclose(
-        np.linalg.norm(geometry.intercepts_gal_m[0, 0]), model.moon_radius_m
-    )
-    emission = model.thermal_emission(geometry, [60e6, 80e6])
-    np.testing.assert_allclose(emission[0, 0], 300.0)
-    np.testing.assert_allclose(emission[0, 1], 0.0)
-    np.testing.assert_allclose(model.unresolved_emission([60e6, 80e6]), 300.0)
-
-
 def test_forward_model_uniform_surface_matches_scalar_fallback_and_reduction():
     _, _, sky, sky_coeffs, beam, observer = _simple_objects()
     times = observer.t0 + np.array([0.0, 900.0]) * u.s
@@ -169,21 +152,6 @@ def test_forward_model_uniform_surface_matches_scalar_fallback_and_reduction():
     np.testing.assert_allclose(
         reduced_truth, surface_truth, rtol=2e-5, atol=2e-4
     )
-
-    _, _, _, _, _, legacy_observer = _simple_objects()
-    legacy = ForwardModel(
-        legacy_observer, beam, sky, surface_model=UniformLunarSurface(300.0)
-    )
-    assert legacy.terrain is None
-    assert legacy_observer.occultation_temperature_K == 300.0
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        ForwardModel(
-            observer,
-            beam,
-            sky,
-            terrain=NullTerrain(),
-            surface_model=UniformLunarSurface(),
-        )
 
 
 def test_campaign_shapes_tracks_phase_and_recovery_adapter():

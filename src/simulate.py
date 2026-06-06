@@ -57,9 +57,6 @@ class ForwardModel:
     terrain : Terrain, optional
         Terrain model for explicit sky blocking. If None, no surface horizon
         is applied; lunar orbit occultation is handled by the observer.
-    surface_model : object, optional
-        Deprecated compatibility path for uniform lunar regolith emission.
-        Prefer ``LunarOrbit(..., occultation_temperature_K=...)``.
     """
 
     def __init__(
@@ -69,23 +66,7 @@ class ForwardModel:
         sky: Sky,
         terrain: Terrain | None = None,
         transmitters=None,
-        surface_model=None,
     ):
-        if terrain is not None and surface_model is not None:
-            raise ValueError(
-                "terrain and surface_model are mutually exclusive"
-            )
-        if surface_model is not None:
-            if not getattr(observer, "occludes_sky", False):
-                raise TypeError("surface_model requires an occulting observer")
-            if not hasattr(surface_model, "T_regolith_K"):
-                raise TypeError(
-                    "surface_model compatibility supports uniform lunar "
-                    "surface models only"
-                )
-            observer.occultation_temperature_K = float(
-                surface_model.T_regolith_K
-            )
         self.observer = observer
         self.beam = beam
         self.sky = sky
