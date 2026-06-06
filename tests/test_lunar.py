@@ -11,7 +11,7 @@ from astropy.coordinates import (
 from astropy.time import Time
 import astropy.units as u
 
-from eigsep_sim import Beam, ForwardModel, LunarOrbit, Sky
+from eigsep_sim import Beam, ForwardModel, LunarOrbit, Sky, StackedForwardModel
 from eigsep_sim.lunar import (
     LunarCampaign,
     angular_momentum_for_spin_period,
@@ -152,6 +152,29 @@ def test_forward_model_uniform_surface_matches_scalar_fallback_and_reduction():
     np.testing.assert_allclose(
         reduced_truth, surface_truth, rtol=2e-5, atol=2e-4
     )
+
+
+def test_stacked_forward_model_matches_manual_concatenation():
+    _, _, sky, sky_coeffs, beam, observer_a = _simple_objects()
+    _, _, _, _, _, observer_b = _simple_objects()
+    observer_b.start_pos = np.array([0.0, 1.0, 0.0])
+    fwd_a = ForwardModel(observer_a, beam, sky)
+    fwd_b = ForwardModel(observer_b, beam, sky)
+    stacked = StackedForwardModel([fwd_a, fwd_b])
+    times = observer_a.t0 + np.array([0.0, 600.0]) * u.s
+    geom = [
+        fwd_a.precompute_geometry(times=times),
+        fwd_b.precompute_geometry(times=times),
+    ]
+    expected = np.concatenate(
+        [
+            np.asarray(fwd_a.simulate(sky_coeffs, beam.coeffs, geom=geom[0])),
+            np.asarray(fwd_b.simulate(sky_coeffs, beam.coeffs, geom=geom[1])),
+        ],
+        axis=0,
+    )
+    actual = np.asarray(stacked.simulate(sky_coeffs, beam.coeffs, geom=geom))
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_campaign_shapes_tracks_phase_and_recovery_adapter():

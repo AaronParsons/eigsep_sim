@@ -1067,6 +1067,49 @@ class ForwardModel:
         )
 
 
+class StackedForwardModel:
+    """Concatenate multiple ForwardModel instances with shared sky and beam.
+
+    This is useful for multi-spacecraft campaigns where each spacecraft has its
+    own observer and geometry, but all observations constrain the same sky and
+    beam coefficients. ``geom`` passed to :meth:`simulate` must be a list of
+    geometry dicts in the same order as ``forward_models``.
+    """
+
+    def __init__(self, forward_models):
+        self.forward_models = list(forward_models)
+        if len(self.forward_models) == 0:
+            raise ValueError("forward_models must be non-empty")
+        self.sky = self.forward_models[0].sky
+        self.beam = self.forward_models[0].beam
+        for fwd in self.forward_models[1:]:
+            if fwd.sky is not self.sky or fwd.beam is not self.beam:
+                raise ValueError(
+                    "all stacked ForwardModel instances must share sky and beam"
+                )
+
+    def simulate(
+        self, sky_coeffs, beam_coeffs, times=None, geom=None, **kwargs
+    ):
+        """Simulate all models and concatenate along the time axis."""
+        if geom is None:
+            if times is None:
+                raise ValueError("Either times or geom must be provided")
+            geom = [
+                fwd.precompute_geometry(times=times)
+                for fwd in self.forward_models
+            ]
+        if len(geom) != len(self.forward_models):
+            raise ValueError(
+                "geom must contain one geometry dict per stacked ForwardModel"
+            )
+        outputs = [
+            fwd.simulate(sky_coeffs, beam_coeffs, geom=g, **kwargs)
+            for fwd, g in zip(self.forward_models, geom)
+        ]
+        return jnp.concatenate(outputs, axis=0)
+
+
 class SourceCatalog:
     """
     Placeholder for source catalog.

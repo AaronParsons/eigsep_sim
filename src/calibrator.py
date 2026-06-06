@@ -21,7 +21,6 @@ from typing import Optional, Dict
 
 from .const import DTYPE_R_NPY, DTYPE_R_JAX
 from .simulate import ForwardModel
-from .linear_solver import normal_solve
 
 _BEAM_HARMONIC_Q_CACHE = {}
 

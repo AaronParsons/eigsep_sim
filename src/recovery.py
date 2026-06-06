@@ -131,6 +131,51 @@ def build_surface_design_matrix(
     return matrix.reshape(nobs * ndipole, ncols)
 
 
+def normal_solve(A, y, npix, rcond=1e-6):
+    """Least-squares sky recovery via normal equations.
+
+    ``A`` must use the current recovery column convention where the first
+    ``npix`` columns are sky pixels, followed by blocked-surface/source columns
+    and optional receiver offsets. Unobserved sky pixels are returned as NaN.
+    """
+    A = np.asarray(A, dtype=float)
+    y = np.asarray(y, dtype=float)
+    AtA = A.T @ A
+    Aty = A.T @ y
+    lam, V = np.linalg.eigh(AtA)
+    lam_thresh = rcond**2 * lam[-1]
+    inv_lam = np.where(
+        lam > lam_thresh,
+        1.0 / np.where(lam > lam_thresh, lam, 1.0),
+        0.0,
+    )
+    x_est = V @ (inv_lam * (V.T @ Aty))
+
+    sky_map = x_est[:npix].copy()
+    col_norms_sq = np.diag(AtA)[:npix]
+    unobserved = col_norms_sq < (1e-6**2) * col_norms_sq.max()
+    sky_map[unobserved] = np.nan
+
+    result = {
+        "sky_map": sky_map,
+        "surface": float(x_est[npix]),
+        "t_regolith": float(x_est[npix]),
+        "eigenvalues": lam,
+        "eigenvectors": V,
+        "inv_eigenvalues": inv_lam,
+        "rank": int((lam > lam_thresh).sum()),
+        "unobserved": unobserved,
+    }
+    if A.shape[1] > npix + 1:
+        result["t_sun"] = float(x_est[npix + 1])
+    if A.shape[1] == npix + 4:
+        result["t_rx_0"] = float(x_est[npix + 2])
+        result["t_rx_1"] = float(x_est[npix + 3])
+    for index in range(npix + 1, A.shape[1]):
+        result[f"extra_{index - npix - 1}"] = float(x_est[index])
+    return result
+
+
 class ScaleDegeneracy:
     """Multiplicative gauge coupled across parameter arrays.
 

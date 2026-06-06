@@ -3,7 +3,7 @@ Benchmark: beam-interpolation strategies in eigsep_sim.
 
 Measures wall-time for several implementations of the beam-weighted sky
 integral (the core of _beam_sum) and compares them with the baseline
-lax.scan implementation used in Simulator.sim().
+lax.scan implementation used by the ForwardModel kernel.
 
 Methods benchmarked
 -------------------
@@ -45,8 +45,8 @@ NSIDE_SKY = 64
 NSIDE_BEAM = 64
 NSIDE_BEAM_LO = 16
 NFREQ = 64
-N_ORIENT = 32       # number of beam orientations
-N_REPEAT = 5        # timing repeats (min is reported)
+N_ORIENT = 32  # number of beam orientations
+N_REPEAT = 5  # timing repeats (min is reported)
 LMAX_SH = 2 * NSIDE_SKY  # standard band-limit for SH decomposition
 
 freqs = np.linspace(50e6, 200e6, NFREQ)
@@ -66,7 +66,9 @@ crds_top_np = np.stack(
 ).astype(np.float32)
 
 # Random rotation matrices, shape (N_ORIENT, 3, 3)
-rot_ms_np = Rotation.random(N_ORIENT, random_state=rng).as_matrix().astype(np.float32)
+rot_ms_np = (
+    Rotation.random(N_ORIENT, random_state=rng).as_matrix().astype(np.float32)
+)
 
 # JAX arrays
 sky_jax = jnp.asarray(sky_np, dtype=float_dtype)
@@ -77,15 +79,18 @@ rot_ms_jax = jnp.asarray(rot_ms_np, dtype=float_dtype)
 
 
 # ---------------------------------------------------------------------------
-# Method 1 – baseline: lax.scan (mirrors _beam_sum in sim.py)
+# Method 1 - baseline: lax.scan-style beam accumulation
 # ---------------------------------------------------------------------------
+
 
 @partial(jax.jit, static_argnums=(0,))
 def beam_sum_scan(beam_nside, beam_map, sky, crds, rot_ms):
     """Return (num, den) using lax.scan over orientations."""
+
     def body(_, R):
         wgt = interpolate_map(beam_nside, beam_map, *(R @ crds))
         return None, (jnp.sum(wgt * sky, axis=0), jnp.sum(wgt, axis=0))
+
     _, (num, den) = jax.lax.scan(body, None, rot_ms)
     return num, den
 
@@ -94,12 +99,15 @@ def beam_sum_scan(beam_nside, beam_map, sky, crds, rot_ms):
 # Method 2 – vmap over orientations
 # ---------------------------------------------------------------------------
 
+
 @partial(jax.jit, static_argnums=(0,))
 def beam_sum_vmap(beam_nside, beam_map, sky, crds, rot_ms):
     """Return (num, den) using jax.vmap over orientations."""
+
     def single(R):
         wgt = interpolate_map(beam_nside, beam_map, *(R @ crds))
         return jnp.sum(wgt * sky, axis=0), jnp.sum(wgt, axis=0)
+
     return jax.vmap(single)(rot_ms)
 
 
@@ -111,6 +119,7 @@ def beam_sum_vmap(beam_nside, beam_map, sky, crds, rot_ms):
 # beam this equals sum(beam_map, axis=0) — independent of rotation R.
 # Precomputing it saves one jnp.sum per orientation inside the scan loop.
 # ---------------------------------------------------------------------------
+
 
 @partial(jax.jit, static_argnums=(0,))
 def beam_sum_precomp_den(beam_nside, beam_map, sky, crds, rot_ms):
@@ -141,7 +150,10 @@ def beam_sum_precomp_den(beam_nside, beam_map, sky, crds, rot_ms):
 # Cost: O(lmax^3) per orientation for the Wigner D recursion.
 # ---------------------------------------------------------------------------
 
-def _sh_inner_product(alm_a: np.ndarray, alm_b: np.ndarray, lmax: int) -> float:
+
+def _sh_inner_product(
+    alm_a: np.ndarray, alm_b: np.ndarray, lmax: int
+) -> float:
     """
     <A, B> = sum_{l,m} a_lm conj(b_lm) summed over ALL m (including m < 0).
 
@@ -183,7 +195,9 @@ def bench_sh_rotate_alm(
         # healpy.rotate_alm modifies in-place and returns None
         sky_alm_rot = sky_alm.copy()
         healpy.rotate_alm(sky_alm_rot, matrix=R)
-        T_ant[i] = _sh_inner_product(beam_alm, sky_alm_rot, lmax) / beam_solid_angle
+        T_ant[i] = (
+            _sh_inner_product(beam_alm, sky_alm_rot, lmax) / beam_solid_angle
+        )
     return T_ant
 
 
@@ -202,7 +216,10 @@ def bench_sh_rotate_alm(
 # for the pixel-domain approach.  Precomputing C_m (once) costs O(n_alm).
 # ---------------------------------------------------------------------------
 
-def _compute_C_m(beam_alm: np.ndarray, sky_alm: np.ndarray, lmax: int) -> np.ndarray:
+
+def _compute_C_m(
+    beam_alm: np.ndarray, sky_alm: np.ndarray, lmax: int
+) -> np.ndarray:
     """
     Compute C_m = sum_{l>=m} b_lm conj(t_lm) for m = 0 .. lmax.
 
@@ -250,9 +267,9 @@ def sh_fft_spin_sweep(
     spectrum[0] = C_pos[0]
     # Positive-m modes at indices 1..mmax (or up to N_phi//2)
     m_hi = min(mmax, N_phi // 2)
-    spectrum[1:m_hi + 1] = C_pos[1:m_hi + 1]
+    spectrum[1 : m_hi + 1] = C_pos[1 : m_hi + 1]
     # Negative-m modes at indices N_phi-m (wrap around)
-    spectrum[N_phi - m_hi:N_phi] = np.conj(C_pos[m_hi:0:-1])
+    spectrum[N_phi - m_hi : N_phi] = np.conj(C_pos[m_hi:0:-1])
 
     # T_ant(phi_k) = (1/den) sum_m C_m e^{-im phi_k}
     #              = (1/den) * N * IFFT[spectrum]
@@ -264,13 +281,14 @@ def sh_fft_spin_sweep(
 # Timing helper
 # ---------------------------------------------------------------------------
 
+
 def _block(result):
     """Ensure JAX computations have completed."""
     if isinstance(result, (tuple, list)):
         for r in result:
-            if hasattr(r, 'block_until_ready'):
+            if hasattr(r, "block_until_ready"):
                 r.block_until_ready()
-    elif hasattr(result, 'block_until_ready'):
+    elif hasattr(result, "block_until_ready"):
         result.block_until_ready()
 
 
@@ -296,13 +314,16 @@ def timeit(fn, label: str, n: int = N_REPEAT):
 
     t_min = min(times)
     t_mean = float(np.mean(times))
-    print(f"  {label:<40s}  min={t_min * 1e3:8.2f} ms  mean={t_mean * 1e3:8.2f} ms")
+    print(
+        f"  {label:<40s}  min={t_min * 1e3:8.2f} ms  mean={t_mean * 1e3:8.2f} ms"
+    )
     return result, t_min
 
 
 # ---------------------------------------------------------------------------
 # Precompute SH coefficients (done once, outside timing loops)
 # ---------------------------------------------------------------------------
+
 
 def _precompute_sh(lmax: int, freq_idx: int = 0):
     """Return (beam_alm, sky_alm, C_pos, beam_solid_angle) for one frequency."""
@@ -320,22 +341,35 @@ def _precompute_sh(lmax: int, freq_idx: int = 0):
 # Sanity check: SH FFT result should match pixel-domain scan (single freq)
 # ---------------------------------------------------------------------------
 
+
 def _sanity_check(lmax: int = LMAX_SH, freq_idx: int = 0):
     """Verify SH-FFT spin sweep against pixel-domain scan for a z-rotation."""
     # Generate N_ORIENT z-rotations
     phis = np.linspace(0, 2 * np.pi, N_ORIENT, endpoint=False)
-    rot_z = np.stack([
-        np.array([[np.cos(p), -np.sin(p), 0],
-                  [np.sin(p),  np.cos(p), 0],
-                  [0,          0,         1]], dtype=np.float32)
-        for p in phis
-    ])
+    rot_z = np.stack(
+        [
+            np.array(
+                [
+                    [np.cos(p), -np.sin(p), 0],
+                    [np.sin(p), np.cos(p), 0],
+                    [0, 0, 1],
+                ],
+                dtype=np.float32,
+            )
+            for p in phis
+        ]
+    )
     rot_z_jax = jnp.asarray(rot_z, dtype=float_dtype)
 
     # Pixel-domain result (single frequency)
-    sky1_jax = sky_jax[:, freq_idx:freq_idx + 1]
-    num, den = beam_sum_scan(NSIDE_BEAM, beam_jax[:, freq_idx:freq_idx + 1],
-                             sky1_jax, crds_top_jax, rot_z_jax)
+    sky1_jax = sky_jax[:, freq_idx : freq_idx + 1]
+    num, den = beam_sum_scan(
+        NSIDE_BEAM,
+        beam_jax[:, freq_idx : freq_idx + 1],
+        sky1_jax,
+        crds_top_jax,
+        rot_z_jax,
+    )
     T_pix = np.asarray(num / den)[:, 0]  # (N_ORIENT,)
 
     # SH-FFT result
@@ -344,8 +378,10 @@ def _sanity_check(lmax: int = LMAX_SH, freq_idx: int = 0):
 
     rms_err = float(np.sqrt(np.mean((T_pix - T_fft) ** 2)))
     rel_err = rms_err / float(np.mean(np.abs(T_pix)))
-    print(f"\n  [sanity] SH-FFT vs pixel-domain (lmax={lmax}): "
-          f"RMS={rms_err:.4f} K  relative={rel_err:.4f}")
+    print(
+        f"\n  [sanity] SH-FFT vs pixel-domain (lmax={lmax}): "
+        f"RMS={rms_err:.4f} K  relative={rel_err:.4f}"
+    )
     if rel_err > 0.05:
         print("  WARNING: relative error > 5% — consider increasing lmax.")
     else:
@@ -356,14 +392,16 @@ def _sanity_check(lmax: int = LMAX_SH, freq_idx: int = 0):
 # Main
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     print(f"\n{'=' * 60}")
     print(f"  eigsep_sim beam-interpolation benchmark")
     print(f"{'=' * 60}")
     print(f"  JAX devices   : {jax.devices()}")
     print(f"  nside_sky     : {NSIDE_SKY}  ({npix_sky} pixels)")
     print(f"  nside_beam    : {NSIDE_BEAM}  ({npix_beam} pixels)")
-    print(f"  nside_beam_lo : {NSIDE_BEAM_LO}  ({healpy.nside2npix(NSIDE_BEAM_LO)} pixels)")
+    print(
+        f"  nside_beam_lo : {NSIDE_BEAM_LO}  ({healpy.nside2npix(NSIDE_BEAM_LO)} pixels)"
+    )
     print(f"  nfreq         : {NFREQ}")
     print(f"  n_orient      : {N_ORIENT}")
     print(f"  lmax_sh       : {LMAX_SH}")
@@ -373,12 +411,28 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # Pre-warm JAX JIT for all pixel-domain methods
     # ------------------------------------------------------------------
-    print("  JIT warm-up … ", end='', flush=True)
+    print("  JIT warm-up … ", end="", flush=True)
     for _ in range(2):
-        _block(beam_sum_scan(NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax))
-        _block(beam_sum_vmap(NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax))
-        _block(beam_sum_precomp_den(NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax))
-        _block(beam_sum_scan(NSIDE_BEAM_LO, beam_lo_jax, sky_jax, crds_top_jax, rot_ms_jax))
+        _block(
+            beam_sum_scan(
+                NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax
+            )
+        )
+        _block(
+            beam_sum_vmap(
+                NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax
+            )
+        )
+        _block(
+            beam_sum_precomp_den(
+                NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax
+            )
+        )
+        _block(
+            beam_sum_scan(
+                NSIDE_BEAM_LO, beam_lo_jax, sky_jax, crds_top_jax, rot_ms_jax
+            )
+        )
     print("done\n")
 
     # ------------------------------------------------------------------
@@ -389,22 +443,26 @@ if __name__ == '__main__':
 
     _, t_scan = timeit(
         lambda: beam_sum_scan(
-            NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax),
+            NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax
+        ),
         label="1. baseline  (lax.scan, nside=64)",
     )
     _, t_vmap = timeit(
         lambda: beam_sum_vmap(
-            NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax),
+            NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax
+        ),
         label="2. vmap      (nside=64)",
     )
     _, t_pden = timeit(
         lambda: beam_sum_precomp_den(
-            NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax),
+            NSIDE_BEAM, beam_jax, sky_jax, crds_top_jax, rot_ms_jax
+        ),
         label="3. precomp-den (lax.scan, nside=64)",
     )
     _, t_lo = timeit(
         lambda: beam_sum_scan(
-            NSIDE_BEAM_LO, beam_lo_jax, sky_jax, crds_top_jax, rot_ms_jax),
+            NSIDE_BEAM_LO, beam_lo_jax, sky_jax, crds_top_jax, rot_ms_jax
+        ),
         label="4. low-nside (lax.scan, nside=16)",
     )
 
@@ -414,7 +472,7 @@ if __name__ == '__main__':
     print()
     print("  SH methods  (single frequency, n_orient=32)")
     print("  " + "-" * 56)
-    print("  Precomputing SH coefficients … ", end='', flush=True)
+    print("  Precomputing SH coefficients … ", end="", flush=True)
     t_sh_pre0 = time.perf_counter()
     beam_alm, sky_alm, C_pos, beam_sol = _precompute_sh(LMAX_SH)
     t_sh_pre = time.perf_counter() - t_sh_pre0
@@ -422,7 +480,8 @@ if __name__ == '__main__':
 
     _, t_sh_rot = timeit(
         lambda: bench_sh_rotate_alm(
-            beam_alm, sky_alm, LMAX_SH, rot_ms_np, beam_sol),
+            beam_alm, sky_alm, LMAX_SH, rot_ms_np, beam_sol
+        ),
         label="5. SH+rotate_alm (per orientation)",
     )
     _, t_fft = timeit(
@@ -448,21 +507,23 @@ if __name__ == '__main__':
     print(f"  Speedup vs baseline (min time)")
     print(f"{'=' * 60}")
     results = [
-        ("vmap (nside=64)",         t_scan / t_vmap),
-        ("precomp-den (nside=64)",  t_scan / t_pden),
-        ("low-nside (nside=16)",    t_scan / t_lo),
-        ("SH+rotate_alm (1 freq)",  t_scan / t_sh_rot),
-        ("SH+FFT spin (1 freq)",    t_scan / t_fft),
+        ("vmap (nside=64)", t_scan / t_vmap),
+        ("precomp-den (nside=64)", t_scan / t_pden),
+        ("low-nside (nside=16)", t_scan / t_lo),
+        ("SH+rotate_alm (1 freq)", t_scan / t_sh_rot),
+        ("SH+FFT spin (1 freq)", t_scan / t_fft),
         ("SH+FFT incl C_m precomp", t_scan / (t_fft + t_cpos)),
     ]
     for label, speedup in results:
-        bar = '█' * max(1, min(50, int(speedup * 2)))
+        bar = "█" * max(1, min(50, int(speedup * 2)))
         print(f"  {label:<35s}  {speedup:9.2f}x  {bar}")
 
     print()
     print("Notes:")
     print("  • SH methods are single-frequency; scale nfreq manually.")
     print("  • SH+rotate_alm costs O(lmax^3) per orientation.")
-    print("  • SH+FFT spin sweep costs O(n_alm) precompute + O(N log N) per freq.")
+    print(
+        "  • SH+FFT spin sweep costs O(n_alm) precompute + O(N log N) per freq."
+    )
     print("  • For a full nfreq=64 spin sweep, multiply SH+FFT time by 64.")
     print()

@@ -3,7 +3,6 @@ Terrain models for radio observations.
 
 Provides abstract Terrain base class and concrete implementations:
 - HorizonTerrain: HEALPix-based horizon distance map
-- DEMTerrain: Digital elevation model (optional, requires eigsep_terrain)
 
 All terrains provide a consistent interface: mask() for visibility and
 emission() for thermal contribution.
@@ -13,7 +12,6 @@ import os
 import numpy as np
 import healpy
 from abc import ABC, abstractmethod
-
 
 HORIZON_MODELS_NPZ = os.path.join(
     os.path.dirname(__file__), "data", "horizon_models_v000.npz"
@@ -114,25 +112,45 @@ class HorizonTerrain(Terrain):
         horizon_map and sky use the same nside.
     """
 
-    def __init__(self, nside, horizon_map, T_terrain=300.0, reflectivity=None,
-                 nside_sky=None, center=None, height=None, metadata=None):
+    def __init__(
+        self,
+        nside,
+        horizon_map,
+        T_terrain=300.0,
+        reflectivity=None,
+        nside_sky=None,
+        center=None,
+        height=None,
+        metadata=None,
+    ):
         self.nside = int(nside)
         self.npix = healpy.nside2npix(self.nside)
         self.horizon_map = np.asarray(horizon_map, dtype=np.float32)
         self.T_terrain = float(T_terrain)
         self.reflectivity = reflectivity
         self.nside_sky = nside_sky if nside_sky is not None else nside
-        self.center = None if center is None else np.asarray(center, dtype=np.float32)
+        self.center = (
+            None if center is None else np.asarray(center, dtype=np.float32)
+        )
         self.height = None if height is None else float(height)
         self.metadata = {} if metadata is None else dict(metadata)
 
         if self.horizon_map.shape[0] != self.npix:
-            raise ValueError(f"horizon_map shape {self.horizon_map.shape} "
-                           f"inconsistent with nside={nside} (npix={self.npix})")
+            raise ValueError(
+                f"horizon_map shape {self.horizon_map.shape} "
+                f"inconsistent with nside={nside} (npix={self.npix})"
+            )
 
     @classmethod
-    def from_file(cls, path, index=None, height=None, T_terrain=300.0,
-                  reflectivity=None, nside_sky=None):
+    def from_file(
+        cls,
+        path,
+        index=None,
+        height=None,
+        T_terrain=300.0,
+        reflectivity=None,
+        nside_sky=None,
+    ):
         """Load a precomputed HEALPix horizon model from an NPZ file.
 
         The packaged Marjum file stores:
@@ -158,7 +176,9 @@ class HorizonTerrain(Terrain):
             raise ValueError("Specify either index or height, not both")
         if height is not None:
             if "heights" not in npz:
-                raise ValueError("Cannot select by height: NPZ has no 'heights'")
+                raise ValueError(
+                    "Cannot select by height: NPZ has no 'heights'"
+                )
             heights = np.asarray(npz["heights"], dtype=float)
             index = int(np.argmin(np.abs(heights - float(height))))
         elif index is None:
@@ -229,9 +249,7 @@ class HorizonTerrain(Terrain):
         # directions scrambles otherwise contiguous terrain regions. Treat the
         # horizon map as a categorical visibility mask and use nearest-neighbor
         # lookup instead of interpolating NaNs.
-        pix = healpy.vec2pix(
-            self.nside, crds_top[0], crds_top[1], crds_top[2]
-        )
+        pix = healpy.vec2pix(self.nside, crds_top[0], crds_top[1], crds_top[2])
         mask = np.isnan(self.horizon_map[pix])
 
         return mask.astype(bool)
@@ -283,59 +301,6 @@ class HorizonTerrain(Terrain):
             self.T_terrain = float(T)
         else:
             # Per-pixel temperature not yet implemented
-            raise NotImplementedError("Per-pixel temperature not yet supported")
-
-
-
-class DEMTerrain(Terrain):
-    """DEM-backed terrain using eigsep_terrain.DEM.
-
-    Wraps a digital elevation model and uses ray tracing to compute horizon
-    distances and terrain masks.
-
-    This class is optional and requires eigsep_terrain to be installed.
-
-    Parameters
-    ----------
-    dem : eigsep_terrain.dem.DEM
-        DEM object with ray_trace() method.
-    observer : Observer
-        Observer object (e.g., EarthSurface) with location info.
-    T_terrain : float, optional
-        Uniform terrain temperature [K] (default 300 K).
-    nside_beam : int, optional
-        HEALPix resolution for ray tracing (default 8).
-    """
-
-    def __init__(self, dem, observer, T_terrain=300.0, nside_beam=8):
-        try:
-            from eigsep_terrain.dem import DEM
-        except ImportError:
-            raise ImportError("eigsep_terrain required for DEMTerrain; "
-                            "install via `pip install eigsep_terrain`")
-
-        self.dem = dem
-        self.observer = observer
-        self.T_terrain = float(T_terrain)
-        self.nside_beam = int(nside_beam)
-        self._horizon_map = None
-
-    def _compute_horizon(self):
-        """Compute horizon distance map via DEM ray tracing."""
-        if self._horizon_map is not None:
-            return self._horizon_map
-
-        # Use DEM's ray_trace method to compute horizon distances
-        # This is a placeholder; actual implementation depends on DEM API
-        raise NotImplementedError("DEMTerrain ray_trace integration pending")
-
-    def mask(self, crds_top):
-        """Compute visibility from DEM via ray tracing."""
-        horizon = self._compute_horizon()
-        # Use horizon map to determine visibility
-        # (similar to HorizonTerrain logic)
-        raise NotImplementedError("DEMTerrain mask() pending")
-
-    def emission(self, crds_top, freqs_hz):
-        """Return terrain temperature from DEM."""
-        raise NotImplementedError("DEMTerrain emission() pending")
+            raise NotImplementedError(
+                "Per-pixel temperature not yet supported"
+            )

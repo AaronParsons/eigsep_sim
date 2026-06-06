@@ -9,11 +9,10 @@ from .terrain import (
     Terrain,
     NullTerrain,
     HorizonTerrain,
-    DEMTerrain,
 )
 from .observer import Observer, EarthSurface, LunarSurface, LunarOrbit
 from .sky import Sky
-from .simulate import ForwardModel
+from .simulate import ForwardModel, StackedForwardModel
 from .calibrator import Calibrator
 from .lunar import (
     LunarCampaign,
@@ -31,6 +30,7 @@ from .recovery import (
     RecoverySolution,
     ScaleDegeneracy,
     build_surface_design_matrix,
+    normal_solve,
     relative_rms,
     sample_beam_weights,
 )
@@ -45,13 +45,13 @@ __all__ = [
     "Terrain",
     "NullTerrain",
     "HorizonTerrain",
-    "DEMTerrain",
     "Observer",
     "EarthSurface",
     "LunarSurface",
     "LunarOrbit",
     "Sky",
     "ForwardModel",
+    "StackedForwardModel",
     "Calibrator",
     "LunarCampaign",
     "LunarCampaignResult",
@@ -61,6 +61,7 @@ __all__ = [
     "RecoverySolution",
     "ScaleDegeneracy",
     "build_surface_design_matrix",
+    "normal_solve",
     "relative_rms",
     "sample_beam_weights",
     "crossed_rod_inertia",
