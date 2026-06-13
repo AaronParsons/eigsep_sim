@@ -298,6 +298,99 @@ def test_direct_sky_solve_falls_back_when_too_large():
     assert cal._sky_step_direct(params, step_size=1.0, max_unknowns=1) is None
 
 
+def test_direct_sky_solve_with_terrain_masking():
+    """The factorization handles terrain masking via the same operators.
+
+    The sky/beam conditional operators (build_g, build_w) fold in the
+    time-varying terrain visibility mask and the terrain emission offset,
+    so the direct sky solve and the full fast-cg fit work unchanged when a
+    large fraction of the sky is blocked (the EIGSEP canyon case).
+    """
+    import healpy
+    import jax.numpy as jnp
+    from astropy.time import Time
+
+    from eigsep_sim.observer import EarthSurface
+    from eigsep_sim.terrain import HorizonTerrain
+
+    nside = 4
+    npix = healpy.nside2npix(nside)
+    freqs = np.linspace(60e6, 140e6, 8)
+
+    # Topocentric horizon map: finite => terrain-blocked, NaN => open sky.
+    vec = np.array(healpy.pix2vec(nside, np.arange(npix)))
+    horizon = np.where(vec[2] < 0.3, 100.0, np.nan).astype(np.float32)
+    terr = HorizonTerrain(nside, horizon, T_terrain=300.0)
+
+    beam = Beam.from_dipole(nside, freqs, arm_lengths_m=[2.0], K=3)
+    sky = Sky.from_gsm(nside, freqs, n_modes=3, include_flat=True)
+    obs = EarthSurface(lat=39.2, lon=-113.4)
+    fwd = ForwardModel(obs, beam, sky, terrain=terr)
+    sc, bc = sky.init_coeffs(), beam.coeffs.copy()
+
+    times = [Time("2025-01-01") + i * 0.25 for i in range(6)]
+    base = obs.rot_gal2top_stack(times)
+    orient = np.stack(
+        [
+            Beam.top2body(a, h)
+            for h in (0.0, 0.8)
+            for a in np.linspace(0, 2 * np.pi, 6, endpoint=False)
+        ]
+    )
+    rots = np.repeat(base, orient.shape[0], axis=0)
+    body = np.tile(orient, (len(times), 1, 1))
+    geom = fwd.precompute_geometry(rots=rots, body_rots=body)
+    # Terrain blocks a large fraction of the sky in this configuration.
+    assert float(np.mean(np.asarray(geom["terrain_masks_jax"]))) < 0.6
+
+    truth = np.asarray(fwd.simulate(sc, bc, geom=geom))
+    sigma = np.abs(truth).mean() / 1e4
+    rng = np.random.default_rng(0)
+    data = (truth + rng.normal(scale=sigma, size=truth.shape)).reshape(-1, 8)
+    inv = np.full_like(data, 1.0 / sigma**2)
+    cal = Calibrator(
+        fwd, data, inv_noise_var=inv, lam_beam=0.01, lam_beam_harmonic=0.0
+    )
+    cal._resolve_geom(geom=geom)
+    ops = cal._ensure_linear_ops()
+
+    # Conditional operators reproduce simulate WITH terrain mask + emission.
+    scale = np.abs(truth).max()
+    const = np.asarray(fwd.simulate(np.zeros_like(sc), bc, geom=geom))
+    g = np.asarray(ops["build_g"](jnp.asarray(bc)))  # (D, F, T, P)
+    pred_sky = np.einsum("dftp,pf->tdf", g, sc @ sky.basis.A.T) + const
+    assert np.max(np.abs(pred_sky - truth)) < 1e-4 * scale
+    w = np.asarray(ops["build_w"](jnp.asarray(sc)))  # (F, T, Q)
+    pred_beam = np.einsum("ftq,dqf->tdf", w, bc @ beam.basis.A.T)
+    assert np.max(np.abs(pred_beam - truth)) < 1e-4 * scale
+
+    # Direct sky solve and full fit work with the terrain present.
+    prng = np.random.default_rng(1)
+    ini = {
+        "sky_coeffs": sc * prng.uniform(0.9, 1.1, sc.shape).astype(sc.dtype),
+        "beam_coeffs": bc * prng.uniform(0.9, 1.1, bc.shape).astype(bc.dtype),
+    }
+    loss_init = float(cal._loss(ini))
+    sky_direct = cal._sky_step_direct(ini, step_size=1.0)
+    assert sky_direct is not None
+    loss_direct = float(
+        cal._loss(
+            {"sky_coeffs": sky_direct, "beam_coeffs": ini["beam_coeffs"]}
+        )
+    )
+    assert loss_direct < 0.1 * loss_init
+
+    result = cal.fit(
+        params={k: v.copy() for k, v in ini.items()},
+        geom=geom,
+        max_iter=8,
+        tol=0.0,
+        verbose=False,
+        solver="fast-cg",
+    )
+    assert float(cal.data_loss(result["params"])) < 5.0
+
+
 def test_fit_keyboard_interrupt_returns_truncated():
     """A KeyboardInterrupt mid-fit returns the last completed iteration.
 
