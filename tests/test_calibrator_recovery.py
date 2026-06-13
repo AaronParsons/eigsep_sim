@@ -235,5 +235,143 @@ def test_conditional_linear_operators_match_simulate():
     assert np.max(np.abs(pred_beam - ref)) < 1e-4 * scale
 
 
+def test_direct_sky_solve_beats_truncated_cg():
+    """The exact Cholesky sky solve must reach a lower conditional loss.
+
+    The conditional sky Hessian is ill-conditioned (kappa ~ 1e8 from sky
+    coverage), so truncated CG stalls well above the conditional minimum.
+    The direct normal-equations solve reaches that minimum in one step;
+    here it must beat a 50-iteration CG solve from the same point.
+    """
+    prob = build_recovery_problem()
+    cal = Calibrator(
+        prob["fwd"],
+        prob["data"],
+        inv_noise_var=prob["inv_noise_var"],
+        lam_beam=0.01,
+        lam_beam_harmonic=0.0,
+    )
+    cal._resolve_geom(geom=prob["geom"])
+
+    params = {k: v.copy() for k, v in prob["prms_ini"].items()}
+    loss_before = float(cal._loss(params))
+
+    sky_direct = cal._sky_step_direct(params, step_size=1.0)
+    assert sky_direct is not None
+    loss_direct = float(
+        cal._loss(
+            {"sky_coeffs": sky_direct, "beam_coeffs": params["beam_coeffs"]}
+        )
+    )
+
+    sky_cg = cal._sky_step_linear(params, n_cg=50, lam=1e-4, step_size=1.0)
+    loss_cg = float(
+        cal._loss(
+            {
+                "sky_coeffs": np.asarray(sky_cg),
+                "beam_coeffs": params["beam_coeffs"],
+            }
+        )
+    )
+
+    assert loss_direct < loss_before
+    assert loss_direct <= loss_cg + 1e-6
+
+
+def test_direct_sky_solve_falls_back_when_too_large():
+    """Direct solve declines (returns None) above the dense-size budget.
+
+    The Cholesky is O((npix*nmodes)^3); _sky_step_direct must defer to the
+    CG path when the system exceeds max_unknowns so high-nside problems
+    don't attempt an intractable dense factorization.
+    """
+    prob = build_recovery_problem()
+    cal = Calibrator(
+        prob["fwd"],
+        prob["data"],
+        inv_noise_var=prob["inv_noise_var"],
+        lam_beam=0.01,
+        lam_beam_harmonic=0.0,
+    )
+    cal._resolve_geom(geom=prob["geom"])
+    params = {k: v.copy() for k, v in prob["prms_ini"].items()}
+    assert cal._sky_step_direct(params, step_size=1.0, max_unknowns=1) is None
+
+
+def test_fit_keyboard_interrupt_returns_truncated():
+    """A KeyboardInterrupt mid-fit returns the last completed iteration.
+
+    The fit must not propagate the interrupt; it returns the usual result
+    dict truncated to the completed iterations, with converged=False and
+    interrupted=True, and params improved over the starting point.
+    """
+    prob = build_recovery_problem()
+    cal = Calibrator(
+        prob["fwd"],
+        prob["data"],
+        inv_noise_var=prob["inv_noise_var"],
+        lam_beam=0.01,
+        lam_beam_harmonic=0.0,
+    )
+    cal._resolve_geom(geom=prob["geom"])
+    params = {k: v.copy() for k, v in prob["prms_ini"].items()}
+    loss_init = float(cal._loss(params))
+
+    # Interrupt at the start of the second outer iteration's sky step, so
+    # exactly one iteration completes before the interrupt.
+    orig_sky_step = cal.sky_step
+    calls = {"n": 0}
+
+    def interrupting_sky_step(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise KeyboardInterrupt
+        return orig_sky_step(*args, **kwargs)
+
+    cal.sky_step = interrupting_sky_step
+
+    result = cal.fit(
+        params=params,
+        geom=prob["geom"],
+        max_iter=10,
+        tol=0.0,
+        verbose=False,
+        solver="fast-cg",
+    )
+
+    assert result["interrupted"] is True
+    assert result["converged"] is False
+    assert result["n_iter"] == 1
+    assert len(result["losses"]) == 1
+    # The returned params are the completed-iteration state and improve on
+    # the starting point; the input dict is left unmutated.
+    assert np.isfinite(float(cal._loss(result["params"])))
+    assert float(cal._loss(result["params"])) < loss_init
+    assert float(cal._loss(params)) == loss_init
+
+
+def test_fit_reports_not_interrupted_on_clean_run():
+    """A normal fit reports interrupted=False."""
+    prob = build_recovery_problem()
+    cal = Calibrator(
+        prob["fwd"],
+        prob["data"],
+        inv_noise_var=prob["inv_noise_var"],
+        lam_beam=0.01,
+        lam_beam_harmonic=0.0,
+    )
+    cal._resolve_geom(geom=prob["geom"])
+    result = cal.fit(
+        params={k: v.copy() for k, v in prob["prms_ini"].items()},
+        geom=prob["geom"],
+        max_iter=2,
+        tol=0.0,
+        verbose=False,
+        solver="fast-cg",
+    )
+    assert result["interrupted"] is False
+    assert result["n_iter"] == 2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -502,14 +502,111 @@ class Calibrator:
             )
             return delta
 
+        @jax.jit
+        def build_sky_normal(beam_coeffs, sky_vis, data_eff, inv_var):
+            # Assemble the exact conditional sky Gauss-Newton system H x = b.
+            # The model decouples across frequency in map space, so
+            # H = (2/N) sum_f (a_f a_f^T) (x) B_f with the per-frequency
+            # pixel Gram B_f = G_f^T W_f G_f.  Returned dense so the caller
+            # can Cholesky-solve it in float64 (the system is ill-conditioned
+            # from sky coverage; iterative CG stalls on it).
+            g_op = build_g(beam_coeffs)  # (D, F, T, Pe)
+            n_data = data_eff.size
+            n_freq = A_sky.shape[0]
+            n_mode = A_sky.shape[1]
+            pe = g_op.shape[-1]
+
+            resid = (
+                jnp.einsum("dftp,fp->dft", g_op, (sky_vis @ A_sky.T).T)
+                - data_eff
+            )
+            b = -(2.0 / n_data) * (
+                jnp.einsum("dftp,dft->fp", g_op, inv_var * resid).T @ A_sky
+            )
+
+            gmat = jnp.transpose(g_op, (1, 0, 2, 3)).reshape(n_freq, -1, pe)
+            wmat = jnp.transpose(inv_var, (1, 0, 2)).reshape(n_freq, -1)
+            b_f = jnp.einsum("fnp,fnq->fpq", gmat * wmat[..., None], gmat)
+            h = (2.0 / n_data) * jnp.einsum(
+                "fm,fn,fpq->pmqn", A_sky, A_sky, b_f
+            )
+            return h.reshape(pe * n_mode, pe * n_mode), b
+
         self._linops = {
             "build_g": build_g,
             "build_w": build_w,
             "sky_cg_solve": sky_cg_solve,
             "beam_cg_solve": beam_cg_solve,
+            "build_sky_normal": build_sky_normal,
             "sky_idx": sky_idx,
         }
         return self._linops
+
+    def _sky_step_direct(self, params, step_size, max_unknowns=8000):
+        """Conditional sky solve by exact Cholesky of the normal equations.
+
+        Returns the proposed sky_coeffs array, or None when the fast path is
+        unavailable or the dense system (``npix_vis * nmodes``) exceeds
+        ``max_unknowns`` (dense Cholesky is O(n^3); above this the
+        linear-operator CG path is used instead).  Exact for the quadratic
+        conditional problem, so it reaches the conditional minimum in one
+        step where truncated CG stalls on the ill-conditioned (kappa ~ 1e8)
+        sky-coverage curvature.
+        """
+        import numpy as _np
+        import scipy.linalg as _sla
+
+        ops = self._ensure_linear_ops()
+        if ops is None:
+            return None
+        beam_jax = jnp.asarray(params["beam_coeffs"], dtype=DTYPE_R_JAX)
+        sky_full = jnp.asarray(params["sky_coeffs"], dtype=DTYPE_R_JAX)
+        sky_idx = ops["sky_idx"]
+        sky_vis = sky_full[sky_idx] if sky_idx is not None else sky_full
+        n_unknowns = int(sky_vis.shape[0] * sky_vis.shape[1])
+        if n_unknowns > max_unknowns:
+            return None
+
+        const = self.fwd.simulate(
+            jnp.zeros_like(sky_full), beam_jax, geom=self._geom
+        )
+        obs = self._matched_observations(const.shape)
+        data_eff = jnp.transpose(
+            jnp.asarray(obs["data"], dtype=DTYPE_R_JAX) - const, (1, 2, 0)
+        )
+        inv_var = jnp.transpose(
+            jnp.asarray(obs["inv_noise_var"], dtype=DTYPE_R_JAX), (1, 2, 0)
+        )
+
+        h_jax, b_jax = ops["build_sky_normal"](
+            beam_jax, sky_vis, data_eff, inv_var
+        )
+        h = _np.asarray(h_jax, dtype=_np.float64)
+        h = 0.5 * (h + h.T)
+        diag = _np.diag_indices_from(h)
+        if self._lam_sky > 0:
+            h[diag] += 2.0 * self._lam_sky / n_unknowns
+        # Tiny relative ridge so the never-sampled (null-space) sky
+        # directions stay finite without perturbing constrained modes.
+        h[diag] += 1e-8 * _np.trace(h) / n_unknowns
+        try:
+            c, low = _sla.cho_factor(h, check_finite=False)
+            delta = _sla.cho_solve(
+                (c, low),
+                _np.asarray(b_jax, dtype=_np.float64).ravel(),
+                check_finite=False,
+            )
+        except _sla.LinAlgError:
+            return None
+
+        delta = jnp.asarray(delta.reshape(sky_vis.shape), dtype=DTYPE_R_JAX)
+        sky_vis_new = sky_vis + step_size * delta
+        if sky_idx is not None:
+            return np.asarray(
+                jnp.zeros_like(sky_full).at[sky_idx].set(sky_vis_new),
+                dtype=DTYPE_R_NPY,
+            )
+        return np.asarray(sky_vis_new, dtype=DTYPE_R_NPY)
 
     def _sky_step_linear(self, params, n_cg, lam, step_size):
         """Conditional sky solve via the precomputed linear operator.
@@ -642,8 +739,21 @@ class Calibrator:
         sky_jax = jnp.asarray(params["sky_coeffs"])
         loss_before = float(loss_sky(sky_jax))
 
-        # Fast path: precomputed linear-operator CG (identical Newton step,
-        # ~50x cheaper per CG iteration than autodiff HVPs).
+        # Preferred fast path: exact Cholesky of the conditional normal
+        # equations.  The sky curvature is constant but ill-conditioned
+        # (kappa ~ 1e8 from coverage), so this exact solve reaches the
+        # conditional minimum where truncated CG stalls — and is faster.
+        # Falls back to CG for large dense systems (high nside * nmodes).
+        sky_direct = self._sky_step_direct(params, step_size)
+        if sky_direct is not None:
+            loss_direct = float(loss_sky(sky_direct))
+            if loss_direct < loss_before:
+                params_new = params.copy()
+                params_new["sky_coeffs"] = sky_direct
+                return params_new
+
+        # Fallback fast path: precomputed linear-operator CG (identical
+        # Newton step, ~50x cheaper per CG iteration than autodiff HVPs).
         sky_fast = self._sky_step_linear(params, n_cg, lam, step_size)
         if sky_fast is not None:
             loss_fast = float(loss_sky(sky_fast))
@@ -1413,6 +1523,11 @@ class Calibrator:
         controls remain accepted: ``use_joint=True`` selects ``joint`` and
         ``use_cg=True`` selects ``cg`` when the default solver is not explicitly
         overridden.
+
+        A ``KeyboardInterrupt`` (e.g. Ctrl-C in a notebook) is caught and
+        ends the fit cleanly at the last completed iteration; the usual
+        result dict is returned with ``converged=False`` and
+        ``interrupted=True`` so an interrupted run is still usable.
         """
         if telemetry_level not in ("summary", "full"):
             raise ValueError("telemetry_level must be 'summary' or 'full'")
@@ -1525,248 +1640,278 @@ class Calibrator:
                 "efficiency",
             )
 
-        for iteration in range(max_iter):
-            tic = time.perf_counter()
-            beam_old = params["beam_coeffs"].copy()
-            step_extra = {}
+        interrupted = False
+        try:
+            for iteration in range(max_iter):
+                tic = time.perf_counter()
+                beam_old = params["beam_coeffs"].copy()
+                step_extra = {}
 
-            scheduled_block = None
-            schedule_reason = None
-            if solver in ("adaptive-fixed-point", "adaptive-scheduled"):
-                step0 = 1.0
-                blocks = ("joint", "sky", "beam")
-                if solver == "adaptive-scheduled":
-                    scheduled_block, schedule_reason = choose_scheduled_block()
-                    if scheduled_block == "lbfgs":
-                        lbfgs_result = self.fit_lbfgs(
-                            params, maxiter=schedule_lbfgs_maxiter
+                scheduled_block = None
+                schedule_reason = None
+                if solver in ("adaptive-fixed-point", "adaptive-scheduled"):
+                    step0 = 1.0
+                    blocks = ("joint", "sky", "beam")
+                    if solver == "adaptive-scheduled":
+                        scheduled_block, schedule_reason = (
+                            choose_scheduled_block()
                         )
-                        params = lbfgs_result["params"]
-                        loss = float(lbfgs_result["losses"][-1])
-                        step_type = f"lbfgs:{schedule_lbfgs_maxiter}"
-                        step_extra = {
-                            "lbfgs_maxiter": schedule_lbfgs_maxiter,
-                            "lbfgs_inner_iter": lbfgs_result.get("n_iter"),
-                        }
-                    else:
-                        blocks = (scheduled_block,)
-                        step0 = scheduler["step_gain"][scheduled_block]
-                if (
-                    solver != "adaptive-scheduled"
-                    or scheduled_block != "lbfgs"
-                ):
-                    params, loss, step_type, step_extra = (
-                        self._adaptive_fixed_point_step(
-                            params,
-                            lambda_damp=lambda_damp,
-                            step0=step0,
-                            min_step=schedule_min_step,
-                            beam_cg_niter=min(beam_cg_niter, 10),
-                            beam_cg_tol=beam_cg_tol,
-                            blocks=blocks,
-                            diagnostics=full_telemetry,
-                        )
-                    )
-            elif solver == "joint":
-                params = self._project_scale_degeneracy(
-                    self.joint_step(params)
-                )
-                loss = float(self._loss(params))
-                step_type = "joint"
-            else:
-                # fast-cg truncates both conditional solves: the first CG
-                # iterations capture most of the loss reduction, and the
-                # outer alternation cleans up the remainder at much better
-                # delta-chi2 per second than deep inner solves.
-                n_cg_sky = (
-                    min(sky_cg_niter, 25)
-                    if solver == "fast-cg"
-                    else sky_cg_niter
-                )
-                params = self.sky_step(
-                    params, n_cg=n_cg_sky, step_size=sky_step_size
-                )
-                if solver in ("cg", "fast-cg"):
-                    n_cg = (
-                        min(beam_cg_niter, 10)
-                        if solver == "fast-cg"
-                        else beam_cg_niter
-                    )
-                    params = self.beam_cg_step(
-                        params, n_cg=n_cg, cg_tol=beam_cg_tol
-                    )
-                    step_type = solver
-                elif solver == "alternating":
-                    params = self.beam_step(params)
-                    step_type = "gradient"
-                else:
-                    raise ValueError(f"unknown solver: {solver}")
-                params = self._project_scale_degeneracy(params)
-
-                beam_new = params["beam_coeffs"]
-                beam_res = beam_new - beam_old
-                beam_acc = self._aa.apply(beam_old, beam_res)
-                params_aa = params.copy()
-                params_aa["beam_coeffs"] = np.asarray(
-                    beam_acc, dtype=DTYPE_R_NPY
-                )
-                params_aa = self._project_scale_degeneracy(params_aa)
-                loss_step = float(self._loss(params))
-                if len(self._aa.x_history) < 2:
-                    loss = loss_step
-                else:
-                    loss_aa = float(self._loss(params_aa))
-                    if loss_aa <= loss_step:
-                        params = params_aa
-                        loss = loss_aa
-                        step_type = step_type + "+aa"
-                    else:
-                        loss = loss_step
-
-            wall_time = time.perf_counter() - tic
-            delta = previous_loss - loss
-            if scheduler is not None:
-                eff = max(0.0, delta) / (
-                    max(abs(previous_loss), 1e-30) * max(wall_time, 1e-30)
-                )
-                block = scheduled_block
-                if block is not None:
-                    old_eff = scheduler["eff"][block]
-                    if old_eff is None:
-                        scheduler["eff"][block] = eff
-                    else:
-                        ema = (
-                            schedule_eff_alpha * eff
-                            + (1.0 - schedule_eff_alpha) * old_eff
-                        )
-                        scheduler["eff"][block] = min(ema, eff)
-                    if block != "lbfgs":
-                        accepted_step = float(
-                            step_extra.get(f"{block}_step", 0.0)
-                        )
-                        old_gain = scheduler["step_gain"][block]
-                        if accepted_step > 0.0:
-                            if accepted_step >= 0.99 * old_gain:
-                                new_gain = old_gain * schedule_step_gain_factor
-                            else:
-                                new_gain = accepted_step
+                        if scheduled_block == "lbfgs":
+                            lbfgs_result = self.fit_lbfgs(
+                                params, maxiter=schedule_lbfgs_maxiter
+                            )
+                            params = lbfgs_result["params"]
+                            loss = float(lbfgs_result["losses"][-1])
+                            step_type = f"lbfgs:{schedule_lbfgs_maxiter}"
+                            step_extra = {
+                                "lbfgs_maxiter": schedule_lbfgs_maxiter,
+                                "lbfgs_inner_iter": lbfgs_result.get("n_iter"),
+                            }
                         else:
-                            new_gain = old_gain / schedule_step_gain_factor
-                        scheduler["step_gain"][block] = max(
-                            schedule_min_step, min(1.0, float(new_gain))
+                            blocks = (scheduled_block,)
+                            step0 = scheduler["step_gain"][scheduled_block]
+                    if (
+                        solver != "adaptive-scheduled"
+                        or scheduled_block != "lbfgs"
+                    ):
+                        params, loss, step_type, step_extra = (
+                            self._adaptive_fixed_point_step(
+                                params,
+                                lambda_damp=lambda_damp,
+                                step0=step0,
+                                min_step=schedule_min_step,
+                                beam_cg_niter=min(beam_cg_niter, 10),
+                                beam_cg_tol=beam_cg_tol,
+                                blocks=blocks,
+                                diagnostics=full_telemetry,
+                            )
                         )
-                    for name in scheduler["n_since"]:
-                        scheduler["n_since"][name] += 1
-                    scheduler["n_since"][block] = 0
-                    scheduler["n_run"][block] += 1
-            losses.append(loss)
-            entry = {
-                "iteration": iteration,
-                "wall_time": wall_time,
-                "loss": loss,
-                "delta_chi2": delta,
-                "delta_chi2_per_sec": delta / max(wall_time, 1e-30),
-                "step_type": step_type,
-            }
-            if full_telemetry:
-                entry.update(
-                    {
-                        "projected_sky_rms": self._rms(params["sky_coeffs"]),
-                        "projected_beam_rms": self._rms(params["beam_coeffs"]),
-                        "beam_scatter": float(np.std(params["beam_coeffs"])),
-                        "beam_roughness": self._beam_roughness(
-                            params["beam_coeffs"]
-                        ),
-                        "beam_harmonic_penalty": self._beam_harmonic_penalty(
-                            params["beam_coeffs"]
-                        ),
-                    }
-                )
-            if scheduler is not None:
-                entry.update(
-                    {
-                        "scheduled_block": scheduled_block,
-                        "schedule_reason": schedule_reason,
-                    }
-                )
+                elif solver == "joint":
+                    params = self._project_scale_degeneracy(
+                        self.joint_step(params)
+                    )
+                    loss = float(self._loss(params))
+                    step_type = "joint"
+                else:
+                    # fast-cg truncates both conditional solves: the first CG
+                    # iterations capture most of the loss reduction, and the
+                    # outer alternation cleans up the remainder at much better
+                    # delta-chi2 per second than deep inner solves.
+                    n_cg_sky = (
+                        min(sky_cg_niter, 25)
+                        if solver == "fast-cg"
+                        else sky_cg_niter
+                    )
+                    params = self.sky_step(
+                        params, n_cg=n_cg_sky, step_size=sky_step_size
+                    )
+                    if solver in ("cg", "fast-cg"):
+                        n_cg = (
+                            min(beam_cg_niter, 10)
+                            if solver == "fast-cg"
+                            else beam_cg_niter
+                        )
+                        params = self.beam_cg_step(
+                            params, n_cg=n_cg, cg_tol=beam_cg_tol
+                        )
+                        step_type = solver
+                    elif solver == "alternating":
+                        params = self.beam_step(params)
+                        step_type = "gradient"
+                    else:
+                        raise ValueError(f"unknown solver: {solver}")
+                    params = self._project_scale_degeneracy(params)
+
+                    beam_new = params["beam_coeffs"]
+                    beam_res = beam_new - beam_old
+                    beam_acc = self._aa.apply(beam_old, beam_res)
+                    params_aa = params.copy()
+                    params_aa["beam_coeffs"] = np.asarray(
+                        beam_acc, dtype=DTYPE_R_NPY
+                    )
+                    params_aa = self._project_scale_degeneracy(params_aa)
+                    loss_step = float(self._loss(params))
+                    if len(self._aa.x_history) < 2:
+                        loss = loss_step
+                    else:
+                        loss_aa = float(self._loss(params_aa))
+                        if loss_aa <= loss_step:
+                            params = params_aa
+                            loss = loss_aa
+                            step_type = step_type + "+aa"
+                        else:
+                            loss = loss_step
+
+                wall_time = time.perf_counter() - tic
+                delta = previous_loss - loss
+                if scheduler is not None:
+                    eff = max(0.0, delta) / (
+                        max(abs(previous_loss), 1e-30) * max(wall_time, 1e-30)
+                    )
+                    block = scheduled_block
+                    if block is not None:
+                        old_eff = scheduler["eff"][block]
+                        if old_eff is None:
+                            scheduler["eff"][block] = eff
+                        else:
+                            ema = (
+                                schedule_eff_alpha * eff
+                                + (1.0 - schedule_eff_alpha) * old_eff
+                            )
+                            scheduler["eff"][block] = min(ema, eff)
+                        if block != "lbfgs":
+                            accepted_step = float(
+                                step_extra.get(f"{block}_step", 0.0)
+                            )
+                            old_gain = scheduler["step_gain"][block]
+                            if accepted_step > 0.0:
+                                if accepted_step >= 0.99 * old_gain:
+                                    new_gain = (
+                                        old_gain * schedule_step_gain_factor
+                                    )
+                                else:
+                                    new_gain = accepted_step
+                            else:
+                                new_gain = old_gain / schedule_step_gain_factor
+                            scheduler["step_gain"][block] = max(
+                                schedule_min_step, min(1.0, float(new_gain))
+                            )
+                        for name in scheduler["n_since"]:
+                            scheduler["n_since"][name] += 1
+                        scheduler["n_since"][block] = 0
+                        scheduler["n_run"][block] += 1
+                losses.append(loss)
+                entry = {
+                    "iteration": iteration,
+                    "wall_time": wall_time,
+                    "loss": loss,
+                    "delta_chi2": delta,
+                    "delta_chi2_per_sec": delta / max(wall_time, 1e-30),
+                    "step_type": step_type,
+                }
                 if full_telemetry:
                     entry.update(
                         {
-                            "schedule_eff_sky": scheduler["eff"].get("sky"),
-                            "schedule_eff_beam": scheduler["eff"].get("beam"),
-                            "schedule_eff_joint": scheduler["eff"].get(
-                                "joint"
+                            "projected_sky_rms": self._rms(
+                                params["sky_coeffs"]
                             ),
-                            "schedule_eff_lbfgs": scheduler["eff"].get(
-                                "lbfgs"
+                            "projected_beam_rms": self._rms(
+                                params["beam_coeffs"]
                             ),
-                            "schedule_n_since_sky": scheduler["n_since"].get(
-                                "sky"
+                            "beam_scatter": float(
+                                np.std(params["beam_coeffs"])
                             ),
-                            "schedule_n_since_beam": scheduler["n_since"].get(
-                                "beam"
+                            "beam_roughness": self._beam_roughness(
+                                params["beam_coeffs"]
                             ),
-                            "schedule_n_since_joint": scheduler["n_since"].get(
-                                "joint"
+                            "beam_harmonic_penalty": (
+                                self._beam_harmonic_penalty(
+                                    params["beam_coeffs"]
+                                )
                             ),
-                            "schedule_n_since_lbfgs": scheduler["n_since"].get(
-                                "lbfgs"
-                            ),
-                            "schedule_n_run_sky": scheduler["n_run"].get(
-                                "sky"
-                            ),
-                            "schedule_n_run_beam": scheduler["n_run"].get(
-                                "beam"
-                            ),
-                            "schedule_n_run_joint": scheduler["n_run"].get(
-                                "joint"
-                            ),
-                            "schedule_n_run_lbfgs": scheduler["n_run"].get(
-                                "lbfgs"
-                            ),
-                            "schedule_step_gain_sky": scheduler[
-                                "step_gain"
-                            ].get("sky"),
-                            "schedule_step_gain_beam": scheduler[
-                                "step_gain"
-                            ].get("beam"),
-                            "schedule_step_gain_joint": scheduler[
-                                "step_gain"
-                            ].get("joint"),
                         }
                     )
-            entry.update(step_extra)
-            telemetry.append(entry)
-
-            if verbose:
-                if iteration == 0:
-                    print(
-                        f"iter {iteration:3d}: loss = {loss:.6e}  "
-                        f"step = {step_type}  dt = {wall_time:.3f}s"
+                if scheduler is not None:
+                    entry.update(
+                        {
+                            "scheduled_block": scheduled_block,
+                            "schedule_reason": schedule_reason,
+                        }
                     )
-                else:
+                    if full_telemetry:
+                        entry.update(
+                            {
+                                "schedule_eff_sky": scheduler["eff"].get(
+                                    "sky"
+                                ),
+                                "schedule_eff_beam": scheduler["eff"].get(
+                                    "beam"
+                                ),
+                                "schedule_eff_joint": scheduler["eff"].get(
+                                    "joint"
+                                ),
+                                "schedule_eff_lbfgs": scheduler["eff"].get(
+                                    "lbfgs"
+                                ),
+                                "schedule_n_since_sky": scheduler[
+                                    "n_since"
+                                ].get("sky"),
+                                "schedule_n_since_beam": scheduler[
+                                    "n_since"
+                                ].get("beam"),
+                                "schedule_n_since_joint": scheduler[
+                                    "n_since"
+                                ].get("joint"),
+                                "schedule_n_since_lbfgs": scheduler[
+                                    "n_since"
+                                ].get("lbfgs"),
+                                "schedule_n_run_sky": scheduler["n_run"].get(
+                                    "sky"
+                                ),
+                                "schedule_n_run_beam": scheduler["n_run"].get(
+                                    "beam"
+                                ),
+                                "schedule_n_run_joint": scheduler["n_run"].get(
+                                    "joint"
+                                ),
+                                "schedule_n_run_lbfgs": scheduler["n_run"].get(
+                                    "lbfgs"
+                                ),
+                                "schedule_step_gain_sky": scheduler[
+                                    "step_gain"
+                                ].get("sky"),
+                                "schedule_step_gain_beam": scheduler[
+                                    "step_gain"
+                                ].get("beam"),
+                                "schedule_step_gain_joint": scheduler[
+                                    "step_gain"
+                                ].get("joint"),
+                            }
+                        )
+                entry.update(step_extra)
+                telemetry.append(entry)
+
+                if verbose:
+                    if iteration == 0:
+                        print(
+                            f"iter {iteration:3d}: loss = {loss:.6e}  "
+                            f"step = {step_type}  dt = {wall_time:.3f}s"
+                        )
+                    else:
+                        rel = abs(losses[-2] - loss) / (
+                            abs(losses[-2]) + 1e-30
+                        )
+                        print(
+                            f"iter {iteration:3d}: loss = {loss:.6e}  "
+                            f"rel_D = {rel:.2e}  step = {step_type}  "
+                            f"dchi2/s = {entry['delta_chi2_per_sec']:.3e}"
+                        )
+
+                if iteration > 0:
                     rel = abs(losses[-2] - loss) / (abs(losses[-2]) + 1e-30)
-                    print(
-                        f"iter {iteration:3d}: loss = {loss:.6e}  "
-                        f"rel_D = {rel:.2e}  step = {step_type}  "
-                        f"dchi2/s = {entry['delta_chi2_per_sec']:.3e}"
-                    )
-
-            if iteration > 0:
-                rel = abs(losses[-2] - loss) / (abs(losses[-2]) + 1e-30)
-                if rel < tol:
-                    if verbose:
-                        print(f"Converged after {iteration + 1} iterations")
-                    converged = True
-                    break
-            previous_loss = loss
+                    if rel < tol:
+                        if verbose:
+                            print(
+                                f"Converged after {iteration + 1} iterations"
+                            )
+                        converged = True
+                        break
+                previous_loss = loss
+        except KeyboardInterrupt:
+            interrupted = True
+            if verbose:
+                print(
+                    f"\nfit interrupted at iteration {iteration}; "
+                    "returning best result so far."
+                )
 
         return {
             "params": params,
             "losses": losses,
             "telemetry": telemetry,
             "converged": converged,
-            "n_iter": iteration + 1,
+            "n_iter": len(losses),
+            "interrupted": interrupted,
             "solver": solver,
         }
 
