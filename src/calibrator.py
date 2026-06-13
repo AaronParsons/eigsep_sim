@@ -361,6 +361,242 @@ class Calibrator:
         resid = pred_flat - data_flat
         return float(jnp.mean(inv_noise_var_flat * resid**2))
 
+    def _ensure_linear_ops(self):
+        """Build cached linear-operator solvers for the conditional problems.
+
+        The forward model is bilinear: with the beam fixed, predictions are
+        an affine function of sky_coeffs through a dense operator
+        ``G[d, t, p, f]`` (beam sampled at sky pixels times the visibility
+        mask); with the sky fixed they are linear in beam_coeffs through a
+        scatter-built operator ``W[t, q, f]``.  Precomputing these operators
+        once per conditional solve makes each CG iteration two einsums
+        instead of a jvp-of-grad pass through the full simulation kernel
+        (~50x faster per iteration on CPU).
+
+        Returns None (and the callers fall back to the autodiff path) when
+        the geometry is not a plain dict (e.g. StackedForwardModel) or when
+        transmitters are present (their contribution is not built into W).
+        """
+        if getattr(self, "_linops_geom", None) is self._geom:
+            return getattr(self, "_linops", None)
+        self._linops_geom = self._geom
+        self._linops = None
+        if not isinstance(self._geom, dict):
+            return None
+        if getattr(self.fwd, "_tx_dirs", np.zeros((0, 3))).shape[0] > 0:
+            return None
+
+        self.fwd._ensure_jax_arrays()
+        geom = self._geom
+        A_sky = self.fwd._sky_basis_A_jax  # (F, M)
+        A_beam = self.fwd._beam_basis_A_jax  # (F, K)
+        px = geom["beam_px_jax"]  # (T, 4, P)
+        wg = geom["beam_wgts_jax"]  # (T, 4, P)
+        mask = geom["terrain_masks_jax"]  # (T, P)
+        emit = geom["terrain_emissions_jax"]  # (T, P, F)
+        dmask = geom["default_emission_masks_jax"]  # (T, P)
+        ub = geom["unresolved_beam_weights_jax"]  # (T, Q)
+        ue = geom["unresolved_emission_jax"]  # (F,)
+        ude = geom["unresolved_default_emission_jax"]  # (F,)
+        sky_idx = geom.get("sky_indices_jax")
+        n_beam_pix = int(self.fwd.beam.npix)
+        t_gnd = jnp.asarray(300.0, dtype=DTYPE_R_JAX)
+
+        @jax.jit
+        def build_g(beam_coeffs):
+            # Layout (D, F, T, P): CG contractions over p become contiguous
+            # batched GEMVs (batch dims d, f) instead of strided gathers.
+            beam_recon = beam_coeffs @ A_beam.T  # (D, Q, F)
+
+            def per_dipole(brd):
+                b_at = (brd[px] * wg[..., None]).sum(axis=1)  # (T, P, F)
+                return (b_at * mask[..., None]).transpose(2, 0, 1)  # (F,T,P)
+
+            return jax.vmap(per_dipole)(beam_recon)  # (D, F, T, P)
+
+        @jax.jit
+        def build_w(sky_coeffs_vis):
+            sky_recon = sky_coeffs_vis @ A_sky.T  # (P, F)
+            s_eff = (
+                sky_recon[None] * mask[..., None]
+                + emit
+                + t_gnd * dmask[..., None]
+            )  # (T, P, F)
+            ntimes = px.shape[0]
+            nfreq = s_eff.shape[-1]
+            flat_idx = (
+                jnp.arange(ntimes)[:, None, None] * n_beam_pix + px
+            ).reshape(-1)
+            vals = (wg[..., None] * s_eff[:, None, :, :]).reshape(-1, nfreq)
+            w_op = (
+                jnp.zeros((ntimes * n_beam_pix, nfreq), dtype=DTYPE_R_JAX)
+                .at[flat_idx]
+                .add(vals)
+                .reshape(ntimes, n_beam_pix, nfreq)
+            )
+            w_op = w_op + ub[..., None] * (ue + t_gnd * ude)[None, None, :]
+            return w_op.transpose(2, 0, 1)  # (F, T, Q)
+
+        from functools import partial
+
+        @partial(jax.jit, static_argnums=(5,))
+        def sky_cg_solve(g_op, sky_vis, data_eff, inv_var, lam_abs, n_iter):
+            # g_op: (D, F, T, P); data_eff/inv_var passed as (D, F, T).
+            n_data = data_eff.size
+
+            def fwd_op(v):  # (P, M) -> (D, F, T)
+                vp = (v @ A_sky.T).T  # (F, P)
+                return jnp.einsum("dftp,fp->dft", g_op, vp)
+
+            def adj_op(u):  # (D, F, T) -> (P, M)
+                return jnp.einsum("dftp,dft->fp", g_op, u).T @ A_sky
+
+            resid = fwd_op(sky_vis) - data_eff
+            b = -(2.0 / n_data) * adj_op(inv_var * resid)
+            if self._lam_sky > 0:
+                n_sky = sky_vis.size
+                b = b - (2.0 * self._lam_sky / n_sky) * sky_vis
+
+            def hvp(v):
+                h = (2.0 / n_data) * adj_op(inv_var * fwd_op(v))
+                if self._lam_sky > 0:
+                    h = h + (2.0 * self._lam_sky / sky_vis.size) * v
+                return h + lam_abs * v
+
+            delta, _ = jax.scipy.sparse.linalg.cg(
+                hvp, b, maxiter=n_iter, tol=1e-3
+            )
+            return delta
+
+        @partial(jax.jit, static_argnums=(6,))
+        def beam_cg_solve(
+            w_op, beam_coeffs, beam_nom, data, inv_var, lam_abs, n_iter
+        ):
+            # w_op: (F, T, Q); data/inv_var passed as (D, F, T).
+            n_data = data.size
+            n_beam = beam_coeffs.size
+
+            def fwd_op(v):  # (D, Q, K) -> (D, F, T)
+                vr = (v @ A_beam.T).transpose(0, 2, 1)  # (D, F, Q)
+                return jnp.einsum("ftq,dfq->dft", w_op, vr)
+
+            def adj_op(u):  # (D, F, T) -> (D, Q, K)
+                y = jnp.einsum("ftq,dft->dfq", w_op, u)
+                return y.transpose(0, 2, 1) @ A_beam
+
+            resid = fwd_op(beam_coeffs) - data
+            b = -(2.0 / n_data) * adj_op(inv_var * resid)
+            if self._lam_beam > 0:
+                b = b - (2.0 * self._lam_beam / n_beam) * (
+                    beam_coeffs - beam_nom
+                )
+
+            def hvp(v):
+                h = (2.0 / n_data) * adj_op(inv_var * fwd_op(v))
+                if self._lam_beam > 0:
+                    h = h + (2.0 * self._lam_beam / n_beam) * v
+                return h + lam_abs * v
+
+            delta, _ = jax.scipy.sparse.linalg.cg(
+                hvp, b, maxiter=n_iter, tol=1e-3
+            )
+            return delta
+
+        self._linops = {
+            "build_g": build_g,
+            "build_w": build_w,
+            "sky_cg_solve": sky_cg_solve,
+            "beam_cg_solve": beam_cg_solve,
+            "sky_idx": sky_idx,
+        }
+        return self._linops
+
+    def _sky_step_linear(self, params, n_cg, lam, step_size):
+        """Conditional sky solve via the precomputed linear operator.
+
+        Returns the proposed sky_coeffs array, or None when the fast path
+        is unavailable.
+        """
+        ops = self._ensure_linear_ops()
+        if ops is None:
+            return None
+        # (The harmonic beam penalty does not involve the sky, so it does
+        # not constrain this conditional solve.)
+        beam_jax = jnp.asarray(params["beam_coeffs"], dtype=DTYPE_R_JAX)
+        sky_full = jnp.asarray(params["sky_coeffs"], dtype=DTYPE_R_JAX)
+        sky_idx = ops["sky_idx"]
+        sky_vis = sky_full[sky_idx] if sky_idx is not None else sky_full
+
+        # Affine offset: beam-dependent emission terms = prediction at
+        # zero sky.  Solving against (data - offset) makes the problem
+        # strictly linear in sky_coeffs.
+        const = self.fwd.simulate(
+            jnp.zeros_like(sky_full), beam_jax, geom=self._geom
+        )
+        obs = self._matched_observations(const.shape)
+        # Solver layout is (D, F, T) to match the GEMV-friendly operator.
+        data_eff = jnp.transpose(
+            jnp.asarray(obs["data"], dtype=DTYPE_R_JAX) - const, (1, 2, 0)
+        )
+        inv_var = jnp.transpose(
+            jnp.asarray(obs["inv_noise_var"], dtype=DTYPE_R_JAX), (1, 2, 0)
+        )
+
+        g_op = ops["build_g"](beam_jax)
+        lam_abs = lam * 1e-6 + 1e-12
+        delta = ops["sky_cg_solve"](
+            g_op, sky_vis, data_eff, inv_var, lam_abs, n_cg
+        )
+        if sky_idx is not None:
+            delta = jnp.zeros_like(sky_full).at[sky_idx].set(delta)
+        return sky_full + step_size * delta
+
+    def _beam_step_linear(self, params, n_cg, lam):
+        """Conditional beam solve via the precomputed linear operator.
+
+        Returns the proposed beam_coeffs array, or None when the fast path
+        is unavailable.  The spherical-harmonic beam penalty is not built
+        into the operator, so callers must fall back when it is active.
+        """
+        ops = self._ensure_linear_ops()
+        if ops is None or self._lam_beam_harmonic > 0:
+            return None
+        sky_full = jnp.asarray(params["sky_coeffs"], dtype=DTYPE_R_JAX)
+        sky_idx = ops["sky_idx"]
+        sky_vis = sky_full[sky_idx] if sky_idx is not None else sky_full
+        beam_jax = jnp.asarray(params["beam_coeffs"], dtype=DTYPE_R_JAX)
+        beam_nom = jnp.asarray(
+            self._beam_nom if self._beam_nom is not None else beam_jax,
+            dtype=DTYPE_R_JAX,
+        )
+
+        w_op = ops["build_w"](sky_vis)  # (F, T, Q)
+        target_shape = (
+            int(w_op.shape[1]),
+            int(beam_jax.shape[0]),
+            int(w_op.shape[0]),
+        )
+        obs = self._matched_observations(target_shape)
+        # Solver layout is (D, F, T) to match the GEMV-friendly operator.
+        data = jnp.transpose(
+            jnp.asarray(obs["data"], dtype=DTYPE_R_JAX), (1, 2, 0)
+        )
+        inv_var = jnp.transpose(
+            jnp.asarray(obs["inv_noise_var"], dtype=DTYPE_R_JAX), (1, 2, 0)
+        )
+
+        # Tikhonov scale relative to the data-term Hessian diagonal mean,
+        # mirroring the Rademacher-probe scaling of the autodiff path.
+        basis_power = jnp.mean(jnp.sum(self.fwd._beam_basis_A_jax**2, 0))
+        h_scale = float(
+            2.0 * jnp.mean(inv_var) * jnp.mean(w_op**2) * basis_power
+        )
+        lam_abs = lam * max(abs(h_scale), 1e-12) + 1e-12
+        delta = ops["beam_cg_solve"](
+            w_op, beam_jax, beam_nom, data, inv_var, lam_abs, n_cg
+        )
+        return beam_jax + delta
+
     def sky_step(
         self,
         params: Dict[str, np.ndarray],
@@ -404,8 +640,21 @@ class Calibrator:
             return self._loss(p)
 
         sky_jax = jnp.asarray(params["sky_coeffs"])
-        grad_fn = jax.grad(loss_sky)
         loss_before = float(loss_sky(sky_jax))
+
+        # Fast path: precomputed linear-operator CG (identical Newton step,
+        # ~50x cheaper per CG iteration than autodiff HVPs).
+        sky_fast = self._sky_step_linear(params, n_cg, lam, step_size)
+        if sky_fast is not None:
+            loss_fast = float(loss_sky(sky_fast))
+            if loss_fast < loss_before:
+                params_new = params.copy()
+                params_new["sky_coeffs"] = np.asarray(
+                    sky_fast, dtype=DTYPE_R_NPY
+                )
+                return params_new
+
+        grad_fn = jax.grad(loss_sky)
         grad_val = grad_fn(sky_jax)
 
         # The sky loss is exactly quadratic in sky_coeffs, so the CG should
@@ -497,8 +746,22 @@ class Calibrator:
             return self._loss(p)
 
         beam_jax = jnp.asarray(params["beam_coeffs"])
-        grad_fn = jax.grad(loss_beam)
         loss_before = float(loss_beam(beam_jax))
+
+        # Fast path: precomputed linear-operator CG (skipped when the
+        # harmonic beam penalty is active; that term is not built into the
+        # operator).
+        beam_fast = self._beam_step_linear(params, n_cg, lam)
+        if beam_fast is not None:
+            loss_fast = float(loss_beam(beam_fast))
+            if loss_fast < loss_before:
+                params_new = params.copy()
+                params_new["beam_coeffs"] = np.asarray(
+                    beam_fast, dtype=DTYPE_R_NPY
+                )
+                return params_new
+
+        grad_fn = jax.grad(loss_beam)
         grad_val = grad_fn(beam_jax)
 
         # Use H-diagonal estimate as Tikhonov scale: v^T H v / ||v||^2 ≈ trace(H)/n.
@@ -1128,6 +1391,7 @@ class Calibrator:
         use_cg: bool = False,
         use_joint: bool = False,
         sky_step_size: float = 1.0,
+        sky_cg_niter: int = 50,
         beam_cg_niter: int = 50,
         beam_cg_tol: float = 1e-3,
         lambda_damp: float = 1e-2,
@@ -1310,7 +1574,18 @@ class Calibrator:
                 loss = float(self._loss(params))
                 step_type = "joint"
             else:
-                params = self.sky_step(params, step_size=sky_step_size)
+                # fast-cg truncates both conditional solves: the first CG
+                # iterations capture most of the loss reduction, and the
+                # outer alternation cleans up the remainder at much better
+                # delta-chi2 per second than deep inner solves.
+                n_cg_sky = (
+                    min(sky_cg_niter, 25)
+                    if solver == "fast-cg"
+                    else sky_cg_niter
+                )
+                params = self.sky_step(
+                    params, n_cg=n_cg_sky, step_size=sky_step_size
+                )
                 if solver in ("cg", "fast-cg"):
                     n_cg = (
                         min(beam_cg_niter, 10)

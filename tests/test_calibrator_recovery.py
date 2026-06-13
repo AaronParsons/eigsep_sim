@@ -1,0 +1,239 @@
+#!/usr/bin/env python
+"""Accuracy regression tests for joint sky+beam recovery.
+
+These tests guard against the two failure modes diagnosed in the
+EIGSEP_Recovery_v001 plateau investigation (2026-06):
+
+1. Solver plateau: damped Jacobi fixed-point steps stall on the bilinear
+   sky x beam problem; exact conditional Newton-CG solves (solver='fast-cg')
+   must reach the noise floor in a handful of iterations.
+2. Objective bias: with the harmonic beam regularizer anchored at the
+   initial beam, a high-ell beam perturbation makes the truth heavily
+   penalized.  Each scenario pairs perturbation and regularizer
+   consistently: i.i.d. scatter init with lam_beam_harmonic=0 (the
+   notebook configuration), or a smooth low-ell perturbation with a
+   modest harmonic prior.
+"""
+
+import numpy as np
+import pytest
+from astropy.time import Time
+
+from eigsep_sim import Beam, Sky, ForwardModel, NullTerrain, Calibrator
+from eigsep_sim.observer import EarthSurface
+
+
+def build_recovery_problem(noise_snr=1e4, beam_perturb="scatter"):
+    """Small EIGSEP-like joint recovery problem with known truth.
+
+    beam_perturb='scatter' applies i.i.d. +-10% scatter to every beam
+    coefficient (the notebook's init; pair with lam_beam_harmonic=0).
+    beam_perturb='smooth' applies a low-ell multiplicative pattern,
+    consistent with a harmonic beam-shape prior.
+    """
+    freqs_hz = np.linspace(60e6, 140e6, 8)
+    nside = 4
+
+    beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=[2.0], K=3)
+    sky = Sky.from_gsm(nside, freqs_hz, n_modes=3, include_flat=True)
+    observer = EarthSurface(lat=39.2, lon=-113.4)
+    fwd = ForwardModel(observer, beam, sky, terrain=NullTerrain())
+
+    sky_coeffs = sky.init_coeffs()
+    beam_coeffs = beam.coeffs.copy()
+
+    # A few sidereal times x a few beam orientations (az/alt scan).
+    times = [Time("2025-01-01") + i * 0.25 for i in range(6)]
+    base_rots = observer.rot_gal2top_stack(times)
+    orient_rots = np.stack(
+        [
+            Beam.top2body(az, alt)
+            for alt in (0.0, 0.8)
+            for az in np.linspace(0, 2 * np.pi, 6, endpoint=False)
+        ]
+    )
+    n_orient = orient_rots.shape[0]
+    rots = np.repeat(base_rots, n_orient, axis=0)
+    body_rots = np.tile(orient_rots, (len(times), 1, 1))
+    geom = fwd.precompute_geometry(rots=rots, body_rots=body_rots)
+
+    truth = np.asarray(fwd.simulate(sky_coeffs, beam_coeffs, geom=geom))
+    sigma = np.abs(truth).mean() / noise_snr
+    rng = np.random.default_rng(seed=0)
+    data = truth + rng.normal(scale=sigma, size=truth.shape)
+    inv_noise_var = np.full_like(data, 1.0 / sigma**2)
+
+    import healpy
+
+    prng = np.random.default_rng(seed=1)
+    if beam_perturb == "scatter":
+        # i.i.d. +-10% scatter on every beam coefficient.
+        beam_ini = beam_coeffs * prng.uniform(
+            0.9, 1.1, size=beam_coeffs.shape
+        ).astype(beam_coeffs.dtype)
+    elif beam_perturb == "smooth":
+        # ell<=1 pattern: constant + dipole along a random direction.
+        pix_vec = np.array(
+            healpy.pix2vec(nside, np.arange(beam.npix))
+        )  # (3, npix)
+        direction = prng.normal(size=3)
+        direction /= np.linalg.norm(direction)
+        pattern = 0.5 + (direction @ pix_vec)
+        pattern /= np.sqrt(np.mean(pattern**2))
+        beam_ini = beam_coeffs * (1.0 + 0.1 * pattern[None, :, None]).astype(
+            beam_coeffs.dtype
+        )
+    else:
+        raise ValueError(f"unknown beam_perturb: {beam_perturb}")
+    sky_ini = sky_coeffs * prng.uniform(
+        0.9, 1.1, size=sky_coeffs.shape
+    ).astype(sky_coeffs.dtype)
+
+    return {
+        "fwd": fwd,
+        "geom": geom,
+        "data": data,
+        "inv_noise_var": inv_noise_var,
+        "prms_tru": {"sky_coeffs": sky_coeffs, "beam_coeffs": beam_coeffs},
+        "prms_ini": {"sky_coeffs": sky_ini, "beam_coeffs": beam_ini},
+        "sigma": sigma,
+    }
+
+
+def test_fast_cg_reaches_noise_floor():
+    """fast-cg must reach the noise floor; adaptive steps plateau here.
+
+    The loss is mean(inv_noise_var * resid**2), so at the truth it is ~1.
+    A correct solver gets within a small factor of that in a few exact
+    conditional solves.  The damped Jacobi solvers stall orders of
+    magnitude higher on this same problem.
+
+    Uses the notebook configuration: i.i.d. coefficient scatter init and
+    no harmonic beam prior (which would otherwise anchor to the scattered
+    init and make the truth score worse than the init).
+    """
+    prob = build_recovery_problem(beam_perturb="scatter")
+    cal = Calibrator(
+        prob["fwd"],
+        prob["data"],
+        inv_noise_var=prob["inv_noise_var"],
+        lam_beam=0.01,
+        lam_beam_harmonic=0.0,
+    )
+    cal._beam_nom = np.asarray(prob["prms_ini"]["beam_coeffs"]).copy()
+    cal._resolve_geom(geom=prob["geom"])
+
+    loss_ini = float(cal._loss(prob["prms_ini"]))
+    loss_tru = float(cal._loss(prob["prms_tru"]))
+    # Objective consistency: the truth must score far better than the
+    # init, otherwise the recovery benchmark is meaningless.
+    assert loss_tru < 0.01 * loss_ini
+
+    result = cal.fit(
+        params={k: v.copy() for k, v in prob["prms_ini"].items()},
+        geom=prob["geom"],
+        max_iter=8,
+        tol=1e-4,
+        verbose=False,
+        solver="fast-cg",
+    )
+    data_chi2 = float(cal.data_loss(result["params"]))
+    # Truth-level data chi2 is ~1; allow slack for finite iterations and
+    # regularization pull, but stay far below the init loss scale.
+    assert data_chi2 < 10.0, f"data_chi2={data_chi2:.3e}"
+    assert data_chi2 < 1e-3 * loss_ini
+
+
+def test_fast_cg_beam_error_does_not_grow():
+    """Recovered beam must not drift away from truth while fitting data.
+
+    At this problem scale the sky basis can absorb nearly any smooth beam
+    perturbation, so joint recovery cannot pull the beam all the way to
+    truth (its error is dominated by data-degenerate directions pinned to
+    the init by the ridge/harmonic priors).  The regression guarded here
+    is the solver riding a degeneracy to a *worse* beam while chi2 drops.
+    """
+    prob = build_recovery_problem(beam_perturb="smooth")
+    cal = Calibrator(
+        prob["fwd"],
+        prob["data"],
+        inv_noise_var=prob["inv_noise_var"],
+        lam_beam=0.01,
+        lam_beam_harmonic=1e2,
+    )
+    cal._beam_nom = np.asarray(prob["prms_ini"]["beam_coeffs"]).copy()
+    cal._resolve_geom(geom=prob["geom"])
+
+    result = cal.fit(
+        params={k: v.copy() for k, v in prob["prms_ini"].items()},
+        geom=prob["geom"],
+        max_iter=8,
+        tol=1e-4,
+        verbose=False,
+        solver="fast-cg",
+    )
+
+    fwd = prob["fwd"]
+    A_beam = fwd.beam.basis.A
+    beam_tru = prob["prms_tru"]["beam_coeffs"] @ A_beam.T
+    beam_ini = prob["prms_ini"]["beam_coeffs"] @ A_beam.T
+    beam_fit = np.asarray(result["params"]["beam_coeffs"]) @ A_beam.T
+
+    # Remove the per-frequency multiplicative sky/beam gauge before
+    # comparing (the notebook removes the same gauge via ScaleDegeneracy).
+    def align(b):
+        scale = np.sum(b * beam_tru, axis=(0, 1)) / np.maximum(
+            np.sum(b**2, axis=(0, 1)), 1e-30
+        )
+        return b * scale[None, None, :]
+
+    err_fit = np.linalg.norm(align(beam_fit) - beam_tru)
+    err_ini = np.linalg.norm(align(beam_ini) - beam_tru)
+    assert err_fit < 1.02 * err_ini, (
+        f"beam error grew while fitting data: "
+        f"fit={err_fit:.3e} init={err_ini:.3e}"
+    )
+
+
+def test_conditional_linear_operators_match_simulate():
+    """The fast-path linear operators must reproduce the forward model.
+
+    sky_step/beam_cg_step solve the conditional problems through
+    precomputed operators (G for sky with beam fixed, W for beam with sky
+    fixed).  Their predictions must match ForwardModel.simulate exactly
+    (up to float32 roundoff) including the affine emission offset.
+    """
+    import jax.numpy as jnp
+
+    prob = build_recovery_problem()
+    cal = Calibrator(
+        prob["fwd"],
+        prob["data"],
+        inv_noise_var=prob["inv_noise_var"],
+        lam_beam=0.01,
+        lam_beam_harmonic=0.0,
+    )
+    cal._resolve_geom(geom=prob["geom"])
+    ops = cal._ensure_linear_ops()
+    assert ops is not None
+
+    fwd = prob["fwd"]
+    s = prob["prms_ini"]["sky_coeffs"]
+    b = prob["prms_ini"]["beam_coeffs"]
+    ref = np.asarray(fwd.simulate(s, b, geom=prob["geom"]))  # (T, D, F)
+    scale = np.abs(ref).max()
+
+    # Sky operator: pred = G . sky_recon + simulate(0, beam).
+    offset = np.asarray(fwd.simulate(np.zeros_like(s), b, geom=prob["geom"]))
+    g_op = np.asarray(ops["build_g"](jnp.asarray(b)))  # (D, F, T, P)
+    pred_sky = np.einsum("dftp,pf->tdf", g_op, s @ fwd.sky.basis.A.T) + offset
+    assert np.max(np.abs(pred_sky - ref)) < 1e-4 * scale
+
+    # Beam operator: pred = W . beam_recon (strictly linear in beam).
+    w_op = np.asarray(ops["build_w"](jnp.asarray(s)))  # (F, T, Q)
+    pred_beam = np.einsum("ftq,dqf->tdf", w_op, b @ fwd.beam.basis.A.T)
+    assert np.max(np.abs(pred_beam - ref)) < 1e-4 * scale
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
