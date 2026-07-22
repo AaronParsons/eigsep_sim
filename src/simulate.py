@@ -79,11 +79,10 @@ class ForwardModel:
         #
         # Store as:
         #   _tx_dirs       : (n_sources, 3) topocentric unit vectors
-        #   _tx_T_internal : (n_sources, nfreq) full-band power, scaled by
-        #                    sky.npix/beam.npix so the kernel denominator
-        #                    (sum over beam pixels) cancels correctly.
+        #   _tx_T_internal : (n_sources, nfreq) full-band power [K].
+        #                    The kernel divides by the total beam integral
+        #                    (sampled_weight), so no pre-scaling is needed.
         nfreq = len(beam.freqs_hz)
-        scale = float(sky.npix) / float(beam.npix)
         if transmitters:
             dirs, T_internals = [], []
             for direction, freqs_tx, power_K in transmitters:
@@ -99,7 +98,7 @@ class ForwardModel:
                 for f_tx, p in zip(freqs_tx, pwr):
                     idx = int(np.argmin(np.abs(beam.freqs_hz - f_tx)))
                     T_full[idx] += float(p)
-                T_internals.append(T_full * scale)
+                T_internals.append(T_full)
             self._tx_dirs = np.stack(dirs)  # (n_sources, 3)
             self._tx_T_internal = np.stack(T_internals)  # (n_sources, nfreq)
         else:
@@ -250,6 +249,7 @@ class ForwardModel:
             beam_px_all,
             beam_wgts_all,
             T_gnd,
+            T_iso,
             tx_px_all,
             tx_wgts_all,
         ):
@@ -265,6 +265,10 @@ class ForwardModel:
             beam_px_all   : (ntimes, 4, npix_vis)     int32    cached beam pixels
             beam_wgts_all : (ntimes, 4, npix_vis)     float32  cached beam weights
             T_gnd         : scalar [K]
+            T_iso         : (nfreq,) float32  isotropic additive sky component (e.g. T21) [K].
+                            Bypasses the sky basis so its spectral shape is preserved
+                            exactly.  Contributes T_iso * f_vis to the antenna temperature
+                            where f_vis = sum_p(B_p*mask_p)/sum_p(B_p).
             tx_px_all     : (ntimes, 4, n_sources)    int32    cached TX pixels
             tx_wgts_all   : (ntimes, 4, n_sources)    float32  cached TX weights
             Returns       : (ntimes, n_dipoles, nfreq)
@@ -299,6 +303,10 @@ class ForwardModel:
                     sky_num = jnp.sum(
                         beam_at_sky * sky_recon * mask[:, None], axis=0
                     )
+                    # Visible-pixel beam integral — used for T_iso injection.
+                    # Kept separate from sky_num so T_iso bypasses the basis.
+                    visible_weight = jnp.sum(beam_at_sky * mask[:, None], axis=0)
+                    sky_num = sky_num + T_iso * visible_weight
                     terrain_num = jnp.sum(beam_at_sky * terrain_emit, axis=0)
                     sampled_weight = jnp.sum(beam_at_sky, axis=0)
                     default_weight = jnp.sum(
@@ -330,7 +338,11 @@ class ForwardModel:
                     num = num + jnp.sum(
                         beam_at_tx * tx_T_jax, axis=0
                     )  # (nfreq,)
-                    return num
+                    # Normalise by total beam integral → output in Kelvin.
+                    # unresolved_weight covers sky_mask-omitted pixels; zero
+                    # in the full-sky case.
+                    denom = sampled_weight + unresolved_weight
+                    return num / denom
 
                 return None, jax.vmap(one_dipole)(beam_recon_all)
 
@@ -417,7 +429,13 @@ class ForwardModel:
                         + beam_recon_d[px[k]] * wgts[k, :, None],
                         jnp.zeros_like(sky_recon),
                     )
-                    sky_jac_f = beam_at_sky * mask[:, None]
+                    # Mirror the forward-model normalisation (GN approx:
+                    # denominator gradient w.r.t. beam is ignored).
+                    sampled_weight_d = jnp.sum(beam_at_sky, axis=0)  # (nfreq,)
+                    unresolved_weight_d = unresolved_beam_weights @ beam_recon_d
+                    denom_d = sampled_weight_d + unresolved_weight_d  # (nfreq,)
+
+                    sky_jac_f = beam_at_sky * mask[:, None] / denom_d[None, :]
                     sky_num_d = sky_num_d - jnp.einsum(
                         "pf,fm->pm", sky_jac_f * wr_d[None, :], A_sky
                     )
@@ -425,10 +443,10 @@ class ForwardModel:
                         "pf,fm->pm", (sky_jac_f**2) * w_d[None, :], A_sky**2
                     )
 
-                    beam_rhs_pix_f = sky_recon * mask[:, None] + terrain_emit
                     beam_rhs_pix_f = (
-                        beam_rhs_pix_f + T_gnd * default_emit_mask[:, None]
-                    )
+                        sky_recon * mask[:, None] + terrain_emit
+                        + T_gnd * default_emit_mask[:, None]
+                    ) / denom_d[None, :]
                     pix_num = jnp.zeros(
                         (n_beam_pix, wr_d.shape[0]), dtype=beam_coeffs.dtype
                     )
@@ -452,6 +470,7 @@ class ForwardModel:
                     unres_jac = (
                         unresolved_beam_weights[:, None]
                         * unresolved_spec[None, :]
+                        / denom_d[None, :]
                     )
                     pix_num = pix_num - unres_jac * wr_d[None, :]
                     pix_den = pix_den + (unres_jac**2) * w_d[None, :]
@@ -461,7 +480,7 @@ class ForwardModel:
 
                     def scatter_tx(k, vals):
                         num_k, den_k = vals
-                        jac = tx_T_jax * tx_wgts[k, :, None]
+                        jac = tx_T_jax * tx_wgts[k, :, None] / denom_d[None, :]
                         num_k = num_k.at[tx_px[k]].add(-jac * wr_d[None, :])
                         den_k = den_k.at[tx_px[k]].add((jac**2) * w_d[None, :])
                         return num_k, den_k
@@ -1012,7 +1031,8 @@ class ForwardModel:
         )
 
     def simulate(
-        self, sky_coeffs, beam_coeffs, times=None, geom=None, T_gnd=300.0
+        self, sky_coeffs, beam_coeffs, times=None, geom=None, T_gnd=300.0,
+        T_iso=None,
     ):
         """
         Simulate antenna temperature given basis coefficients.
@@ -1029,6 +1049,12 @@ class ForwardModel:
             Pre-computed geometry from precompute_geometry().
         T_gnd : float
             Ground temperature [K] for blocked pixels.
+        T_iso : ndarray, shape (nfreq,), optional
+            Isotropic additive sky component (e.g. cosmological T21 signal) [K].
+            Bypasses the sky basis so its full spectral shape enters the data
+            unchanged.  Contributes ``T_iso * f_vis`` to the antenna temperature
+            where ``f_vis = sum_p(B_p*mask_p) / sum_p(B_p)`` accounts for lunar
+            occultation.  Defaults to zero.
 
         Returns
         -------
@@ -1050,6 +1076,13 @@ class ForwardModel:
                 sky_indices_jax
             ]  # (npix_vis, nmodes_sky)
 
+        nfreq = len(self.beam.freqs_hz)
+        T_iso_jax = (
+            jnp.zeros(nfreq, dtype=DTYPE_R_JAX)
+            if T_iso is None
+            else jnp.asarray(T_iso, dtype=DTYPE_R_JAX)
+        )
+
         return self._sim_jit(
             sky_coeffs_jax,
             beam_coeffs_jax,
@@ -1062,6 +1095,7 @@ class ForwardModel:
             geom["beam_px_jax"],
             geom["beam_wgts_jax"],
             jnp.asarray(T_gnd, dtype=DTYPE_R_JAX),
+            T_iso_jax,
             geom["tx_px_jax"],
             geom["tx_wgts_jax"],
         )

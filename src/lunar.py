@@ -238,10 +238,10 @@ class LunarCampaign:
             self.T21cm_K = T21cmModel()(
                 self.freqs_hz, model_index=signal_cfg.get("model_index", 0)
             ).astype(np.float32)
-            sky_maps = self.sky.basis.deproject(self.sky_coeffs) + self.T21cm_K
-            self.sky_coeffs = self.sky.basis.project(sky_maps).astype(
-                np.float32
-            )
+            # T21 is kept separate from sky_coeffs and injected via the T_iso
+            # parameter of ForwardModel.simulate().  Projecting T21 onto the GSM
+            # spectral basis would destroy its out-of-basis spectral content,
+            # which is precisely what distinguishes it from the GSM in recovery.
         self.source_config = config.get(
             "sources", {"earth": {"enabled": False}, "sun": {"enabled": False}}
         )
@@ -325,7 +325,10 @@ class LunarCampaign:
             masks.append(np.asarray(geom["terrain_masks_jax"]))
             spectra.append(
                 np.asarray(
-                    fwd.simulate(self.sky_coeffs, self.beam.coeffs, geom=geom)
+                    fwd.simulate(
+                        self.sky_coeffs, self.beam.coeffs, geom=geom,
+                        T_iso=self.T21cm_K if np.any(self.T21cm_K != 0) else None,
+                    )
                 )
             )
         return LunarCampaignResult(
