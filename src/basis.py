@@ -380,8 +380,10 @@ class SkyBasis(_SpectralBasis):
         gsm_maps = np.array(gsm_maps).T  # (npix, nfreq)
 
         # SVD to get dominant spectral modes
+        # gsm_maps: (npix, nfreq) → U: (npix, r), s: (r,), Vt: (r, nfreq)
         U, s, Vt = np.linalg.svd(gsm_maps, full_matrices=False)
-        modes = Vt[:n_modes].T  # (nfreq, n_modes)
+        modes = Vt[:n_modes].T     # (nfreq, n_modes) — spectral modes
+        U_spatial = U[:, :n_modes]  # (npix, n_modes) — GSM spatial eigenmodes
 
         # Optionally add flat mode
         if include_flat:
@@ -394,7 +396,10 @@ class SkyBasis(_SpectralBasis):
                 flat_orth = flat_orth / norm
                 modes = np.column_stack([modes, flat_orth])
 
-        return cls(modes, freqs_hz=freqs_hz)
+        # Store spatial modes so callers (e.g. Calibrator._sky_step_gsm) can
+        # compress sky solves from (npix × nmodes) to (n_modes × nmodes) unknowns.
+        return cls(modes, freqs_hz=freqs_hz,
+                   svd_modes=U_spatial, svd_svals=s[:n_modes])
 
 
 def _resample_basis(old_freqs, A_old, new_freqs):

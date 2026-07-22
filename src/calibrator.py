@@ -406,13 +406,29 @@ class Calibrator:
         def build_g(beam_coeffs):
             # Layout (D, F, T, P): CG contractions over p become contiguous
             # batched GEMVs (batch dims d, f) instead of strided gathers.
+            # Divides by denom = sampled_weight + unresolved_weight so that
+            # fwd_op(sky) returns Kelvin, matching the output of simulate().
             beam_recon = beam_coeffs @ A_beam.T  # (D, Q, F)
 
             def per_dipole(brd):
                 b_at = (brd[px] * wg[..., None]).sum(axis=1)  # (T, P, F)
-                return (b_at * mask[..., None]).transpose(2, 0, 1)  # (F,T,P)
+                sampled_w = b_at.sum(axis=1)          # (T, F)
+                denom = sampled_w + ub @ brd           # (T, F)
+                b_at_norm = b_at / denom[:, None, :]   # (T, P, F)
+                return (b_at_norm * mask[..., None]).transpose(2, 0, 1)  # (F,T,P)
 
             return jax.vmap(per_dipole)(beam_recon)  # (D, F, T, P)
+
+        @jax.jit
+        def build_denom(beam_coeffs):
+            """Per-dipole beam integral denom[d,t,f] = sampled_weight + unresolved_weight."""
+            beam_recon = beam_coeffs @ A_beam.T  # (D, Q, F)
+
+            def per_dipole(brd):
+                b_at = (brd[px] * wg[..., None]).sum(axis=1)  # (T, P, F)
+                return b_at.sum(axis=1) + ub @ brd  # (T, F)
+
+            return jax.vmap(per_dipole)(beam_recon)  # (D, T, F)
 
         @jax.jit
         def build_w(sky_coeffs_vis):
@@ -463,8 +479,22 @@ class Calibrator:
                     h = h + (2.0 * self._lam_sky / sky_vis.size) * v
                 return h + lam_abs * v
 
+            # Diagonal preconditioner: H_diag[p,m] = (2/N) sum_{d,f,t}
+            # A_sky[f,m]^2 * g_op[d,f,t,p]^2 * inv_var[d,f,t].
+            # With all-sky illumination (wide tumbling) the sky normal matrix
+            # spans ~npix*nmodes ~ 12k dimensions and plain CG stalls; the
+            # diagonal preconditioner approximately equalises per-pixel/mode
+            # curvature and reduces the effective condition number by orders
+            # of magnitude.
+            g_sq_wt = jnp.einsum("dftp,dft->fp", g_op ** 2, inv_var)
+            M_diag = (2.0 / n_data) * jnp.einsum("fm,fp->pm", A_sky ** 2, g_sq_wt)
+            M_inv = 1.0 / jnp.maximum(M_diag + lam_abs, 1e-30)
+
+            def precond(r):
+                return r * M_inv
+
             delta, _ = jax.scipy.sparse.linalg.cg(
-                hvp, b, maxiter=n_iter, tol=1e-3
+                hvp, b, M=precond, maxiter=n_iter, tol=1e-3
             )
             return delta
 
@@ -472,16 +502,16 @@ class Calibrator:
         def beam_cg_solve(
             w_op, beam_coeffs, beam_nom, data, inv_var, lam_abs, n_iter
         ):
-            # w_op: (F, T, Q); data/inv_var passed as (D, F, T).
+            # w_op: (D, F, T, Q); data/inv_var passed as (D, F, T).
             n_data = data.size
             n_beam = beam_coeffs.size
 
             def fwd_op(v):  # (D, Q, K) -> (D, F, T)
                 vr = (v @ A_beam.T).transpose(0, 2, 1)  # (D, F, Q)
-                return jnp.einsum("ftq,dfq->dft", w_op, vr)
+                return jnp.einsum("dftq,dfq->dft", w_op, vr)
 
             def adj_op(u):  # (D, F, T) -> (D, Q, K)
-                y = jnp.einsum("ftq,dft->dfq", w_op, u)
+                y = jnp.einsum("dftq,dft->dfq", w_op, u)
                 return y.transpose(0, 2, 1) @ A_beam
 
             resid = fwd_op(beam_coeffs) - data
@@ -532,9 +562,42 @@ class Calibrator:
             )
             return h.reshape(pe * n_mode, pe * n_mode), b
 
+        # Fused operator: H[d,f,t,i] = sum_p g_op[d,f,t,p] * U_sp[p,i].
+        # Building H directly inside JIT avoids materialising the full
+        # (D,F,T,P) g_op array (~552 MB at nside=16, ntimes=500) as a
+        # Python-visible JAX buffer.  Only constructed when sky.basis carries
+        # GSM spatial eigenmodes (i.e. created via SkyBasis.from_gsm with the
+        # svd_modes patch).
+        sky_basis = self.fwd.sky.basis
+        build_H = None
+        if getattr(sky_basis, "svd_modes", None) is not None:
+            svd_modes_full = np.asarray(sky_basis.svd_modes, dtype=DTYPE_R_NPY)
+            _U_sp_np = (
+                svd_modes_full[np.asarray(sky_idx)]
+                if sky_idx is not None
+                else svd_modes_full
+            )  # (P, n_spatial)
+            _U_sp_jax = jnp.asarray(_U_sp_np, dtype=DTYPE_R_JAX)
+
+            @jax.jit
+            def build_H(beam_coeffs):
+                beam_recon = beam_coeffs @ A_beam.T  # (D, Q, F)
+
+                def per_dipole(brd):
+                    b_at = (brd[px] * wg[..., None]).sum(axis=1)  # (T, P, F)
+                    sampled_w = b_at.sum(axis=1)           # (T, F)
+                    denom = sampled_w + ub @ brd            # (T, F)
+                    b_at_norm = b_at / denom[:, None, :]   # (T, P, F)
+                    g_ftp = (b_at_norm * mask[..., None]).transpose(2, 0, 1)
+                    return jnp.einsum("ftp,pi->fti", g_ftp, _U_sp_jax)  # (F, T, I)
+
+                return jax.vmap(per_dipole)(beam_recon)  # (D, F, T, I)
+
         self._linops = {
             "build_g": build_g,
+            "build_H": build_H,
             "build_w": build_w,
+            "build_denom": build_denom,
             "sky_cg_solve": sky_cg_solve,
             "beam_cg_solve": beam_cg_solve,
             "build_sky_normal": build_sky_normal,
@@ -608,6 +671,80 @@ class Calibrator:
             )
         return np.asarray(sky_vis_new, dtype=DTYPE_R_NPY)
 
+    def _sky_step_gsm(self, params, step_size):
+        """Conditional sky solve in the GSM spatial basis.
+
+        Compresses the per-pixel sky to the GSM spatial eigenmodes stored in
+        ``sky.basis.svd_modes`` (shape ``(npix, n_spatial)``), then solves the
+        resulting ``(n_spatial * n_spectral)``-dimensional normal equations
+        exactly with ``np.linalg.lstsq``.  This is 10–100× faster than the
+        per-pixel CG path for nside ≥ 16, while producing the exact conditional
+        minimum within the GSM spatial subspace.
+
+        Returns None when ``svd_modes`` are unavailable or the linear-op cache
+        is not ready.
+        """
+        sky_basis = self.fwd.sky.basis
+        if getattr(sky_basis, "svd_modes", None) is None:
+            return None
+        ops = self._ensure_linear_ops()
+        if ops is None:
+            return None
+
+        U_sp_full = np.asarray(sky_basis.svd_modes, dtype=DTYPE_R_NPY)  # (npix, I)
+        A_sky_np = np.asarray(self.fwd._sky_basis_A_jax)               # (F, J)
+        n_spatial, n_spectral = U_sp_full.shape[1], A_sky_np.shape[1]
+        n_params = n_spatial * n_spectral
+
+        beam_jax = jnp.asarray(params["beam_coeffs"], dtype=DTYPE_R_JAX)
+        sky_full = jnp.asarray(params["sky_coeffs"], dtype=DTYPE_R_JAX)
+        sky_idx = ops["sky_idx"]
+        sky_vis = sky_full[sky_idx] if sky_idx is not None else sky_full
+
+        # When sky_idx restricts the beam integral to a visible subset, index
+        # U_sp to match g_op's P dimension (len(sky_idx) rather than npix).
+        U_sp = U_sp_full[np.asarray(sky_idx)] if sky_idx is not None else U_sp_full
+
+        # Terrain offset: prediction at zero sky
+        const = self.fwd.simulate(
+            jnp.zeros_like(sky_full), beam_jax, geom=self._geom
+        )
+        obs = self._matched_observations(const.shape)
+        data_eff = np.asarray(
+            jnp.asarray(obs["data"], dtype=DTYPE_R_JAX) - const
+        )  # (T, D, F)
+        inv_var_np = np.asarray(obs["inv_noise_var"])  # (T, D, F)
+
+        # H[d,f,t,i] = sum_p g_op[d,f,t,p] * U_sp[p,i]  (P = visible pixels)
+        # Prefer the fused build_H (avoids materialising the full 552 MB g_op).
+        if ops.get("build_H") is not None:
+            H = np.asarray(ops["build_H"](beam_jax))  # (D, F, T, I)
+        else:
+            g_op_jax = ops["build_g"](beam_jax)       # (D, F, T, P)
+            H = np.asarray(
+                jnp.einsum("dftp,pi->dfti", g_op_jax, jnp.asarray(U_sp))
+            )
+            del g_op_jax
+
+        # Design matrix M[(d,f,t), (i*n_spectral+j)] = A_sky[f,j] * H[d,f,t,i]
+        # Rows in (D, F, T) order to match the data reshape.
+        M = np.einsum("dfti,fj->dftij", H, A_sky_np).reshape(-1, n_params)
+
+        rhs = data_eff.transpose(1, 2, 0).reshape(-1)       # (D*F*T,)
+        w = np.sqrt(inv_var_np.transpose(1, 2, 0).reshape(-1))
+        c, _, _, _ = np.linalg.lstsq(M * w[:, None], rhs * w, rcond=None)
+        c = c.reshape(n_spatial, n_spectral)  # (n_spatial, n_spectral)
+
+        # Reconstruct sky in per-pixel spectral space and apply step damping.
+        sky_vis_new = jnp.asarray(U_sp @ c, dtype=DTYPE_R_JAX)  # (P_vis, J)
+        sky_vis_stepped = sky_vis + step_size * (sky_vis_new - sky_vis)
+        if sky_idx is not None:
+            return np.asarray(
+                jnp.zeros_like(sky_full).at[sky_idx].set(sky_vis_stepped),
+                dtype=DTYPE_R_NPY,
+            )
+        return np.asarray(sky_vis_stepped, dtype=DTYPE_R_NPY)
+
     def _sky_step_linear(self, params, n_cg, lam, step_size):
         """Conditional sky solve via the precomputed linear operator.
 
@@ -667,11 +804,17 @@ class Calibrator:
             dtype=DTYPE_R_JAX,
         )
 
-        w_op = ops["build_w"](sky_vis)  # (F, T, Q)
+        w_op_unnorm = ops["build_w"](sky_vis)  # (F, T, Q)
+        denom = ops["build_denom"](beam_jax)   # (D, T, F)
+        # Normalize per-dipole so beam CG output is in Kelvin, matching simulate().
+        # w_op[d,f,t,q] = w_op_unnorm[f,t,q] / denom[d,t,f]
+        w_op = (
+            w_op_unnorm[None] / denom.transpose(0, 2, 1)[:, :, :, None]
+        )  # (D, F, T, Q)
         target_shape = (
-            int(w_op.shape[1]),
+            int(w_op.shape[2]),
             int(beam_jax.shape[0]),
-            int(w_op.shape[0]),
+            int(w_op.shape[1]),
         )
         obs = self._matched_observations(target_shape)
         # Solver layout is (D, F, T) to match the GEMV-friendly operator.
@@ -750,6 +893,17 @@ class Calibrator:
             if loss_direct < loss_before:
                 params_new = params.copy()
                 params_new["sky_coeffs"] = sky_direct
+                return params_new
+
+        # GSM-compressed exact solve: exact conditional minimum within the GSM
+        # spatial subspace (n_spatial * n_spectral ~ 16 unknowns).  10–100×
+        # faster than the per-pixel CG for nside ≥ 16 and GSM-dominated sky.
+        sky_gsm = self._sky_step_gsm(params, step_size)
+        if sky_gsm is not None:
+            loss_gsm = float(loss_sky(jnp.asarray(sky_gsm)))
+            if loss_gsm < loss_before:
+                params_new = params.copy()
+                params_new["sky_coeffs"] = sky_gsm
                 return params_new
 
         # Fallback fast path: precomputed linear-operator CG (identical
@@ -1693,15 +1847,15 @@ class Calibrator:
                     loss = float(self._loss(params))
                     step_type = "joint"
                 else:
-                    # fast-cg truncates both conditional solves: the first CG
-                    # iterations capture most of the loss reduction, and the
-                    # outer alternation cleans up the remainder at much better
-                    # delta-chi2 per second than deep inner solves.
-                    n_cg_sky = (
-                        min(sky_cg_niter, 25)
-                        if solver == "fast-cg"
-                        else sky_cg_niter
-                    )
+                    # fast-cg truncates the beam conditional solve (10 iters
+                    # is enough since the beam starts near nominal), but lets
+                    # sky_cg_niter flow through unchanged.  The beam CG cap
+                    # was paired with a sky CG cap of 25, but that cap only
+                    # worked when few sky pixels were illuminated (equatorial
+                    # attitude); with all-sky coverage the sky normal matrix
+                    # spans ~npix*nmodes >> 25 and needs more iterations to
+                    # converge.
+                    n_cg_sky = sky_cg_niter
                     params = self.sky_step(
                         params, n_cg=n_cg_sky, step_size=sky_step_size
                     )

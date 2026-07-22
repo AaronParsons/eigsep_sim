@@ -387,12 +387,22 @@ class Beam:
                            f"nside={nside} (npix={npix}) and basis nmodes={self.basis.nmodes}")
 
     @classmethod
-    def from_dipole(cls, nside, freqs_hz, arm_lengths_m, u_body=None, K=5):
+    def from_dipole(
+        cls,
+        nside,
+        freqs_hz,
+        arm_lengths_m,
+        u_body=None,
+        K=5,
+        arm_length_range_frac=0.0,
+        n_arm_samples=5,
+    ):
         """Initialize beam from thin-dipole analytic model.
 
         Evaluates the thin-dipole power pattern at all frequencies on a HEALPix
-        grid, then performs SVD per dipole to extract K dominant spectral modes.
-        The coefficients are initialized from the SVD decomposition.
+        grid, then performs SVD to extract K dominant spectral modes.  The
+        coefficients are initialized by projecting the nominal beam onto the
+        shared spectral basis.
 
         Parameters
         ----------
@@ -406,6 +416,16 @@ class Beam:
             Dipole axes in body frame. Defaults to a standard orthogonal pair.
         K : int
             Number of spectral modes to retain (default 5).
+        arm_length_range_frac : float
+            If > 0, the SVD basis is built from beam maps sampled over a range
+            of arm lengths [L*(1-frac), L*(1+frac)] for each dipole, making the
+            basis able to represent beams that are perturbations of the nominal
+            model.  The nominal coefficients are still projected from the
+            unperturbed arm lengths.  Default 0 (nominal beam only).
+        n_arm_samples : int
+            Number of arm length samples per dipole when arm_length_range_frac
+            > 0.  An odd value ensures the nominal length is included.
+            Default 5.
 
         Returns
         -------
@@ -435,29 +455,46 @@ class Beam:
             )
 
         freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
+        nfreq = len(freqs_hz)
 
         # Compute cos(θ) for all beam pixels
         npix = healpy.nside2npix(nside)
         N_GAL = np.array(healpy.pix2vec(nside, np.arange(npix)))  # (3, npix)
         cos_theta = u_body @ N_GAL  # (n_dipoles, npix)
 
-        # Evaluate thin-dipole beam at all frequencies
-        nominal_beam = np.zeros(
-            (n_dipoles, npix, len(freqs_hz)), dtype=DTYPE_R_NPY
-        )
+        # Evaluate thin-dipole beam at nominal arm lengths
+        nominal_beam = np.zeros((n_dipoles, npix, nfreq), dtype=DTYPE_R_NPY)
         for f_idx, f_hz in enumerate(freqs_hz):
             kh_f = arm_lengths_m * np.pi * f_hz / C_LIGHT
             nominal_beam[:, :, f_idx] = thin_dipole_pattern(kh_f[:, np.newaxis], cos_theta)
 
-        # SVD along frequency axis for each dipole
-        # Note: K is limited by min(npix, nfreq)
-        max_rank = min(npix, len(freqs_hz))
+        # Build matrix for SVD.  With arm_length_range_frac > 0, stack beam
+        # maps evaluated at perturbed arm lengths for every dipole so that the
+        # K spectral modes span arm-length-induced beam shape variation, making
+        # the basis able to fit beams that are perturbations of the nominal
+        # model.  Coefficients are always projected from the nominal beam.
+        max_rank = min(npix, nfreq)
         K_actual = min(K, max_rank)
-        # Build a shared spectral basis from the averaged dipole. Project each
-        # physical dipole map into that basis so coefficient signs and scales
-        # match the shared basis rather than an independent per-dipole SVD.
-        B_avg = np.mean(nominal_beam, axis=0)
-        U, s, Vt = np.linalg.svd(B_avg, full_matrices=False)
+        if arm_length_range_frac > 0.0:
+            maps = []
+            for d_idx, L_nom in enumerate(arm_lengths_m):
+                for L in np.linspace(
+                    L_nom * (1.0 - arm_length_range_frac),
+                    L_nom * (1.0 + arm_length_range_frac),
+                    int(n_arm_samples),
+                ):
+                    kh = L * np.pi * freqs_hz / C_LIGHT  # (nfreq,)
+                    maps.append(
+                        thin_dipole_pattern(
+                            kh[np.newaxis, :], cos_theta[d_idx][:, np.newaxis]
+                        )
+                    )  # (npix, nfreq)
+            B_stack = np.concatenate(maps, axis=0)  # (n_dipoles*n_arm_samples*npix, nfreq)
+        else:
+            # Default: shared basis from dipole-averaged nominal beam.
+            B_stack = np.mean(nominal_beam, axis=0)  # (npix, nfreq)
+
+        _, _, Vt = np.linalg.svd(B_stack, full_matrices=False)
         basis_A = Vt[:K_actual].T  # (nfreq, K_actual)
         coeffs = nominal_beam @ basis_A  # (n_dipoles, npix, K_actual)
         basis = BeamBasis(basis_A, freqs_hz=freqs_hz)
