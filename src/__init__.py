@@ -3,7 +3,7 @@ __version__ = "0.0.1"
 
 from .const import DTYPE_R_NPY, DTYPE_R_JAX
 from .basis import BeamBasis, SkyBasis
-from .beam import Beam
+from .beam import Beam, dipole_beam_maps_jax, dipole_axes_from_angles
 from .terrain import (
     HORIZON_MODELS_NPZ,
     Terrain,
@@ -25,6 +25,17 @@ from .lunar import (
     normalize_vector,
 )
 from .lunar_recovery import LunarRecoveryAdapter
+from .param_recovery import (
+    DipoleBeamVarPro,
+    build_gsm_sky_prior,
+    beam_pix_vecs,
+    pack_dipole_params,
+    unpack_dipole_params,
+    t21_matched_filter,
+    t21_template,
+    t21_filter_spectral,
+    t21_filter_forward,
+)
 from .recovery import (
     AdditiveDegeneracy,
     RecoverySolution,
@@ -41,6 +52,8 @@ __all__ = [
     "BeamBasis",
     "SkyBasis",
     "Beam",
+    "dipole_beam_maps_jax",
+    "dipole_axes_from_angles",
     "HORIZON_MODELS_NPZ",
     "Terrain",
     "NullTerrain",
@@ -56,6 +69,15 @@ __all__ = [
     "LunarCampaign",
     "LunarCampaignResult",
     "LunarRecoveryAdapter",
+    "DipoleBeamVarPro",
+    "build_gsm_sky_prior",
+    "beam_pix_vecs",
+    "pack_dipole_params",
+    "unpack_dipole_params",
+    "t21_matched_filter",
+    "t21_template",
+    "t21_filter_spectral",
+    "t21_filter_forward",
     "angular_momentum_for_spin_period",
     "AdditiveDegeneracy",
     "RecoverySolution",

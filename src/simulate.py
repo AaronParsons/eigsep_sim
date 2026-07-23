@@ -239,7 +239,7 @@ class ForwardModel:
         @jax.jit
         def _sim(
             sky_coeffs,
-            beam_coeffs,
+            beam_recon_all,
             terrain_masks,
             terrain_emissions,
             default_emission_masks,
@@ -274,9 +274,10 @@ class ForwardModel:
             Returns       : (ntimes, n_dipoles, nfreq)
             """
             sky_recon = sky_coeffs @ A_sky.T  # (npix_vis, nfreq)
-            beam_recon_all = (
-                beam_coeffs @ A_beam.T
-            )  # (n_dipoles, npix_beam, nfreq)
+            # beam_recon_all is passed in already reconstructed
+            # (n_dipoles, npix_beam, nfreq).  The coefficient reconstruction
+            # beam_coeffs @ A_beam.T is done by the caller so a parametric beam
+            # map (e.g. dipole_beam_maps_jax) can be substituted unchanged.
 
             def one_time(_, args):
                 (
@@ -1031,8 +1032,8 @@ class ForwardModel:
         )
 
     def simulate(
-        self, sky_coeffs, beam_coeffs, times=None, geom=None, T_gnd=300.0,
-        T_iso=None,
+        self, sky_coeffs, beam_coeffs=None, times=None, geom=None, T_gnd=300.0,
+        T_iso=None, beam_maps=None,
     ):
         """
         Simulate antenna temperature given basis coefficients.
@@ -1042,11 +1043,19 @@ class ForwardModel:
         Parameters
         ----------
         sky_coeffs : ndarray, shape (npix_sky, nmodes_sky)
-        beam_coeffs : ndarray, shape (n_dipoles, npix_beam, nmodes_beam)
+        beam_coeffs : ndarray, shape (n_dipoles, npix_beam, nmodes_beam), optional
+            Beam spectral-basis coefficients; reconstructed to maps via
+            ``beam_coeffs @ basis.A.T``.  Provide this OR ``beam_maps``.
         times : list of Time, optional
             Ignored if geom is provided.
         geom : dict, optional
             Pre-computed geometry from precompute_geometry().
+        beam_maps : ndarray, shape (n_dipoles, npix_beam, nfreq), optional
+            Pre-reconstructed beam power maps, used directly in place of
+            ``beam_coeffs @ basis.A.T``.  Lets a parametric beam (e.g.
+            :func:`eigsep_sim.beam.dipole_beam_maps_jax`, differentiable in
+            dipole length/orientation) drive the forward model.  Takes
+            precedence over ``beam_coeffs`` when both are given.
         T_gnd : float
             Ground temperature [K] for blocked pixels.
         T_iso : ndarray, shape (nfreq,), optional
@@ -1068,7 +1077,15 @@ class ForwardModel:
             geom = self.precompute_geometry(times)
 
         sky_coeffs_jax = jnp.asarray(sky_coeffs, dtype=DTYPE_R_JAX)
-        beam_coeffs_jax = jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
+        if beam_maps is not None:
+            beam_recon_all = jnp.asarray(beam_maps, dtype=DTYPE_R_JAX)
+        elif beam_coeffs is not None:
+            beam_recon_all = (
+                jnp.asarray(beam_coeffs, dtype=DTYPE_R_JAX)
+                @ self._beam_basis_A_jax.T
+            )
+        else:
+            raise ValueError("provide either beam_coeffs or beam_maps")
 
         sky_indices_jax = geom.get("sky_indices_jax")
         if sky_indices_jax is not None:
@@ -1085,7 +1102,7 @@ class ForwardModel:
 
         return self._sim_jit(
             sky_coeffs_jax,
-            beam_coeffs_jax,
+            beam_recon_all,
             geom["terrain_masks_jax"],
             geom["terrain_emissions_jax"],
             geom["default_emission_masks_jax"],
@@ -1123,9 +1140,13 @@ class StackedForwardModel:
                 )
 
     def simulate(
-        self, sky_coeffs, beam_coeffs, times=None, geom=None, **kwargs
+        self, sky_coeffs, beam_coeffs=None, times=None, geom=None, **kwargs
     ):
-        """Simulate all models and concatenate along the time axis."""
+        """Simulate all models and concatenate along the time axis.
+
+        ``beam_maps=`` may be passed via ``kwargs`` in place of ``beam_coeffs``
+        to drive all stacked models with a parametric beam.
+        """
         if geom is None:
             if times is None:
                 raise ValueError("Either times or geom must be provided")

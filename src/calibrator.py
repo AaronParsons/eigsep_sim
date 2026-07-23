@@ -210,6 +210,9 @@ class Calibrator:
         # Cache initial nominal beam coefficients for regularization
         self._beam_nom = None
 
+        # Which strategy produced the last beam_cg_step (for verbose flags)
+        self._last_beam_source = "fast"
+
         # Precomputed geometry (cached from init_params or fit)
         self._geom = None
 
@@ -1032,6 +1035,7 @@ class Calibrator:
         n_cg: int = 50,
         lam: float = 1e-4,
         cg_tol: float = 1e-3,
+        force_autodiff: bool = False,
     ) -> Dict[str, np.ndarray]:
         """
         Beam coefficient update via Newton-CG (mirrors sky_step for the beam).
@@ -1069,11 +1073,30 @@ class Calibrator:
 
         # Fast path: precomputed linear-operator CG (skipped when the
         # harmonic beam penalty is active; that term is not built into the
-        # operator).
+        # operator).  Track the best improving beam across all strategies so a
+        # scheduled escalation to the (expensive) autodiff path can never
+        # regress below the cheap fast-path step.
+        best_beam = None
+        best_loss = loss_before
+        # Records which strategy produced the accepted step so fit() can flag
+        # it in verbose output (like "+aa" for Anderson): "fast" = frozen-denom
+        # step, "cg" = autodiff Newton-CG, "backtrack" = gradient-descent line
+        # search, "none" = no improvement (beam unchanged).
+        best_source = "none"
         beam_fast = self._beam_step_linear(params, n_cg, lam)
         if beam_fast is not None:
             loss_fast = float(loss_beam(beam_fast))
-            if loss_fast < loss_before:
+            if loss_fast < best_loss:
+                best_beam = beam_fast
+                best_loss = loss_fast
+                best_source = "fast"
+            # Normally accept the cheap step as soon as it improves.  On
+            # scheduled iterations (force_autodiff) fall through instead to the
+            # autodiff Newton-CG + gradient-backtracking escape, which is far
+            # more productive per unit time on a plateau — keeping the fast step
+            # as a floor so the escape can only ever help.
+            if loss_fast < loss_before and not force_autodiff:
+                self._last_beam_source = "fast"
                 params_new = params.copy()
                 params_new["beam_coeffs"] = np.asarray(
                     beam_fast, dtype=DTYPE_R_NPY
@@ -1107,25 +1130,37 @@ class Calibrator:
 
         beam_new = (beam_jax.ravel() + delta).reshape(beam_jax.shape)
         loss_new = float(loss_beam(beam_new))
+        if loss_new < best_loss:
+            best_beam = beam_new
+            best_loss = loss_new
+            best_source = "cg"
 
         if loss_new < loss_before:
+            # autodiff Newton-CG made progress; return the best step so far
+            # (fast-path floor or this CG step, whichever is lower).
+            self._last_beam_source = best_source
             params_new = params.copy()
-            params_new["beam_coeffs"] = np.asarray(beam_new, dtype=DTYPE_R_NPY)
+            params_new["beam_coeffs"] = np.asarray(best_beam, dtype=DTYPE_R_NPY)
             return params_new
 
         # CG didn't improve; fall back to gradient descent with adaptive lr.
         current_lr = 0.01 / (float(jnp.max(jnp.abs(grad_val))) + 1e-30)
         for _ in range(30):
-            beam_new = beam_jax - current_lr * grad_val
-            loss_new = float(loss_beam(beam_new))
-            if loss_new <= loss_before:
-                params_new = params.copy()
-                params_new["beam_coeffs"] = np.asarray(
-                    beam_new, dtype=DTYPE_R_NPY
-                )
-                return params_new
+            beam_try = beam_jax - current_lr * grad_val
+            loss_try = float(loss_beam(beam_try))
+            if loss_try <= loss_before:
+                if loss_try < best_loss:
+                    best_beam = beam_try
+                    best_loss = loss_try
+                    best_source = "backtrack"
+                break
             current_lr *= 0.5
 
+        self._last_beam_source = best_source
+        if best_beam is not None:
+            params_new = params.copy()
+            params_new["beam_coeffs"] = np.asarray(best_beam, dtype=DTYPE_R_NPY)
+            return params_new
         return params.copy()
 
     def joint_step(
@@ -1713,6 +1748,7 @@ class Calibrator:
         sky_cg_niter: int = 50,
         beam_cg_niter: int = 50,
         beam_cg_tol: float = 1e-3,
+        beam_escape_every: int = 4,
         lambda_damp: float = 1e-2,
         schedule_max_every: Optional[Dict[str, int]] = None,
         schedule_eff_alpha: float = 0.3,
@@ -1732,6 +1768,18 @@ class Calibrator:
         controls remain accepted: ``use_joint=True`` selects ``joint`` and
         ``use_cg=True`` selects ``cg`` when the default solver is not explicitly
         overridden.
+
+        ``beam_escape_every`` (default 4, ``cg``/``fast-cg`` only) forces the
+        beam step onto its autodiff Newton-CG + gradient-backtracking escape
+        every N iterations instead of accepting the cheap frozen-denom step.
+        That escape is what breaks the alternating-minimisation plateau (it
+        takes a genuine gradient-based step where the fast path stalls) and is
+        highly competitive in dchi2/s once stalled; scheduling it periodically
+        triggers those breakthroughs sooner rather than waiting for the fast
+        path to fail on its own.  It keeps the fast step as a floor, so a forced
+        escape can never regress the beam.  It costs one autodiff CG solve on
+        the scheduled iterations (~3-4x a normal iteration); set to 0 to
+        disable.
 
         A ``KeyboardInterrupt`` (e.g. Ctrl-C in a notebook) is caught and
         ends the fit cleanly at the last completed iteration; the usual
@@ -1920,10 +1968,32 @@ class Calibrator:
                             if solver == "fast-cg"
                             else beam_cg_niter
                         )
-                        params = self.beam_cg_step(
-                            params, n_cg=n_cg, cg_tol=beam_cg_tol
+                        # Every beam_escape_every-th iteration, force the
+                        # autodiff Newton-CG + gradient-backtracking escape
+                        # instead of accepting the cheap frozen-denom step:
+                        # it is the mechanism that breaks the plateau, and is
+                        # highly competitive in dchi2/s once the fast path
+                        # stalls.
+                        force_escape = (
+                            beam_escape_every > 0
+                            and iteration > 0
+                            and iteration % beam_escape_every == 0
                         )
+                        params = self.beam_cg_step(
+                            params,
+                            n_cg=n_cg,
+                            cg_tol=beam_cg_tol,
+                            force_autodiff=force_escape,
+                        )
+                        # Flag the beam sub-step in verbose output: "+escape"
+                        # for a scheduled autodiff iteration, "+bt" when the
+                        # gradient-backtracking line search produced the step
+                        # (parity with "+aa" for Anderson).
                         step_type = solver
+                        if force_escape:
+                            step_type += "+escape"
+                        if self._last_beam_source == "backtrack":
+                            step_type += "+bt"
                     elif solver == "alternating":
                         params = self.beam_step(params)
                         step_type = "gradient"

@@ -17,9 +17,10 @@ Supported analytic dipole models:
 import os
 import healpy
 import numpy as np
+import jax.numpy as jnp
 from scipy.interpolate import interp1d
 
-from .const import c as C_LIGHT, DTYPE_R_NPY
+from .const import c as C_LIGHT, DTYPE_R_NPY, DTYPE_R_JAX
 
 BEAM_NPZ = os.path.join(os.path.dirname(__file__), "data", "eigsep_bowtie_v000.npz")
 
@@ -265,6 +266,79 @@ def thin_dipole_pattern(kh, cos_theta, eps=1e-12):
     sin2 = np.maximum(1.0 - cos_theta ** 2, eps)
     numer = np.cos(kh * cos_theta) - np.cos(kh)
     return np.where(sin2 > eps, numer ** 2 / sin2, 0.0)
+
+
+# ── Differentiable parametric dipole beam (JAX) ─────────────────────────────
+
+def dipole_axes_from_angles(angles):
+    """Unit dipole axes from ``(azimuth, elevation)`` angles in the body frame.
+
+    Parameters
+    ----------
+    angles : array_like, shape (n_dipoles, 2)
+        Per-dipole ``[azimuth, elevation]`` in radians.  Azimuth is measured in
+        the body xy-plane from +x; elevation tilts out of that plane toward +z.
+        ``elevation = 0`` reproduces the planar crossed-dipole geometry used by
+        :meth:`Beam.from_dipole` (axes ``[cos az, sin az, 0]``).
+
+    Returns
+    -------
+    axes : jnp.ndarray, shape (n_dipoles, 3)
+        Unit dipole axes.  Differentiable in ``angles``.
+    """
+    angles = jnp.asarray(angles, dtype=DTYPE_R_JAX)
+    az, el = angles[:, 0], angles[:, 1]
+    ce = jnp.cos(el)
+    return jnp.stack([ce * jnp.cos(az), ce * jnp.sin(az), jnp.sin(el)], axis=1)
+
+
+def dipole_beam_maps_jax(arm_lengths_m, axes, freqs_hz, pix_vecs, eps=1e-12):
+    """Differentiable thin-dipole power-beam maps, parametrised by physics.
+
+    JAX counterpart of the per-dipole pattern built inside
+    :meth:`Beam.from_dipole`: identical convention ``kh = arm_length · π f / c``
+    and ``B = [(cos(kh cosθ) − cos kh) / sinθ]²`` on a fixed body-frame pixel
+    grid, but expressed as a smooth function of the physical parameters so it
+    can be differentiated w.r.t. dipole arm length and orientation for
+    parametric joint recovery.
+
+    Parameters
+    ----------
+    arm_lengths_m : array_like, shape (n_dipoles,)
+        Per-dipole arm length [m] (same convention as :meth:`Beam.from_dipole`:
+        it multiplies ``π f / c`` directly).
+    axes : array_like, shape (n_dipoles, 3)
+        Unit dipole axes in the body frame (see :func:`dipole_axes_from_angles`).
+    freqs_hz : array_like, shape (nfreq,)
+        Frequencies [Hz].
+    pix_vecs : array_like, shape (npix, 3)
+        Body-frame HEALPix pixel unit vectors, i.e.
+        ``np.array(healpy.pix2vec(nside, np.arange(npix))).T``.
+    eps : float
+        sin²(θ) floor; the pattern is set to zero on the dipole axis.
+
+    Returns
+    -------
+    beam_maps : jnp.ndarray, shape (n_dipoles, npix, nfreq)
+        Unnormalised power beam — a drop-in replacement for
+        ``beam_coeffs @ basis.A.T`` in the forward model, which applies the
+        solid-angle normalisation itself.
+    """
+    arm_lengths_m = jnp.asarray(arm_lengths_m, dtype=DTYPE_R_JAX)
+    axes = jnp.asarray(axes, dtype=DTYPE_R_JAX)
+    freqs_hz = jnp.asarray(freqs_hz, dtype=DTYPE_R_JAX)
+    pix_vecs = jnp.asarray(pix_vecs, dtype=DTYPE_R_JAX)
+
+    cos_theta = pix_vecs @ axes.T                     # (npix, D)
+    sin2 = jnp.maximum(1.0 - cos_theta ** 2, eps)     # (npix, D)
+    kh = (jnp.pi / C_LIGHT) * freqs_hz[:, None] * arm_lengths_m[None, :]  # (F, D)
+
+    khc = cos_theta[:, :, None] * kh.T[None, :, :]    # (npix, D, F) = kh·cosθ
+    numer = jnp.cos(khc) - jnp.cos(kh.T)[None, :, :]  # (npix, D, F)
+    pattern = jnp.where(
+        sin2[:, :, None] > eps, numer ** 2 / sin2[:, :, None], 0.0
+    )                                                 # (npix, D, F)
+    return jnp.transpose(pattern, (1, 0, 2))          # (D, npix, F)
 
 
 # ── Dipole reception physics ───────────────────────────────────────────────
