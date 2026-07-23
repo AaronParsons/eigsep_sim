@@ -453,11 +453,11 @@ class Calibrator:
             w_op = w_op + ub[..., None] * (ue + t_gnd * ude)[None, None, :]
             return w_op.transpose(2, 0, 1)  # (F, T, Q)
 
-        from functools import partial
-
-        @partial(jax.jit, static_argnums=(5,))
+        @jax.jit
         def sky_cg_solve(g_op, sky_vis, data_eff, inv_var, lam_abs, n_iter):
             # g_op: (D, F, T, P); data_eff/inv_var passed as (D, F, T).
+            # n_iter is a dynamic integer — lax.while_loop compiles the body
+            # once regardless of iteration count (see beam_cg_solve for rationale).
             n_data = data_eff.size
 
             def fwd_op(v):  # (P, M) -> (D, F, T)
@@ -490,19 +490,45 @@ class Calibrator:
             M_diag = (2.0 / n_data) * jnp.einsum("fm,fp->pm", A_sky ** 2, g_sq_wt)
             M_inv = 1.0 / jnp.maximum(M_diag + lam_abs, 1e-30)
 
-            def precond(r):
-                return r * M_inv
+            # Preconditioned CG via lax.while_loop.
+            b_dot = jnp.dot(b.ravel(), b.ravel())
+            x0 = jnp.zeros_like(b)
+            r0 = b
+            z0 = r0 * M_inv
+            p0 = z0
+            rz0 = jnp.dot(r0.ravel(), z0.ravel())
 
-            delta, _ = jax.scipy.sparse.linalg.cg(
-                hvp, b, M=precond, maxiter=n_iter, tol=1e-3
+            def cg_cond(state):
+                i, _x, r, _z, _p, _rz = state
+                rr = jnp.dot(r.ravel(), r.ravel())
+                return (i < n_iter) & (rr > 1e-6 * b_dot)
+
+            def cg_body(state):
+                i, x, r, z, p, rz = state
+                Ap = hvp(p)
+                pAp = jnp.dot(p.ravel(), Ap.ravel())
+                alpha = jnp.where(pAp > 0, rz / pAp, 0.0)
+                x_new = x + alpha * p
+                r_new = r - alpha * Ap
+                z_new = r_new * M_inv
+                rz_new = jnp.dot(r_new.ravel(), z_new.ravel())
+                beta = jnp.where(rz > 0, rz_new / rz, 0.0)
+                p_new = z_new + beta * p
+                return i + 1, x_new, r_new, z_new, p_new, rz_new
+
+            _, delta, _, _, _, _ = jax.lax.while_loop(
+                cg_cond, cg_body, (0, x0, r0, z0, p0, rz0)
             )
             return delta
 
-        @partial(jax.jit, static_argnums=(6,))
+        @jax.jit
         def beam_cg_solve(
             w_op, beam_coeffs, beam_nom, data, inv_var, lam_abs, n_iter
         ):
             # w_op: (D, F, T, Q); data/inv_var passed as (D, F, T).
+            # n_iter is a dynamic integer — lax.while_loop compiles the body
+            # once regardless of iteration count, avoiding static_argnums and
+            # the XLA graph blow-up that unrolling causes at large n_iter.
             n_data = data.size
             n_beam = beam_coeffs.size
 
@@ -527,8 +553,31 @@ class Calibrator:
                     h = h + (2.0 * self._lam_beam / n_beam) * v
                 return h + lam_abs * v
 
-            delta, _ = jax.scipy.sparse.linalg.cg(
-                hvp, b, maxiter=n_iter, tol=1e-3
+            # CG via lax.while_loop so n_iter is a dynamic runtime value.
+            b_dot = jnp.dot(b.ravel(), b.ravel())
+            x0 = jnp.zeros_like(b)
+            r0 = b  # residual at x=0 is just b
+            p0 = b
+            rr0 = b_dot
+
+            def cg_cond(state):
+                i, _x, _r, _p, rr = state
+                return (i < n_iter) & (rr > 1e-6 * b_dot)
+
+            def cg_body(state):
+                i, x, r, p, rr = state
+                Ap = hvp(p)
+                pAp = jnp.dot(p.ravel(), Ap.ravel())
+                alpha = jnp.where(pAp > 0, rr / pAp, 0.0)
+                x_new = x + alpha * p
+                r_new = r - alpha * Ap
+                rr_new = jnp.dot(r_new.ravel(), r_new.ravel())
+                beta = jnp.where(rr > 0, rr_new / rr, 0.0)
+                p_new = r_new + beta * p
+                return i + 1, x_new, r_new, p_new, rr_new
+
+            _, delta, _, _, _ = jax.lax.while_loop(
+                cg_cond, cg_body, (0, x0, r0, p0, rr0)
             )
             return delta
 
@@ -882,11 +931,28 @@ class Calibrator:
         sky_jax = jnp.asarray(params["sky_coeffs"])
         loss_before = float(loss_sky(sky_jax))
 
-        # Preferred fast path: exact Cholesky of the conditional normal
-        # equations.  The sky curvature is constant but ill-conditioned
-        # (kappa ~ 1e8 from coverage), so this exact solve reaches the
-        # conditional minimum where truncated CG stalls — and is faster.
-        # Falls back to CG for large dense systems (high nside * nmodes).
+        # GSM-compressed exact solve: exact conditional minimum within the GSM
+        # spatial subspace (n_spatial * n_spectral ~ 16 unknowns).  10–100×
+        # faster than the per-pixel CG for nside ≥ 16 and GSM-dominated sky.
+        # Checked FIRST because it uses build_H (memory-safe); _sky_step_direct
+        # materialises the full g_op array via build_sky_normal and is only
+        # used as a fallback when GSM spatial modes are unavailable.
+        sky_gsm = self._sky_step_gsm(params, step_size)
+        if sky_gsm is not None:
+            loss_gsm = float(loss_sky(jnp.asarray(sky_gsm)))
+            params_new = params.copy()
+            params_new["sky_coeffs"] = sky_gsm
+            if loss_gsm < loss_before:
+                return params_new
+            # GSM half-step didn't improve (current per-pixel sky outfits the
+            # subspace); still return the GSM result rather than falling through
+            # to _sky_step_linear, which materialises the 440 MB g_op and risks
+            # OOM.  The GSM subspace is the correct prior; per-pixel overfitting
+            # that beats it will be cleaned up in subsequent joint iterations.
+            return params_new
+
+        # Per-pixel Cholesky fallback: only when GSM modes are unavailable.
+        # Materialises g_op via build_sky_normal — avoid when build_H exists.
         sky_direct = self._sky_step_direct(params, step_size)
         if sky_direct is not None:
             loss_direct = float(loss_sky(sky_direct))
@@ -895,19 +961,8 @@ class Calibrator:
                 params_new["sky_coeffs"] = sky_direct
                 return params_new
 
-        # GSM-compressed exact solve: exact conditional minimum within the GSM
-        # spatial subspace (n_spatial * n_spectral ~ 16 unknowns).  10–100×
-        # faster than the per-pixel CG for nside ≥ 16 and GSM-dominated sky.
-        sky_gsm = self._sky_step_gsm(params, step_size)
-        if sky_gsm is not None:
-            loss_gsm = float(loss_sky(jnp.asarray(sky_gsm)))
-            if loss_gsm < loss_before:
-                params_new = params.copy()
-                params_new["sky_coeffs"] = sky_gsm
-                return params_new
-
-        # Fallback fast path: precomputed linear-operator CG (identical
-        # Newton step, ~50x cheaper per CG iteration than autodiff HVPs).
+        # CG fallback: precomputed linear-operator CG (also materialises g_op).
+        # Only reached when both GSM and Cholesky paths are unavailable.
         sky_fast = self._sky_step_linear(params, n_cg, lam, step_size)
         if sky_fast is not None:
             loss_fast = float(loss_sky(sky_fast))
@@ -2038,6 +2093,7 @@ class Calibrator:
                         print(
                             f"iter {iteration:3d}: loss = {loss:.6e}  "
                             f"rel_D = {rel:.2e}  step = {step_type}  "
+                            f"dt = {wall_time:.3f}s "
                             f"dchi2/s = {entry['delta_chi2_per_sec']:.3e}"
                         )
 
