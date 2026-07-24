@@ -11,6 +11,28 @@ from .terrain import (
     HorizonTerrain,
 )
 from .observer import Observer, EarthSurface, LunarSurface, LunarOrbit
+from .ephemeris import (
+    body_directions_gal,
+    body_angular_radius,
+    body_occulted_by_moon,
+    moon_surface_intersection_mcmf,
+)
+from .sources import (
+    quiet_sun_temperature_K,
+    solar_activity_envelope,
+    sun_temperature_K,
+    inject_solar_bursts,
+    flag_bursts,
+    earth_rfi_temperature_K,
+)
+from .regolith import (
+    subsolar_equilibrium_temperature_K,
+    surface_equilibrium_temperature_K,
+    solar_geometry,
+    em_power_penetration_depth_m,
+    diurnal_thermal_skin_depth_m,
+    regolith_brightness_temperature_K,
+)
 from .sky import Sky
 from .simulate import ForwardModel, StackedForwardModel
 from .calibrator import Calibrator
@@ -62,6 +84,22 @@ __all__ = [
     "EarthSurface",
     "LunarSurface",
     "LunarOrbit",
+    "body_directions_gal",
+    "body_angular_radius",
+    "body_occulted_by_moon",
+    "moon_surface_intersection_mcmf",
+    "quiet_sun_temperature_K",
+    "solar_activity_envelope",
+    "sun_temperature_K",
+    "inject_solar_bursts",
+    "flag_bursts",
+    "earth_rfi_temperature_K",
+    "subsolar_equilibrium_temperature_K",
+    "surface_equilibrium_temperature_K",
+    "solar_geometry",
+    "em_power_penetration_depth_m",
+    "diurnal_thermal_skin_depth_m",
+    "regolith_brightness_temperature_K",
     "Sky",
     "ForwardModel",
     "StackedForwardModel",

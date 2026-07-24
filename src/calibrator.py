@@ -1347,11 +1347,29 @@ class Calibrator:
     def _project_scale_degeneracy(
         self, params: Dict[str, np.ndarray]
     ) -> Dict[str, np.ndarray]:
-        """Project the multiplicative sky/beam scale gauge in-place."""
+        """Project the beam-scale gauge, pinning ``beam_coeffs`` RMS to the
+        nominal beam's RMS.
+
+        The forward model normalises by the beam's own integral
+        (``denom = sampled_weight + unresolved_weight``, a function of
+        ``beam_coeffs`` alone), so rescaling ``beam_coeffs`` by ANY
+        constant leaves ``simulate()``'s prediction exactly unchanged --
+        this is the actual (and only) scale degeneracy. ``sky_coeffs`` is
+        NOT part of it: unlike beam, sky enters only the numerator, so
+        scaling it directly and proportionally changes the prediction,
+        with no beam rescaling able to compensate. Do not counter-scale
+        ``sky_coeffs`` here -- an earlier version of this method did (as if
+        the degeneracy were a joint ``sky*beam``-product-preserving one,
+        which it is not under this normalisation), which actively
+        corrupted the sky solution every time this projection ran during a
+        fit. Verified empirically: ``simulate(sky, k*beam) == simulate(sky,
+        beam)`` for any ``k``, while ``simulate(sky/k, beam)`` differs from
+        ``simulate(sky, beam)`` by exactly ``1/k`` -- see
+        ``tests/test_calibrator.py::test_calibrator_scale_projection_preserves_sky_beam_product``.
+        """
         if self._beam_nom is None:
             return params
         beam = np.asarray(params["beam_coeffs"], dtype=DTYPE_R_NPY)
-        sky = np.asarray(params["sky_coeffs"], dtype=DTYPE_R_NPY)
         nom = np.asarray(self._beam_nom, dtype=DTYPE_R_NPY)
         nom_rms = float(np.sqrt(np.mean(nom**2)))
         beam_rms = float(np.sqrt(np.mean(beam**2)))
@@ -1359,7 +1377,6 @@ class Calibrator:
             return params
         scale = beam_rms / nom_rms
         out = params.copy()
-        out["sky_coeffs"] = np.asarray(sky * scale, dtype=DTYPE_R_NPY)
         out["beam_coeffs"] = np.asarray(beam / scale, dtype=DTYPE_R_NPY)
         return out
 

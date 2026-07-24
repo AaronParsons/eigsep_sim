@@ -268,7 +268,22 @@ def test_forward_model_simulate_no_times_no_geom_error():
 
 
 def test_forward_model_sky_beam_scale_degeneracy():
-    """Opposite sky and beam scales preserve the unnormalized prediction."""
+    """Beam-only rescaling is the true (exact) scale degeneracy.
+
+    simulate() normalises by the beam's own integral (denom = beam-integral
+    over the sky, a function of beam_coeffs alone -- documented in
+    _build_sim_fn: "Normalise by total beam integral -> output in Kelvin").
+    Because that denominator depends only on beam, not sky, rescaling
+    beam_coeffs by ANY constant cancels between numerator and denominator
+    and leaves the prediction EXACTLY unchanged -- verified here to
+    rtol=1e-6, and empirically re-confirmed for arbitrary scale factors.
+    sky_coeffs is NOT part of this degeneracy: sky only enters the
+    numerator, so scaling it directly and proportionally scales the
+    prediction, with no beam rescaling able to compensate (previously
+    this test -- and Calibrator._project_scale_degeneracy, now fixed --
+    assumed a joint sky*beam-product-preserving degeneracy, which does not
+    hold under this normalisation; see that method's docstring).
+    """
     nside = 4
     freqs_hz = np.array([50e6, 100e6])
     beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
@@ -293,11 +308,12 @@ def test_forward_model_sky_beam_scale_degeneracy():
         fwd.simulate(2.0 * sky_coeffs, 0.5 * beam.coeffs, geom=geom)
     )
 
-    np.testing.assert_allclose(
-        beam_scaled, 2.0 * nominal, rtol=1e-6, atol=1e-6
-    )
+    np.testing.assert_allclose(beam_scaled, nominal, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(sky_scaled, 2.0 * nominal, rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(coupled_scaled, nominal, rtol=1e-6, atol=1e-6)
+    # beam's 0.5x has zero effect (degenerate), so only sky's 2x shows up.
+    np.testing.assert_allclose(
+        coupled_scaled, 2.0 * nominal, rtol=1e-6, atol=1e-6
+    )
 
 
 def test_forward_model_different_nside_beam_sky():
@@ -574,8 +590,13 @@ def test_transmitter_linearity(simple_fwd, simple_coeffs):
 def test_transmitter_physics_formula(simple_fwd):
     """Transmitter contribution matches closed-form formula.
 
-    For a transmitter at direction d (body frame) with power T_eff:
-        T_ant_tx(f) = T_eff * B(d, f)
+    For a transmitter at direction d (body frame) with power T_eff,
+    normalised by the same total beam integral simulate() itself divides
+    by (denom = sum over ALL sky pixels of the beam's interpolated value
+    there -- documented in _build_sim_fn as "Normalise by total beam
+    integral -> output in Kelvin"; previously this test's formula omitted
+    that division entirely, off by ~2 orders of magnitude):
+        T_ant_tx(f) = T_eff * B(d, f) / denom(f)
     """
     fwd = simple_fwd
     freqs_hz = fwd.beam.freqs_hz
@@ -618,7 +639,18 @@ def test_transmitter_physics_formula(simple_fwd):
     B_at_zenith = np.sum(
         beam_recon[px_z[:, 0]] * wgts_z[:, 0, None], axis=0
     )  # (nfreq,)
-    expected = T_eff * B_at_zenith  # (nfreq,)
+
+    # denom(f) = sum over all sky pixels of the beam interpolated there
+    # (dipole 0, since delta is indexed [0, 0, :] -> dipole 0).
+    crds_top = R @ fwd._crds_gal  # body == topo here (body_rots=None)
+    th_sky, ph_sky = healpy.vec2ang(crds_top.T)
+    px_sky, wgts_sky = healpy.get_interp_weights(fwd.beam.nside, th_sky, ph_sky)
+    beam_at_sky = np.sum(
+        beam_recon[px_sky] * wgts_sky[:, :, None], axis=0
+    )  # (npix_sky, nfreq)
+    denom = beam_at_sky.sum(axis=0)  # (nfreq,)
+
+    expected = T_eff * B_at_zenith / denom  # (nfreq,)
 
     np.testing.assert_allclose(delta, expected, rtol=1e-4)
 
@@ -679,16 +711,29 @@ def test_transmitter_body_rots_coupling(simple_fwd):
         fwd_tx.simulate(sky_c, beam_c, geom=geom_no_rot, T_gnd=0.0)
     )
 
-    # 90-degree body rotation around z: topocentric [0,0,1] maps to body [0,0,1]
-    # (z-rotation leaves the z-axis fixed, so TX coupling must be identical)
+    # 90-degree body rotation around z: topocentric [0,0,1] maps to body
+    # [0,0,1] (z-rotation leaves the z-axis fixed), so the TX's own
+    # direction is unchanged. But simulate() normalises by the total beam
+    # integral over the WHOLE sky (not just the TX direction), and that
+    # integral is taken in the BODY frame too -- so a 90-degree z-rotation
+    # also rotates the sky's orientation relative to each dipole's (not
+    # azimuthally symmetric) pattern. simple_fwd's two dipoles are exactly
+    # 90 degrees apart (u_body=[[1,0,0],[0,1,0]]), so this rotation is
+    # physically equivalent to swapping which dipole is which -- verified
+    # exactly bit-for-bit, not merely close. (An earlier version of this
+    # test asserted T_no_rot == T_rz directly, which only accounted for
+    # the TX-direction invariance and missed the whole-sky normalisation
+    # coupling; that assertion doesn't hold as a matter of physics, not
+    # because of a code bug.)
     R90z = _Beam.rot_z(np.pi / 2).astype(np.float32)
     geom_rz = fwd_tx.precompute_geometry(rots=[R], body_rots=[R90z])
     T_rz = np.array(fwd_tx.simulate(sky_c, beam_c, geom=geom_rz, T_gnd=0.0))
     np.testing.assert_allclose(
-        T_no_rot,
+        T_no_rot[:, ::-1, :],
         T_rz,
         atol=1e-4,
-        err_msg="z-rotation should not change coupling to zenith TX",
+        err_msg="90-degree z-rotation should exactly swap the two dipoles' "
+        "TX coupling (they are 90 degrees apart in u_body)",
     )
 
     # 90-degree body rotation around x: topocentric [0,0,1] maps to body [0,1,0]
@@ -897,7 +942,14 @@ def test_surface_terrain_controls_ground_cut():
     assert np.all(np.array(geom["terrain_masks_jax"]) == 0.0)
 
     T = np.array(fwd.simulate(sky_c, beam_c, geom=geom, T_gnd=300.0))
-    np.testing.assert_allclose(T, 275.0 * npix, atol=1e-5)
+    # simulate() returns a beam-weighted AVERAGE brightness temperature
+    # (normalised by the total beam integral, documented in _build_sim_fn:
+    # "Normalise by total beam integral -> output in Kelvin"), not a raw
+    # sum over pixels -- a uniformly-275K sky under any beam integrates to
+    # exactly 275K, independent of npix (as it must be: a physically
+    # meaningful antenna temperature can't depend on an arbitrary HEALPix
+    # resolution choice).
+    np.testing.assert_allclose(T, 275.0, atol=1e-5)
 
 
 def test_sky_mask_preserves_uniform_terrain_emission():
@@ -944,7 +996,10 @@ def test_sky_mask_preserves_uniform_terrain_emission():
     T_full = np.array(fwd.simulate(sky_c, beam_c, geom=geom_full, T_gnd=300.0))
     T_mask = np.array(fwd.simulate(sky_c, beam_c, geom=geom_mask, T_gnd=300.0))
 
-    np.testing.assert_allclose(T_full, 250.0 * npix, atol=1e-5)
+    # simulate() returns a beam-weighted AVERAGE (normalised by the total
+    # beam integral), not a raw sum over pixels -- see the identical note
+    # in test_surface_terrain_controls_ground_cut.
+    np.testing.assert_allclose(T_full, 250.0, atol=1e-5)
     np.testing.assert_allclose(T_mask, T_full, atol=1e-5)
 
 

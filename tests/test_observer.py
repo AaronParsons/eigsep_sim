@@ -13,12 +13,12 @@ import numpy as np
 import pytest
 import healpy
 from astropy.time import Time
-from astropy.coordinates import EarthLocation
+from astropy.coordinates import EarthLocation, get_body_barycentric
 import astropy.units as u
 
 from eigsep_sim.observer import (
     Observer, EarthSurface, LunarSurface, LunarOrbit,
-    circular_orbital_period, ICRS2GAL
+    circular_orbital_period, ICRS2GAL, _moon_icrs2mcmf
 )
 from eigsep_sim.const import R_MOON, GM_MOON
 
@@ -172,6 +172,62 @@ def test_lunar_surface_horizon():
     assert mask.dtype == bool
     # Roughly hemisphere should be visible from lunar surface
     assert 0.4 < np.sum(mask) / npix < 0.6
+
+
+def test_moon_icrs2mcmf_earth_libration_bounded():
+    """
+    _moon_icrs2mcmf: Earth's direction, expressed in the MCMF frame, must
+    stay near a fixed point (real optical libration is ~8 deg in longitude,
+    ~7 deg in latitude), not sweep across the sky.  This is a regression
+    test for a rotation-convention bug that previously caused the computed
+    sub-Earth point to sweep ~166 deg in longitude over a single month.
+    """
+    times = Time("2030-01-01") + np.linspace(0, 30, 15) * u.day
+    moon_pos = get_body_barycentric("moon", times)
+    earth_pos = get_body_barycentric("earth", times) - moon_pos
+    xyz = earth_pos.xyz.to(u.m).value
+    d_icrs = xyz / np.linalg.norm(xyz, axis=0)  # (3, ntimes)
+
+    d_mcmf = np.empty_like(d_icrs)
+    for i, t in enumerate(times):
+        R = _moon_icrs2mcmf(t)
+        d_mcmf[:, i] = R @ d_icrs[:, i]
+
+    # Great-circle angle of each sample from the first sample.
+    ref = d_mcmf[:, 0]
+    cos_ang = np.clip(ref @ d_mcmf, -1.0, 1.0)
+    ang = np.rad2deg(np.arccos(cos_ang))
+
+    # Generous margin over the true ~10 deg combined libration amplitude.
+    assert np.all(ang < 15.0)
+
+    # Also sanity-check selenographic lon/lat stay near a fixed point.
+    lon = np.rad2deg(np.arctan2(d_mcmf[1], d_mcmf[0]))
+    lat = np.rad2deg(np.arcsin(np.clip(d_mcmf[2], -1, 1)))
+    assert lon.max() - lon.min() < 20.0
+    assert lat.max() - lat.min() < 20.0
+
+
+def test_moon_icrs2mcmf_pole_stable():
+    """
+    _moon_icrs2mcmf: the Moon's pole direction (expressed back in ICRS)
+    should be very stable over a month -- real precession of the lunar
+    pole has an 18.6-year period, so month-to-month motion is tiny.  This
+    guards against a "fix" that merely freezes the prime-meridian angle W
+    to a wrong-but-constant value rather than correctly tracking Earth.
+    """
+    times = Time("2030-01-01") + np.linspace(0, 30, 6) * u.day
+    poles = np.array(
+        [_moon_icrs2mcmf(t).T @ np.array([0.0, 0.0, 1.0]) for t in times]
+    )
+    ref = poles[0]
+    cos_ang = np.clip(poles @ ref, -1.0, 1.0)
+    ang = np.rad2deg(np.arccos(cos_ang))
+
+    # Real precessional wobble over a month is ~0.05 deg; use a tolerance
+    # comfortably above that but far tighter than the ~10-15 deg libration
+    # bound above.
+    assert np.all(ang < 0.2)
 
 
 def test_circular_orbital_period():

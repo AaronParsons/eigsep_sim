@@ -187,8 +187,8 @@ def _moon_icrs2mcmf(t):
     # Fundamental arguments (IAU WGCCRE 2015, Table 2)
     E1  = np.deg2rad(125.045 -  0.0529921 * d)
     E2  = np.deg2rad(250.089 -  0.1059842 * d)
-    E3  = np.deg2rad(260.008 + 13.012009  * d)
-    E4  = np.deg2rad(176.625 + 13.340716  * d)
+    E3  = np.deg2rad(260.008 + 13.0120009 * d)
+    E4  = np.deg2rad(176.625 + 13.3407154 * d)
     E5  = np.deg2rad(357.529 +  0.9856003 * d)
     E6  = np.deg2rad(311.589 + 26.4057084 * d)
     E7  = np.deg2rad(134.963 + 13.0649930 * d)
@@ -215,7 +215,7 @@ def _moon_icrs2mcmf(t):
     )
     W = np.deg2rad(
         38.3213 + 13.17635815 * d - 1.4e-12 * d ** 2
-        - 3.5610 * np.sin(E1)  - 0.1208 * np.sin(E2)
+        + 3.5610 * np.sin(E1)  + 0.1208 * np.sin(E2)
         - 0.0642 * np.sin(E3)  + 0.0158 * np.sin(E4)
         + 0.0252 * np.sin(E5)  - 0.0066 * np.sin(E6)
         - 0.0047 * np.sin(E7)  - 0.0046 * np.sin(E8)
@@ -224,8 +224,17 @@ def _moon_icrs2mcmf(t):
         - 0.0044 * np.sin(E13)
     )
 
-    # ICRS → MCMF:  Rz(W) @ Rx(90° − δ₀) @ Rz(90° + α₀)
-    return _rotmat_z(W) @ _rotmat_x(np.pi / 2 - delta0) @ _rotmat_z(np.pi / 2 + alpha0)
+    # ICRS → MCMF:  Rz(W) @ Rx(90° − δ₀) @ Rz(90° + α₀), using the *passive*
+    # (frame-rotation) convention for R_z/R_x as defined by the IAU WGCCRE
+    # Euler-angle formula.  `_rotmat_x`/`_rotmat_z` implement the *active*
+    # (vector-rotation) convention (v' = R(a) v rotates v by +a), which is
+    # the transpose/inverse of the passive convention, so the passive R_i(a)
+    # required here equals `_rotmat_i(-a)`.  Angles are negated accordingly.
+    return (
+        _rotmat_z(-W)
+        @ _rotmat_x(-(np.pi / 2 - delta0))
+        @ _rotmat_z(-(np.pi / 2 + alpha0))
+    )
 
 
 class LunarSurface(Observer):

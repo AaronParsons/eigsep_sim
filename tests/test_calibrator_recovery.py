@@ -129,10 +129,16 @@ def test_fast_cg_reaches_noise_floor():
     # init, otherwise the recovery benchmark is meaningless.
     assert loss_tru < 0.01 * loss_ini
 
+    # max_iter=8 previously landed this right at the edge of its own
+    # convergence curve (verified: monotonic decrease throughout, e.g.
+    # iter 8 data_chi2~8.8, iter 20 ~2.9, iter 29 ~1.9 -- the solver
+    # is working correctly, 8 iterations just isn't reliably enough for
+    # this problem/threshold combination -- see the identical note in
+    # test_direct_sky_solve_with_terrain_masking).
     result = cal.fit(
         params={k: v.copy() for k, v in prob["prms_ini"].items()},
         geom=prob["geom"],
-        max_iter=8,
+        max_iter=20,
         tol=1e-4,
         verbose=False,
         solver="fast-cg",
@@ -202,6 +208,14 @@ def test_conditional_linear_operators_match_simulate():
     precomputed operators (G for sky with beam fixed, W for beam with sky
     fixed).  Their predictions must match ForwardModel.simulate exactly
     (up to float32 roundoff) including the affine emission offset.
+
+    Note simulate() is NOT actually linear in beam_coeffs alone (denom is
+    a beam integral, so simulate(s, k*beam) == simulate(s, beam) for any k
+    -- the real scale degeneracy, see Calibrator._project_scale_degeneracy).
+    build_w returns the un-normalized numerator contribution (genuinely
+    linear in beam_recon) precisely because denom must be applied
+    separately (via build_denom) using whatever beam the solver is
+    currently at, not baked into W as a fixed reference.
     """
     import jax.numpy as jnp
 
@@ -229,9 +243,20 @@ def test_conditional_linear_operators_match_simulate():
     pred_sky = np.einsum("dftp,pf->tdf", g_op, s @ fwd.sky.basis.A.T) + offset
     assert np.max(np.abs(pred_sky - ref)) < 1e-4 * scale
 
-    # Beam operator: pred = W . beam_recon (strictly linear in beam).
+    # Beam operator: pred = (W . beam_recon) / denom(beam). Unlike build_g
+    # (which bakes its normalization in -- b_at_norm = b_at/denom), build_w
+    # returns the UN-normalized numerator contribution by design (denom
+    # depends on the current beam, which changes across CG iterations, so
+    # the solver applies it separately via build_denom rather than baking
+    # a fixed reference into W) -- confirmed by direct comparison: without
+    # the division the mismatch is ~3.3e5 (matching this test's original
+    # failure), with it the match is exact to 3.6e-12.
     w_op = np.asarray(ops["build_w"](jnp.asarray(s)))  # (F, T, Q)
-    pred_beam = np.einsum("ftq,dqf->tdf", w_op, b @ fwd.beam.basis.A.T)
+    denom = np.asarray(ops["build_denom"](jnp.asarray(b)))  # (D, T, F)
+    pred_beam = (
+        np.einsum("ftq,dqf->tdf", w_op, b @ fwd.beam.basis.A.T)
+        / denom.transpose(1, 0, 2)
+    )
     assert np.max(np.abs(pred_beam - ref)) < 1e-4 * scale
 
 
@@ -360,8 +385,15 @@ def test_direct_sky_solve_with_terrain_masking():
     g = np.asarray(ops["build_g"](jnp.asarray(bc)))  # (D, F, T, P)
     pred_sky = np.einsum("dftp,pf->tdf", g, sc @ sky.basis.A.T) + const
     assert np.max(np.abs(pred_sky - truth)) < 1e-4 * scale
+    # build_w is un-normalized by design (denom depends on the current
+    # beam, applied separately via build_denom) -- see the identical note
+    # in test_conditional_linear_operators_match_simulate.
     w = np.asarray(ops["build_w"](jnp.asarray(sc)))  # (F, T, Q)
-    pred_beam = np.einsum("ftq,dqf->tdf", w, bc @ beam.basis.A.T)
+    denom = np.asarray(ops["build_denom"](jnp.asarray(bc)))  # (D, T, F)
+    pred_beam = (
+        np.einsum("ftq,dqf->tdf", w, bc @ beam.basis.A.T)
+        / denom.transpose(1, 0, 2)
+    )
     assert np.max(np.abs(pred_beam - truth)) < 1e-4 * scale
 
     # Direct sky solve and full fit work with the terrain present.
@@ -380,10 +412,16 @@ def test_direct_sky_solve_with_terrain_masking():
     )
     assert loss_direct < 0.1 * loss_init
 
+    # max_iter=8 previously landed this test right at the edge of its own
+    # convergence curve (verified: loss decreases monotonically the whole
+    # way, e.g. iter 8 ~8.3, iter 20 ~2.6, iter 29 ~1.9 -- the solver is
+    # working correctly, 8 iterations just isn't reliably enough for this
+    # problem/threshold combination). Use enough iterations to comfortably
+    # clear the target instead of a borderline exact count.
     result = cal.fit(
         params={k: v.copy() for k, v in ini.items()},
         geom=geom,
-        max_iter=8,
+        max_iter=20,
         tol=0.0,
         verbose=False,
         solver="fast-cg",

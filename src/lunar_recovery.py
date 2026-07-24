@@ -29,7 +29,21 @@ class LunarRecoveryAdapter:
         )
 
     def build_design_matrix(self, freq_index, include_receiver_offsets=False):
-        """Build sky, lunar-disk, and optional receiver-offset columns."""
+        """Build sky, lunar-disk, and optional receiver-offset columns.
+
+        Rows are normalised by each observation's total beam integral
+        (``denom = sum_p(weights) + unresolved_surface_weight``, the same
+        quantity ``ForwardModel.simulate()`` divides by -- see its
+        "Normalise by total beam integral -> output in Kelvin" kernel
+        comment), so ``design_matrix @ [sky_map, T_regolith]`` reproduces
+        physical antenna temperature directly, matching ``simulate()``
+        exactly (verified in ``verify_noiseless``). Without this, the raw
+        ``build_surface_design_matrix`` output is only proportional to the
+        true prediction (by a per-row, per-dipole factor -- the beam
+        integral differs between dipoles/times), which silently biases any
+        recovery done against real (correctly-normalised) data, not just
+        this adapter's own noiseless self-check.
+        """
         blocks = []
         for spacecraft_index in range(len(self.campaign.observers)):
             weights = self.beam_weights(spacecraft_index, freq_index)
@@ -44,14 +58,15 @@ class LunarRecoveryAdapter:
             unresolved_surface_weight = unresolved_weights @ (
                 beam_maps[:, :, freq_index].T
             )
-            blocks.append(
-                build_surface_design_matrix(
-                    weights,
-                    masks,
-                    unresolved_surface_weight=unresolved_surface_weight,
-                    include_receiver_offsets=include_receiver_offsets,
-                )
+            block = build_surface_design_matrix(
+                weights,
+                masks,
+                unresolved_surface_weight=unresolved_surface_weight,
+                include_receiver_offsets=include_receiver_offsets,
             )
+            denom = weights.sum(axis=2) + unresolved_surface_weight  # (T, D)
+            block = block / denom.reshape(-1, 1)
+            blocks.append(block)
         return np.vstack(blocks)
 
     def predict(self, sky_map_K, T_regolith_K, freq_index):

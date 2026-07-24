@@ -252,6 +252,9 @@ class ForwardModel:
             T_iso,
             tx_px_all,
             tx_wgts_all,
+            ext_px_all,
+            ext_wgts_all,
+            ext_T_all,
         ):
             """
             sky_coeffs    : (npix_vis, nmodes_sky)
@@ -269,8 +272,18 @@ class ForwardModel:
                             Bypasses the sky basis so its spectral shape is preserved
                             exactly.  Contributes T_iso * f_vis to the antenna temperature
                             where f_vis = sum_p(B_p*mask_p)/sum_p(B_p).
-            tx_px_all     : (ntimes, 4, n_sources)    int32    cached TX pixels
+            tx_px_all     : (ntimes, 4, n_sources)    int32    cached TX pixels (fixed
+                            topocentric direction, e.g. ground RFI transmitters)
             tx_wgts_all   : (ntimes, 4, n_sources)    float32  cached TX weights
+            ext_px_all    : (ntimes, 4, n_ext)        int32    cached external-source
+                            pixels (time-varying galactic direction, e.g. Sun/Earth
+                            ephemeris via ephemeris.body_directions_gal)
+            ext_wgts_all  : (ntimes, 4, n_ext)        float32  cached external-source weights
+            ext_T_all     : (ntimes, n_ext, nfreq)    float32  external-source brightness
+                            temperature [K], already occultation-gated by the caller
+                            (zero where blocked) -- unlike tx_T (compile-time constant),
+                            this varies per timestep so solar/RFI variability flows
+                            straight through.
             Returns       : (ntimes, n_dipoles, nfreq)
             """
             sky_recon = sky_coeffs @ A_sky.T  # (npix_vis, nfreq)
@@ -289,6 +302,9 @@ class ForwardModel:
                     wgts,
                     tx_px,
                     tx_wgts,
+                    ext_px,
+                    ext_wgts,
+                    ext_T,
                 ) = args
                 mask = terrain_mask  # (npix_vis,)
 
@@ -339,6 +355,19 @@ class ForwardModel:
                     num = num + jnp.sum(
                         beam_at_tx * tx_T_jax, axis=0
                     )  # (nfreq,)
+
+                    # External sources: same beam-weighted point-evaluation as
+                    # TX, but direction and brightness vary per timestep (real
+                    # ephemeris + occultation gating, done by the caller).
+                    beam_at_ext = jax.lax.fori_loop(
+                        0,
+                        4,
+                        lambda k, acc: acc
+                        + beam_recon_d[ext_px[k]] * ext_wgts[k, :, None],
+                        jnp.zeros_like(ext_T),
+                    )  # (n_ext, nfreq)
+                    num = num + jnp.sum(beam_at_ext * ext_T, axis=0)  # (nfreq,)
+
                     # Normalise by total beam integral → output in Kelvin.
                     # unresolved_weight covers sky_mask-omitted pixels; zero
                     # in the full-sky case.
@@ -359,6 +388,9 @@ class ForwardModel:
                     beam_wgts_all,
                     tx_px_all,
                     tx_wgts_all,
+                    ext_px_all,
+                    ext_wgts_all,
+                    ext_T_all,
                 ),
             )
             return antenna_temp  # (ntimes, n_dipoles, nfreq)
@@ -600,7 +632,8 @@ class ForwardModel:
         }
 
     def precompute_geometry(
-        self, times=None, rots=None, body_rots=None, sky_mask=None
+        self, times=None, rots=None, body_rots=None, sky_mask=None,
+        ext_source_dirs_gal=None, regolith_kwargs=None,
     ):
         """
         Precompute rotation matrices and terrain masks for a list of observation
@@ -628,6 +661,32 @@ class ForwardModel:
             coordinate and kernel sizes proportionally.  ``simulate()``
             automatically gathers the corresponding sky coefficients via the
             ``sky_indices_jax`` entry stored in the returned geom dict.
+        ext_source_dirs_gal : ndarray, shape (ntimes, n_ext, 3), optional
+            Per-timestep galactic-frame unit vectors for time-varying
+            external sources (e.g. Sun/Earth from
+            :func:`eigsep_sim.ephemeris.body_directions_gal`).  Rotated
+            through the same galactic->topocentric->body chain as the sky
+            (unlike the fixed-topocentric ``transmitters=`` passed at
+            construction).  Only the interpolation pixels/weights are cached
+            here; brightness (which may vary faster than geometry, e.g.
+            solar bursts) is supplied per-call to ``simulate()`` via
+            ``ext_source_temps``.
+        regolith_kwargs : dict, optional
+            When provided, replaces the scalar ``occultation_temperature_K``
+            broadcast for Moon-blocked sky pixels with a real per-pixel,
+            per-timestep regolith brightness from
+            :func:`eigsep_sim.regolith.regolith_brightness_temperature_K`,
+            evaluated at each blocked pixel's actual sub-observer surface
+            point (via :func:`eigsep_sim.ephemeris.moon_surface_intersection_mcmf`
+            + real Sun ephemeris). Keys are forwarded to
+            ``regolith_brightness_temperature_K`` (e.g. ``bond_albedo``,
+            ``T_deep_K``, ``loss_tangent``, ...). Requires ``times=`` (not
+            ``rots=``, which has no real epoch to query the Sun's position
+            at) with a ``LunarOrbit``-like occulting observer, and is
+            incompatible with ``sky_mask`` (per-pixel regolith brightness
+            can't be represented by the single spectrum omitted pixels
+            would need). ``None`` (default) preserves the existing scalar-
+            occultation-temperature behavior exactly.
 
         Returns
         -------
@@ -647,6 +706,8 @@ class ForwardModel:
             - 'beam_wgts_jax': (ntimes, 4, npix_vis) float32 — cached beam interpolation weights
             - 'tx_px_jax': (ntimes, 4, n_sources) int32 — cached TX interpolation pixels
             - 'tx_wgts_jax': (ntimes, 4, n_sources) float32 — cached TX interpolation weights
+            - 'ext_px_jax': (ntimes, 4, n_ext) int32 — cached external-source pixels
+            - 'ext_wgts_jax': (ntimes, 4, n_ext) float32 — cached external-source weights
             - 'sky_indices_jax': (npix_vis,) int32 — only present when sky_mask given
             Times path also retains: 'rot_gal2top', 'crds_top', 'masks' (numpy arrays)
         """
@@ -773,6 +834,58 @@ class ForwardModel:
                 [],
             )
 
+            regolith_maps_all = None
+            if regolith_kwargs is not None:
+                if observer_occultation_emission is None:
+                    raise ValueError(
+                        "regolith_kwargs requires an occulting observer "
+                        "with occultation emission (e.g. "
+                        "LunarOrbit(occultation_temperature_K=...))"
+                    )
+                if sky_mask is not None:
+                    raise ValueError(
+                        "regolith_kwargs is not supported together with "
+                        "sky_mask (per-pixel regolith brightness can't be "
+                        "represented by the single unresolved_emission "
+                        "spectrum omitted pixels need); use full geometry "
+                        "(no sky_mask) instead"
+                    )
+                from .ephemeris import (
+                    moon_surface_intersection_mcmf,
+                    body_directions_gal,
+                )
+                from .observer import (
+                    ICRS2GAL as _ICRS2GAL,
+                    _moon_icrs2mcmf as _moon_icrs2mcmf_fn,
+                )
+                from .regolith import (
+                    solar_geometry as _solar_geometry,
+                    regolith_brightness_temperature_K as _regolith_Tb,
+                )
+
+                normals_mcmf = moon_surface_intersection_mcmf(
+                    self.observer, times, crds_gal.T
+                )  # (ntimes, npix_vis, 3); NaN where not occulted
+                sun_dirs_gal, _ = body_directions_gal(times, bodies=("sun",))
+                gal2icrs = _ICRS2GAL.T
+                sun_dirs_mcmf = np.stack(
+                    [
+                        _moon_icrs2mcmf_fn(t) @ (gal2icrs @ sun_dirs_gal["sun"][i])
+                        for i, t in enumerate(times)
+                    ]
+                )  # (ntimes, 3)
+                cos_zenith, phase = _solar_geometry(
+                    normals_mcmf, sun_dirs_mcmf[:, None, :]
+                )  # (ntimes, npix_vis)
+                # NaN (not-occulted) pixels get multiplied by (1-obs_mask)=0
+                # below, but 0*NaN=NaN in IEEE float, so sanitize first.
+                regolith_maps_all = np.nan_to_num(
+                    _regolith_Tb(
+                        cos_zenith, phase, self.beam.freqs_hz, **regolith_kwargs
+                    ),
+                    nan=0.0,
+                ).astype(np.float32)  # (ntimes, npix_vis, nfreq)
+
             # Batch-compute rotation matrices when the observer supports it.
             # EarthSurface uses a vectorised astropy call (61× faster than looping).
             if hasattr(self.observer, "rot_gal2top_stack"):
@@ -840,7 +953,16 @@ class ForwardModel:
                     default_emission_masks_list.append(default_mask)
                 else:
                     masks_list.append(obs_mask)
-                    if observer_occultation_emission is not None:
+                    if regolith_maps_all is not None:
+                        emissions_list.append(
+                            (
+                                (1.0 - obs_mask)[:, None] * regolith_maps_all[i]
+                            ).astype(np.float32)
+                        )
+                        default_emission_masks_list.append(
+                            np.zeros(npix_vis, dtype=np.float32)
+                        )
+                    elif observer_occultation_emission is not None:
                         emissions_list.append(
                             (
                                 (1.0 - obs_mask)[:, None]
@@ -942,6 +1064,27 @@ class ForwardModel:
             tx_px = np.empty((4, ntimes, 0), dtype=np.int32)
             tx_wgts = np.empty((4, ntimes, 0), dtype=np.float32)
 
+        # External (time-varying, galactic-frame) sources: same gal->top->body
+        # rotation chain as the sky, but the direction itself changes every
+        # timestep (real ephemeris) instead of being a fixed set of pixels
+        # re-rotated by attitude only, so it can't reuse the sky's crds_body.
+        if ext_source_dirs_gal is not None:
+            ext_dirs = np.asarray(ext_source_dirs_gal, dtype=np.float32)
+            n_ext = ext_dirs.shape[1]
+            ext_top = np.einsum("tij,tsj->tsi", R_arr, ext_dirs)
+            ext_body = np.einsum("tij,tsj->tsi", body_rots_arr, ext_top)
+            ext_th = np.arccos(np.clip(ext_body[:, :, 2], -1.0, 1.0))
+            ext_ph = np.mod(
+                np.arctan2(ext_body[:, :, 1], ext_body[:, :, 0]), 2.0 * np.pi
+            )
+            ext_px, ext_wgts = healpy.get_interp_weights(
+                self.beam.nside, ext_th, ext_ph
+            )
+        else:
+            n_ext = 0
+            ext_px = np.empty((4, ntimes, 0), dtype=np.int32)
+            ext_wgts = np.empty((4, ntimes, 0), dtype=np.float32)
+
         geom["rots_jax"] = jnp.asarray(R_arr, dtype=DTYPE_R_JAX)
         geom["body_rots_jax"] = jnp.asarray(body_rots_arr, dtype=DTYPE_R_JAX)
         geom["beam_px_jax"] = jnp.asarray(
@@ -955,6 +1098,12 @@ class ForwardModel:
         )
         geom["tx_wgts_jax"] = jnp.asarray(
             tx_wgts.transpose(1, 0, 2), dtype=DTYPE_R_JAX
+        )
+        geom["ext_px_jax"] = jnp.asarray(
+            ext_px.transpose(1, 0, 2), dtype=jnp.int32
+        )
+        geom["ext_wgts_jax"] = jnp.asarray(
+            ext_wgts.transpose(1, 0, 2), dtype=DTYPE_R_JAX
         )
         geom["terrain_masks_jax"] = jnp.asarray(
             terrain_masks, dtype=DTYPE_R_JAX
@@ -1033,7 +1182,7 @@ class ForwardModel:
 
     def simulate(
         self, sky_coeffs, beam_coeffs=None, times=None, geom=None, T_gnd=300.0,
-        T_iso=None, beam_maps=None,
+        T_iso=None, beam_maps=None, ext_source_temps=None,
     ):
         """
         Simulate antenna temperature given basis coefficients.
@@ -1064,6 +1213,14 @@ class ForwardModel:
             unchanged.  Contributes ``T_iso * f_vis`` to the antenna temperature
             where ``f_vis = sum_p(B_p*mask_p) / sum_p(B_p)`` accounts for lunar
             occultation.  Defaults to zero.
+        ext_source_temps : ndarray, shape (ntimes, n_ext, nfreq), optional
+            Brightness temperature [K] for each external source configured
+            via ``precompute_geometry(ext_source_dirs_gal=...)``, at each
+            timestep/frequency.  Already occultation-gated by the caller
+            (e.g. zeroed where
+            :func:`eigsep_sim.ephemeris.body_occulted_by_moon` is True).
+            ``n_ext`` must match ``geom['ext_px_jax']``'s last dimension;
+            defaults to zero (no contribution) when omitted.
 
         Returns
         -------
@@ -1100,6 +1257,19 @@ class ForwardModel:
             else jnp.asarray(T_iso, dtype=DTYPE_R_JAX)
         )
 
+        ntimes = geom["terrain_masks_jax"].shape[0]
+        ext_px_jax = geom.get("ext_px_jax")
+        ext_wgts_jax = geom.get("ext_wgts_jax")
+        if ext_px_jax is None:
+            ext_px_jax = jnp.zeros((ntimes, 4, 0), dtype=jnp.int32)
+            ext_wgts_jax = jnp.zeros((ntimes, 4, 0), dtype=DTYPE_R_JAX)
+        n_ext = ext_px_jax.shape[-1]
+        ext_T_jax = (
+            jnp.zeros((ntimes, n_ext, nfreq), dtype=DTYPE_R_JAX)
+            if ext_source_temps is None
+            else jnp.asarray(ext_source_temps, dtype=DTYPE_R_JAX)
+        )
+
         return self._sim_jit(
             sky_coeffs_jax,
             beam_recon_all,
@@ -1115,6 +1285,9 @@ class ForwardModel:
             T_iso_jax,
             geom["tx_px_jax"],
             geom["tx_wgts_jax"],
+            ext_px_jax,
+            ext_wgts_jax,
+            ext_T_jax,
         )
 
 
