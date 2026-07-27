@@ -212,8 +212,13 @@ def inject_solar_bursts(
         )
         dt = t_s - t0
         rise = 0.1 * dur
+        # np.where evaluates both branches everywhere before selecting, so for
+        # dt << 0 (elements far before this burst) the discarded decay branch's
+        # exponent can be huge and overflow exp() even though its value is
+        # never used -- clip it to avoid the spurious RuntimeWarning.
+        decay_exponent = np.clip(-(dt - rise) / dur, None, 700.0)
         profile = np.where(
-            dt < 0, 0.0, np.where(dt < rise, dt / rise, np.exp(-(dt - rise) / dur))
+            dt < 0, 0.0, np.where(dt < rise, dt / rise, np.exp(decay_exponent))
         )
         burst_temp += amp * profile[:, None] * freq_shape[None, :]
 
@@ -289,3 +294,46 @@ def earth_rfi_temperature_K(freqs_hz, in_band_temp_K=5e5, out_of_band_temp_K=0.0
     f = np.asarray(freqs_hz, dtype=np.float64)
     in_band = (f >= FM_BAND_HZ[0]) & (f <= FM_BAND_HZ[1])
     return np.where(in_band, in_band_temp_K, out_of_band_temp_K)
+
+
+def earth_rfi_tone_temperature_K(
+    freqs_hz, tone_freqs_hz, tone_temp_K=5e5, tone_width_hz=None
+):
+    """Earth RFI as a comb of discrete broadcast-carrier tones, rather than
+    the flat in-band continuum of :func:`earth_rfi_temperature_K`.
+
+    Real FM/broadcast RFI is many narrow carriers (each order ~100-200 kHz
+    wide) separated by mostly-quiet channels, not a smooth top-hat spanning
+    the whole band -- a flat top-hat is a much smoother function of
+    frequency than the real environment, which makes it more degenerate
+    with smooth sky/Sun continua in a joint spectral fit than the real
+    signal would be. This models only the frequency structure (nonzero at
+    the tone centers, zero elsewhere); ``tone_temp_K`` is a free amplitude
+    parameter, same convention as ``in_band_temp_K`` above.
+
+    Parameters
+    ----------
+    freqs_hz : array_like, shape (nfreq,)
+        Frequency grid to evaluate on.
+    tone_freqs_hz : array_like, shape (ntones,)
+        Center frequencies of the discrete tones [Hz].
+    tone_temp_K : float
+        Brightness temperature contributed by each tone.
+    tone_width_hz : float, optional
+        Half-width used to associate a grid frequency with a tone. Default
+        is half the median grid spacing, i.e. each tone lights up only its
+        single nearest frequency channel -- appropriate when ``freqs_hz``
+        is a coarse science-channel grid rather than a fine RFI-survey grid.
+
+    Returns
+    -------
+    T_K : ndarray, shape (nfreq,)
+    """
+    f = np.asarray(freqs_hz, dtype=np.float64)
+    tones = np.atleast_1d(np.asarray(tone_freqs_hz, dtype=np.float64))
+    if tone_width_hz is None:
+        tone_width_hz = 0.5 * np.median(np.diff(np.sort(f))) if len(f) > 1 else 1.0
+    T = np.zeros_like(f)
+    for tf in tones:
+        T[np.abs(f - tf) <= tone_width_hz] = tone_temp_K
+    return T

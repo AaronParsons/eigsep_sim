@@ -198,6 +198,119 @@ def diurnal_thermal_skin_depth_m(thermal_diffusivity_m2_s=1e-9, period_s=None):
     return np.sqrt(thermal_diffusivity_m2_s * period_s / np.pi)
 
 
+def regolith_reflectivity(freqs_hz, eps_r=3.0, loss_tangent=0.005):
+    """Normal-incidence power reflectivity of the regolith half-space [-].
+
+    ``R = |(n-1)/(n+1)|**2`` with complex refractive index
+    ``n = sqrt(eps_r * (1 - 1j*loss_tangent))``, using the SAME dielectric
+    parameters already grounded for :func:`em_power_penetration_depth_m`
+    (Phase 2) rather than introducing new, independently-tuned numbers.
+    With the default ``eps_r=3.0``, ``loss_tangent=0.005`` this gives
+    ``R ~= 0.072``, nearly frequency-independent (the loss tangent's
+    contribution is a small O(loss_tangent^2) correction to the dominant
+    real-index reflectivity) -- consistent with a fixed, non-dispersive
+    dielectric model. This is a single-interface, smooth-surface, normal-
+    incidence placeholder: real regolith reflectivity is also a function of
+    incidence angle (Fresnel angular dependence) and surface roughness
+    (which suppresses coherent/specular reflection at short wavelengths
+    relative to the roughness scale); see the module-level notes on
+    ``specular_frac`` in :func:`specular_reflection_direction` /
+    :func:`lambertian_hemisphere_weights` for why specular is nonetheless
+    expected to dominate at these frequencies.
+
+    Parameters
+    ----------
+    freqs_hz : array_like
+        Unused except to broadcast the (currently frequency-independent)
+        result to the caller's frequency grid shape; kept as an explicit
+        argument so callers don't need special-case this function
+        differently from the other spectrum functions in this module, and
+        so a future angle/frequency-dependent refinement is a drop-in
+        replacement.
+    eps_r, loss_tangent : float
+        Same dielectric parameters as :func:`em_power_penetration_depth_m`.
+
+    Returns
+    -------
+    R : ndarray, same shape as ``freqs_hz``
+    """
+    freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
+    n_complex = np.sqrt(complex(eps_r) * (1.0 - 1j * loss_tangent))
+    R = np.abs((n_complex - 1.0) / (n_complex + 1.0)) ** 2
+    return np.full_like(freqs_hz, R)
+
+
+def specular_reflection_direction(view_dir, normal):
+    """Direction a specularly-reflected ray toward ``view_dir`` came from.
+
+    Standard mirror-image construction: ``source = 2*(view.n)*n - view``.
+    Both ``view_dir`` (unit vector from the surface point TOWARD the
+    observer) and the returned ``source`` direction (unit vector from the
+    surface point toward whatever is being reflected, e.g. a point on the
+    sky) point outward from the surface, into the same hemisphere as
+    ``normal``.
+
+    At 50-150 MHz (wavelength ~2-5 m), typical lunar regolith surface
+    roughness (~mm-cm scale, e.g. Diviner/radar roughness studies) is far
+    below the wavelength -- by the Rayleigh smoothness criterion the
+    surface behaves as optically SMOOTH at these frequencies, so coherent
+    specular reflection, not diffuse (Lambertian) scattering, should
+    dominate. Callers mixing this with :func:`lambertian_hemisphere_weights`
+    should default ``specular_frac`` close to 1 for that reason, not 0.5.
+
+    Parameters
+    ----------
+    view_dir : ndarray, shape (..., 3)
+        Unit vector(s) from the surface point toward the observer.
+    normal : ndarray, shape (..., 3), broadcastable with ``view_dir``
+        Unit outward surface normal(s), same frame as ``view_dir``.
+
+    Returns
+    -------
+    source_dir : ndarray, shape matching ``broadcast(view_dir, normal)``
+        Unit vector(s) toward the reflected source direction.
+    """
+    view_dir = np.asarray(view_dir, dtype=np.float64)
+    normal = np.asarray(normal, dtype=np.float64)
+    cos_i = np.sum(view_dir * normal, axis=-1, keepdims=True)
+    source = 2.0 * cos_i * normal - view_dir
+    return source / np.linalg.norm(source, axis=-1, keepdims=True)
+
+
+def lambertian_hemisphere_weights(normal, pixel_dirs, pixel_omega):
+    """Per-pixel Lambertian (diffuse) reflection weights for a surface point.
+
+    Returns ``w[pixel] = max(0, normal . pixel_dirs[pixel]) * pixel_omega / pi``
+    such that, for a sky brightness map ``T_sky`` sampled at ``pixel_dirs``
+    (same units/shape convention throughout this codebase: brightness
+    temperature, linear in the Rayleigh-Jeans regime used everywhere else
+    here), the diffusely-reflected brightness temperature is
+    ``R * (w @ T_sky)`` for reflectivity ``R``. Normalised so a spatially
+    UNIFORM sky of brightness ``T0`` reflects to exactly ``R * T0``
+    (``integral of cos(theta) over the hemisphere = pi``, the standard
+    Lambertian identity) -- a useful energy-conservation sanity check.
+
+    Parameters
+    ----------
+    normal : ndarray, shape (3,)
+        Unit outward surface normal, in the same frame as ``pixel_dirs``.
+    pixel_dirs : ndarray, shape (npix, 3)
+        Unit vectors of the sky pixel grid (or a reduced set of spatial
+        eigenmode-defining pixels) to integrate over.
+    pixel_omega : float or ndarray, shape (npix,)
+        Solid angle per pixel [sr] (e.g. ``healpy.nside2pixarea(nside)``
+        for a uniform HEALPix grid).
+
+    Returns
+    -------
+    weights : ndarray, shape (npix,)
+    """
+    normal = np.asarray(normal, dtype=np.float64)
+    pixel_dirs = np.asarray(pixel_dirs, dtype=np.float64)
+    cos_i = np.clip(pixel_dirs @ normal, 0.0, None)
+    return cos_i * np.asarray(pixel_omega) / np.pi
+
+
 def regolith_brightness_temperature_K(
     cos_zenith,
     phase_rad,

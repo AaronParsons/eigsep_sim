@@ -633,7 +633,7 @@ class ForwardModel:
 
     def precompute_geometry(
         self, times=None, rots=None, body_rots=None, sky_mask=None,
-        ext_source_dirs_gal=None, regolith_kwargs=None,
+        ext_source_dirs_gal=None, regolith_kwargs=None, reflection_kwargs=None,
     ):
         """
         Precompute rotation matrices and terrain masks for a list of observation
@@ -687,6 +687,37 @@ class ForwardModel:
             can't be represented by the single spectrum omitted pixels
             would need). ``None`` (default) preserves the existing scalar-
             occultation-temperature behavior exactly.
+        reflection_kwargs : dict, optional
+            When provided, ADDS a specular+Lambertian reflected GSM+Sun
+            brightness on top of whichever intrinsic emission model is
+            active for Moon-blocked pixels (the ``regolith_kwargs`` map if
+            also given, else the scalar ``occultation_temperature_K``) --
+            reflection is a correction to that base, not a replacement.
+            Computed from a caller-supplied, numerically KNOWN sky map (not
+            the symbolic ``sky_coeffs`` being fit elsewhere in this
+            pipeline) via :func:`eigsep_sim.regolith.specular_reflection_direction`
+            and :func:`eigsep_sim.regolith.lambertian_hemisphere_weights`,
+            so this is intended for generating realistic TRUE simulated
+            data, not as a differentiable term in a joint sky+beam fit (a
+            recovery pipeline that wants to account for reflection should
+            treat it as an explicit template rebuilt from the current best
+            sky estimate, the same way Sun/Earth flux are fit in BLOOM v003
+            Section 13 -- reflected light IS a linear function of the sky,
+            unlike Sun/Earth/regolith, so a single fixed template is only
+            exactly right once the sky estimate it's built from is exact).
+            Required key: ``sky_map_K`` (ndarray, shape (npix_sky, nfreq),
+            galactic frame, same nside as ``self.sky``). Optional keys:
+            ``specular_frac`` (default 0.9 -- physically motivated by the
+            Rayleigh smoothness criterion at 50-150 MHz wavelengths vs.
+            cm-scale regolith roughness, see
+            :func:`eigsep_sim.regolith.specular_reflection_direction`),
+            ``include_sun`` (default True), ``sun_temp_K`` (default
+            ``quiet_sun_temperature_K(freqs_hz)``), ``eps_r``,
+            ``loss_tangent`` (dielectric params for
+            :func:`eigsep_sim.regolith.regolith_reflectivity`, default same
+            as ``regolith_brightness_temperature_K``'s). Same ``times=``-
+            only, no-``sky_mask`` requirements as ``regolith_kwargs``.
+            ``None`` (default) adds no reflected term.
 
         Returns
         -------
@@ -835,56 +866,181 @@ class ForwardModel:
             )
 
             regolith_maps_all = None
-            if regolith_kwargs is not None:
+            reflect_maps_all = None
+            if regolith_kwargs is not None or reflection_kwargs is not None:
                 if observer_occultation_emission is None:
                     raise ValueError(
-                        "regolith_kwargs requires an occulting observer "
-                        "with occultation emission (e.g. "
+                        "regolith_kwargs/reflection_kwargs require an "
+                        "occulting observer with occultation emission (e.g. "
                         "LunarOrbit(occultation_temperature_K=...))"
                     )
                 if sky_mask is not None:
                     raise ValueError(
-                        "regolith_kwargs is not supported together with "
-                        "sky_mask (per-pixel regolith brightness can't be "
-                        "represented by the single unresolved_emission "
-                        "spectrum omitted pixels need); use full geometry "
-                        "(no sky_mask) instead"
+                        "regolith_kwargs/reflection_kwargs are not "
+                        "supported together with sky_mask (per-pixel "
+                        "brightness can't be represented by the single "
+                        "unresolved_emission spectrum omitted pixels need); "
+                        "use full geometry (no sky_mask) instead"
                     )
                 from .ephemeris import (
                     moon_surface_intersection_mcmf,
                     body_directions_gal,
+                    body_angular_radius,
                 )
                 from .observer import (
                     ICRS2GAL as _ICRS2GAL,
                     _moon_icrs2mcmf as _moon_icrs2mcmf_fn,
                 )
-                from .regolith import (
-                    solar_geometry as _solar_geometry,
-                    regolith_brightness_temperature_K as _regolith_Tb,
-                )
 
+                # Shared geometry: both the intrinsic-emission (regolith)
+                # and reflected-light (reflection) models need the same
+                # per-pixel, per-timestep surface normal and Sun direction.
                 normals_mcmf = moon_surface_intersection_mcmf(
                     self.observer, times, crds_gal.T
                 )  # (ntimes, npix_vis, 3); NaN where not occulted
-                sun_dirs_gal, _ = body_directions_gal(times, bodies=("sun",))
+                sun_dirs_gal, sun_dists = body_directions_gal(
+                    times, bodies=("sun",)
+                )
                 gal2icrs = _ICRS2GAL.T
+                icrs2gal = _ICRS2GAL
                 sun_dirs_mcmf = np.stack(
                     [
                         _moon_icrs2mcmf_fn(t) @ (gal2icrs @ sun_dirs_gal["sun"][i])
                         for i, t in enumerate(times)
                     ]
                 )  # (ntimes, 3)
-                cos_zenith, phase = _solar_geometry(
-                    normals_mcmf, sun_dirs_mcmf[:, None, :]
-                )  # (ntimes, npix_vis)
-                # NaN (not-occulted) pixels get multiplied by (1-obs_mask)=0
-                # below, but 0*NaN=NaN in IEEE float, so sanitize first.
-                regolith_maps_all = np.nan_to_num(
-                    _regolith_Tb(
-                        cos_zenith, phase, self.beam.freqs_hz, **regolith_kwargs
-                    ),
-                    nan=0.0,
-                ).astype(np.float32)  # (ntimes, npix_vis, nfreq)
+
+                if regolith_kwargs is not None:
+                    from .regolith import (
+                        solar_geometry as _solar_geometry,
+                        regolith_brightness_temperature_K as _regolith_Tb,
+                    )
+
+                    cos_zenith, phase = _solar_geometry(
+                        normals_mcmf, sun_dirs_mcmf[:, None, :]
+                    )  # (ntimes, npix_vis)
+                    # NaN (not-occulted) pixels get multiplied by
+                    # (1-obs_mask)=0 below, but 0*NaN=NaN in IEEE float, so
+                    # sanitize first.
+                    regolith_maps_all = np.nan_to_num(
+                        _regolith_Tb(
+                            cos_zenith, phase, self.beam.freqs_hz,
+                            **regolith_kwargs,
+                        ),
+                        nan=0.0,
+                    ).astype(np.float32)  # (ntimes, npix_vis, nfreq)
+
+                if reflection_kwargs is not None:
+                    from .regolith import (
+                        regolith_reflectivity as _regolith_R,
+                        specular_reflection_direction as _specular_dir,
+                        lambertian_hemisphere_weights as _lambertian_w,
+                    )
+                    from .sources import (
+                        quiet_sun_temperature_K as _quiet_sun_K,
+                    )
+                    import healpy as _healpy
+
+                    refl = dict(reflection_kwargs)
+                    sky_map_K = np.asarray(
+                        refl.pop("sky_map_K"), dtype=np.float64
+                    )  # (npix_sky, nfreq), galactic frame, self.sky.nside
+                    specular_frac = float(refl.pop("specular_frac", 0.9))
+                    include_sun = bool(refl.pop("include_sun", True))
+                    sun_temp_K = refl.pop("sun_temp_K", None)
+                    eps_r = refl.pop("eps_r", 3.0)
+                    loss_tangent = refl.pop("loss_tangent", 0.005)
+                    if refl:
+                        raise ValueError(
+                            f"unexpected reflection_kwargs keys: {list(refl)}"
+                        )
+
+                    R_freq = _regolith_R(
+                        self.beam.freqs_hz, eps_r=eps_r,
+                        loss_tangent=loss_tangent,
+                    )  # (nfreq,)
+                    if sun_temp_K is None:
+                        sun_temp_K = _quiet_sun_K(self.beam.freqs_hz)
+                    else:
+                        sun_temp_K = np.broadcast_to(
+                            np.asarray(sun_temp_K, dtype=np.float64),
+                            (len(self.beam.freqs_hz),),
+                        )
+                    sun_ang_rad = (
+                        body_angular_radius("sun", sun_dists["sun"])
+                        if include_sun else None
+                    )  # (ntimes,)
+
+                    pixel_omega = _healpy.nside2pixarea(self.sky.nside)
+                    view_dir_gal = -crds_gal.T  # (npix_vis, 3); time-independent
+                    reflect_maps_list = []
+                    for i in range(ntimes):
+                        M_t = _moon_icrs2mcmf_fn(times[i]) @ gal2icrs  # gal->mcmf
+                        normal_mcmf_t = normals_mcmf[i]  # (npix_vis,3), NaN if not occulted
+                        occ_valid = ~np.isnan(normal_mcmf_t[:, 0])
+
+                        view_mcmf_t = view_dir_gal @ M_t.T  # (npix_vis,3)
+                        normal_mcmf_safe = np.nan_to_num(normal_mcmf_t, nan=0.0)
+                        normal_mcmf_safe[~occ_valid] = [0.0, 0.0, 1.0]
+                        source_mcmf_t = _specular_dir(view_mcmf_t, normal_mcmf_safe)
+                        source_gal_t = source_mcmf_t @ M_t  # mcmf->gal (M_t orthogonal)
+                        normal_gal_t = normal_mcmf_safe @ M_t
+
+                        # Specular: bilinear-interpolated GSM sample at the
+                        # mirror direction.
+                        sp_th = np.arccos(np.clip(source_gal_t[:, 2], -1.0, 1.0))
+                        sp_ph = np.mod(
+                            np.arctan2(source_gal_t[:, 1], source_gal_t[:, 0]),
+                            2 * np.pi,
+                        )
+                        sp_px, sp_wg = _healpy.get_interp_weights(
+                            self.sky.nside, sp_th, sp_ph
+                        )  # (4, npix_vis)
+                        specular_gsm = sum(
+                            sp_wg[k][:, None] * sky_map_K[sp_px[k]]
+                            for k in range(4)
+                        )  # (npix_vis, nfreq)
+
+                        # Lambertian: cos-weighted hemisphere sum against the
+                        # full GSM map, chunked per-timestep to bound memory
+                        # (see regolith.py's lambertian_hemisphere_weights).
+                        # float32 throughout this (npix_vis, npix_vis) intermediate
+                        # halves its footprint vs. the float64 default.
+                        cos_i = np.clip(
+                            crds_gal.T.astype(np.float32)
+                            @ normal_gal_t.T.astype(np.float32),
+                            0.0, None,
+                        )
+                        lambertian_gsm = (
+                            (cos_i * np.float32(pixel_omega / np.pi)).T
+                            @ sky_map_K.astype(np.float32)
+                        )
+                        del cos_i
+
+                        sun_specular = np.zeros((npix_vis, len(self.beam.freqs_hz)))
+                        sun_lambertian = np.zeros((npix_vis, len(self.beam.freqs_hz)))
+                        if include_sun:
+                            sun_dir_gal_t = sun_dirs_gal["sun"][i]
+                            ang = np.arccos(np.clip(
+                                source_gal_t @ sun_dir_gal_t, -1.0, 1.0
+                            ))
+                            hit = ang <= sun_ang_rad[i]
+                            sun_specular[hit] = sun_temp_K[None, :]
+                            omega_sun = np.pi * sun_ang_rad[i] ** 2
+                            sun_cos = np.clip(normal_gal_t @ sun_dir_gal_t, 0.0, None)
+                            sun_lambertian = (
+                                (sun_cos * omega_sun / np.pi)[:, None]
+                                * sun_temp_K[None, :]
+                            )
+
+                        reflected_t = R_freq[None, :] * (
+                            specular_frac * (specular_gsm + sun_specular)
+                            + (1.0 - specular_frac) * (lambertian_gsm + sun_lambertian)
+                        )
+                        reflected_t[~occ_valid] = 0.0
+                        reflect_maps_list.append(reflected_t.astype(np.float32))
+
+                    reflect_maps_all = np.stack(reflect_maps_list)  # (ntimes, npix_vis, nfreq)
 
             # Batch-compute rotation matrices when the observer supports it.
             # EarthSurface uses a vectorised astropy call (61× faster than looping).
@@ -954,19 +1110,34 @@ class ForwardModel:
                 else:
                     masks_list.append(obs_mask)
                     if regolith_maps_all is not None:
-                        emissions_list.append(
-                            (
-                                (1.0 - obs_mask)[:, None] * regolith_maps_all[i]
-                            ).astype(np.float32)
-                        )
-                        default_emission_masks_list.append(
-                            np.zeros(npix_vis, dtype=np.float32)
-                        )
+                        base_emit = regolith_maps_all[i]
+                        default_mask = np.zeros(npix_vis, dtype=np.float32)
                     elif observer_occultation_emission is not None:
+                        base_emit = np.broadcast_to(
+                            observer_occultation_emission[None, :],
+                            (npix_vis, len(self.beam.freqs_hz)),
+                        ).astype(np.float32)
+                        default_mask = np.zeros(npix_vis, dtype=np.float32)
+                    else:
+                        base_emit = None  # filled by the zeros branch below
+                        default_mask = 1.0 - obs_mask
+                    if base_emit is not None:
+                        # reflect_maps_all adds ON TOP of whichever intrinsic
+                        # emission model (regolith or scalar occultation
+                        # temperature) is active -- reflection is a
+                        # correction to that base, not a replacement for it.
+                        if reflect_maps_all is not None:
+                            base_emit = base_emit + reflect_maps_all[i]
+                        emissions_list.append(
+                            ((1.0 - obs_mask)[:, None] * base_emit).astype(
+                                np.float32
+                            )
+                        )
+                        default_emission_masks_list.append(default_mask)
+                    elif reflect_maps_all is not None:
                         emissions_list.append(
                             (
-                                (1.0 - obs_mask)[:, None]
-                                * observer_occultation_emission[None, :]
+                                (1.0 - obs_mask)[:, None] * reflect_maps_all[i]
                             ).astype(np.float32)
                         )
                         default_emission_masks_list.append(

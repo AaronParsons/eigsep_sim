@@ -24,6 +24,7 @@ from .sources import (
     inject_solar_bursts,
     flag_bursts,
     earth_rfi_temperature_K,
+    earth_rfi_tone_temperature_K,
 )
 from .regolith import (
     subsolar_equilibrium_temperature_K,
@@ -32,6 +33,9 @@ from .regolith import (
     em_power_penetration_depth_m,
     diurnal_thermal_skin_depth_m,
     regolith_brightness_temperature_K,
+    regolith_reflectivity,
+    specular_reflection_direction,
+    lambertian_hemisphere_weights,
 )
 from .sky import Sky
 from .simulate import ForwardModel, StackedForwardModel
@@ -94,12 +98,16 @@ __all__ = [
     "inject_solar_bursts",
     "flag_bursts",
     "earth_rfi_temperature_K",
+    "earth_rfi_tone_temperature_K",
     "subsolar_equilibrium_temperature_K",
     "surface_equilibrium_temperature_K",
     "solar_geometry",
     "em_power_penetration_depth_m",
     "diurnal_thermal_skin_depth_m",
     "regolith_brightness_temperature_K",
+    "regolith_reflectivity",
+    "specular_reflection_direction",
+    "lambertian_hemisphere_weights",
     "Sky",
     "ForwardModel",
     "StackedForwardModel",

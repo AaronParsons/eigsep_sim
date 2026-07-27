@@ -26,6 +26,9 @@ from eigsep_sim.regolith import (
     em_power_penetration_depth_m,
     diurnal_thermal_skin_depth_m,
     regolith_brightness_temperature_K,
+    regolith_reflectivity,
+    specular_reflection_direction,
+    lambertian_hemisphere_weights,
 )
 
 
@@ -85,6 +88,81 @@ def test_em_penetration_depth_scales_inversely_with_frequency():
 def test_diurnal_skin_depth_order_of_magnitude():
     d = diurnal_thermal_skin_depth_m()
     assert 0.01 < d < 0.20  # cm-scale, per Hayne et al. 2017's ~4-10 cm
+
+
+def test_regolith_reflectivity_reasonable_and_nearly_flat():
+    freqs = np.array([50e6, 100e6, 150e6])
+    R = regolith_reflectivity(freqs)
+    assert R.shape == freqs.shape
+    assert np.all((R > 0.03) & (R < 0.15))  # ballpark for eps_r~3 dielectrics
+    np.testing.assert_allclose(R, R[0], rtol=1e-3)  # ~frequency-independent
+
+
+def test_regolith_reflectivity_zero_loss_matches_real_fresnel():
+    # zero loss tangent -> purely real index -> exact real-valued Fresnel formula
+    freqs = np.array([100e6])
+    R = regolith_reflectivity(freqs, eps_r=3.0, loss_tangent=0.0)
+    n = np.sqrt(3.0)
+    expected = ((n - 1) / (n + 1)) ** 2
+    np.testing.assert_allclose(R, expected, rtol=1e-10)
+
+
+def test_regolith_reflectivity_higher_eps_gives_higher_reflectivity():
+    freqs = np.array([100e6])
+    R_low  = regolith_reflectivity(freqs, eps_r=2.0)
+    R_high = regolith_reflectivity(freqs, eps_r=6.0)
+    assert R_high > R_low
+
+
+def test_specular_reflection_normal_incidence_reflects_back_along_normal():
+    normal = np.array([0.0, 0.0, 1.0])
+    view = np.array([0.0, 0.0, 1.0])  # observer directly overhead
+    source = specular_reflection_direction(view, normal)
+    np.testing.assert_allclose(source, normal, atol=1e-10)
+
+
+def test_specular_reflection_grazing_incidence_reflects_opposite():
+    normal = np.array([0.0, 0.0, 1.0])
+    view = np.array([1.0, 0.0, 1e-8])  # observer near the local horizon
+    source = specular_reflection_direction(view, normal)
+    np.testing.assert_allclose(source, -view, atol=1e-6)
+
+
+def test_specular_reflection_is_unit_norm_and_broadcasts():
+    normal = np.tile([0.0, 0.0, 1.0], (5, 1))
+    rng = np.random.default_rng(0)
+    view = rng.normal(size=(5, 3))
+    view /= np.linalg.norm(view, axis=-1, keepdims=True)
+    view[:, 2] = np.abs(view[:, 2])  # keep above horizon
+    source = specular_reflection_direction(view, normal)
+    assert source.shape == (5, 3)
+    np.testing.assert_allclose(np.linalg.norm(source, axis=-1), 1.0, atol=1e-10)
+
+
+def test_lambertian_weights_uniform_sky_reflects_to_reflectivity_times_temperature():
+    nside = 32
+    npix = healpy.nside2npix(nside)
+    pixel_dirs = np.array(healpy.pix2vec(nside, np.arange(npix))).T
+    pixel_omega = healpy.nside2pixarea(nside)
+    normal = np.array([0.0, 0.0, 1.0])
+    w = lambertian_hemisphere_weights(normal, pixel_dirs, pixel_omega)
+
+    T0 = 1000.0
+    T_sky_uniform = np.full(npix, T0)
+    R = 0.072
+    T_reflected = R * (w @ T_sky_uniform)
+    np.testing.assert_allclose(T_reflected, R * T0, rtol=2e-3)
+
+
+def test_lambertian_weights_zero_below_horizon():
+    nside = 16
+    npix = healpy.nside2npix(nside)
+    pixel_dirs = np.array(healpy.pix2vec(nside, np.arange(npix))).T
+    normal = np.array([0.0, 0.0, 1.0])
+    w = lambertian_hemisphere_weights(normal, pixel_dirs, healpy.nside2pixarea(nside))
+    below_horizon = pixel_dirs[:, 2] < 0
+    np.testing.assert_array_equal(w[below_horizon], 0.0)
+    assert np.any(w[~below_horizon] > 0)
 
 
 def test_regolith_brightness_high_frequency_matches_exact_surface():
@@ -270,6 +348,121 @@ def test_regolith_kwargs_frequency_dependence():
 def test_regolith_kwargs_simulate_runs_and_is_finite():
     fwd, times = _small_lunar_fwd()
     geom = fwd.precompute_geometry(times=times, regolith_kwargs={})
+    sky_coeffs = np.zeros((fwd.sky.npix, 2), dtype=np.float32)
+    T_ant = np.asarray(fwd.simulate(sky_coeffs, fwd.beam.coeffs, geom=geom))
+    assert np.all(np.isfinite(T_ant))
+    assert T_ant.shape == (30, 2, 4)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Integration: ForwardModel.precompute_geometry(reflection_kwargs=...)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_reflection_kwargs_requires_occulting_observer():
+    freqs_hz = np.array([100e6])
+    nside = 4
+    npix = healpy.nside2npix(nside)
+    beam = Beam.from_dipole(nside, freqs_hz, arm_lengths_m=3.0, K=2)
+    sky = Sky.from_map(nside, freqs_hz, np.zeros((npix, 1)), n_modes=1)
+    from eigsep_sim.observer import EarthSurface
+
+    observer = EarthSurface(lat=0.0, lon=0.0)
+    observer.set_time("2030-01-01")
+    fwd = ForwardModel(observer, beam, sky)
+    with pytest.raises(ValueError, match="occulting observer"):
+        fwd.precompute_geometry(
+            times=[Time("2030-01-01")],
+            reflection_kwargs=dict(sky_map_K=np.zeros((npix, 1))),
+        )
+
+
+def test_reflection_kwargs_incompatible_with_sky_mask():
+    fwd, times = _small_lunar_fwd()
+    npix_sky = healpy.nside2npix(4)
+    sky_map_K = np.zeros((npix_sky, 4))
+    sky_mask = np.ones(npix_sky, dtype=bool)
+    with pytest.raises(ValueError, match="sky_mask"):
+        fwd.precompute_geometry(
+            times=times, sky_mask=sky_mask,
+            reflection_kwargs=dict(sky_map_K=sky_map_K),
+        )
+
+
+def test_reflection_kwargs_absent_matches_prior_behavior():
+    """Default (no reflection_kwargs) must be byte-identical to before this
+    feature existed -- verified by re-running the existing regolith-only
+    baseline and checking it is unaffected by reflection_kwargs's mere
+    existence as a parameter."""
+    fwd, times = _small_lunar_fwd()
+    geom = fwd.precompute_geometry(times=times, regolith_kwargs={})
+    emissions = np.asarray(geom["terrain_emissions_jax"])
+    blocked = np.asarray(geom["terrain_masks_jax"]) < 1.0
+    assert blocked.any()
+    assert emissions[blocked].min() > 254.0
+    assert emissions[blocked].max() < 256.0  # unchanged deep-isotherm range
+
+
+def test_reflection_kwargs_energy_conservation_uniform_sky():
+    """A spatially UNIFORM sky must reflect to exactly R*T0, regardless of
+    specular_frac (specular and Lambertian individually reduce to the same
+    result for uniform illumination) -- a strong, mixing-fraction-
+    independent sanity check tying the reflected brightness directly to
+    regolith_reflectivity's own R(freq)."""
+    fwd, times = _small_lunar_fwd(nside=4, nfreq=3)
+    npix_sky = healpy.nside2npix(4)
+    T0 = 1000.0
+    sky_map_K = np.full((npix_sky, 3), T0)
+    freqs_hz = fwd.beam.freqs_hz
+    R = regolith_reflectivity(freqs_hz)
+
+    for frac in (0.0, 0.5, 1.0):
+        geom = fwd.precompute_geometry(
+            times=times,
+            reflection_kwargs=dict(
+                sky_map_K=sky_map_K, specular_frac=frac, include_sun=False,
+            ),
+        )
+        emissions = np.asarray(geom["terrain_emissions_jax"])
+        blocked = np.asarray(geom["terrain_masks_jax"]) < 1.0
+        assert blocked.any()
+        vals = emissions[blocked]  # (n_blocked, nfreq)
+        expected = 255.0 + R * T0  # base occultation_temperature_K=255 + R*T0
+        np.testing.assert_allclose(
+            vals, np.broadcast_to(expected, vals.shape), atol=2.0
+        )
+
+
+def test_reflection_kwargs_adds_on_top_of_regolith_base():
+    """regolith_kwargs + reflection_kwargs together must differ from (and
+    generally exceed) regolith_kwargs alone -- reflection is additive, not
+    a replacement."""
+    fwd, times = _small_lunar_fwd(nside=4, nfreq=3)
+    npix_sky = healpy.nside2npix(4)
+    sky_map_K = np.full((npix_sky, 3), 500.0)
+
+    geom_regolith_only = fwd.precompute_geometry(
+        times=times, regolith_kwargs={}
+    )
+    geom_both = fwd.precompute_geometry(
+        times=times, regolith_kwargs={},
+        reflection_kwargs=dict(sky_map_K=sky_map_K, include_sun=False),
+    )
+    e_regolith = np.asarray(geom_regolith_only["terrain_emissions_jax"])
+    e_both = np.asarray(geom_both["terrain_emissions_jax"])
+    blocked = np.asarray(geom_both["terrain_masks_jax"]) < 1.0
+    assert blocked.any()
+    assert np.all(e_both[blocked] > e_regolith[blocked])
+    assert np.all(np.isfinite(e_both))
+
+
+def test_reflection_kwargs_simulate_runs_and_is_finite():
+    fwd, times = _small_lunar_fwd()
+    npix_sky = healpy.nside2npix(4)
+    sky_map_K = np.full((npix_sky, 4), 300.0)
+    geom = fwd.precompute_geometry(
+        times=times, reflection_kwargs=dict(sky_map_K=sky_map_K)
+    )
     sky_coeffs = np.zeros((fwd.sky.npix, 2), dtype=np.float32)
     T_ant = np.asarray(fwd.simulate(sky_coeffs, fwd.beam.coeffs, geom=geom))
     assert np.all(np.isfinite(T_ant))

@@ -24,6 +24,7 @@ from eigsep_sim.sources import (
     inject_solar_bursts,
     flag_bursts,
     earth_rfi_temperature_K,
+    earth_rfi_tone_temperature_K,
     FM_BAND_HZ,
 )
 from eigsep_sim.ephemeris import body_directions_gal, body_occulted_by_moon
@@ -389,6 +390,27 @@ def test_earth_rfi_temperature_fm_band_only():
     in_band = (freqs_hz >= FM_BAND_HZ[0]) & (freqs_hz <= FM_BAND_HZ[1])
     np.testing.assert_array_equal(T[in_band], 5e5)
     np.testing.assert_array_equal(T[~in_band], 0.0)
+
+
+def test_earth_rfi_tone_temperature_nonzero_only_at_tones():
+    freqs_hz = np.linspace(55e6, 145e6, 45)
+    tone_freqs_hz = freqs_hz[[10, 18, 25]]  # snap tones exactly onto 3 grid channels
+    T = earth_rfi_tone_temperature_K(freqs_hz, tone_freqs_hz, tone_temp_K=5e5)
+    expect_nonzero = np.zeros(len(freqs_hz), dtype=bool)
+    expect_nonzero[[10, 18, 25]] = True
+    np.testing.assert_array_equal(T[expect_nonzero], 5e5)
+    np.testing.assert_array_equal(T[~expect_nonzero], 0.0)
+    # far fewer nonzero channels than the flat top-hat over the same band
+    T_flat = earth_rfi_temperature_K(freqs_hz, in_band_temp_K=5e5)
+    assert (T > 0).sum() < (T_flat > 0).sum()
+
+
+def test_earth_rfi_tone_temperature_off_grid_tone_hits_nearest_channel():
+    freqs_hz = np.array([88e6, 90e6, 92e6, 94e6])
+    T = earth_rfi_tone_temperature_K(freqs_hz, tone_freqs_hz=[90.4e6], tone_temp_K=1e5)
+    # default tone_width_hz = half the median grid spacing (1 MHz here) -> 90.4 MHz
+    # is within 1 MHz of the 90 MHz channel and no other.
+    np.testing.assert_array_equal(T, [0.0, 1e5, 0.0, 0.0])
 
 
 def test_earth_rfi_end_to_end_through_real_ephemeris_and_occultation():
