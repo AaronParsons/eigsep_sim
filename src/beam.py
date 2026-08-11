@@ -12,6 +12,7 @@ Beam data can come either from:
 Supported analytic dipole models:
   - "short": frequency-independent short-dipole power pattern
   - "thin": frequency-dependent finite thin-dipole power pattern in free space
+  - "v": frequency-dependent coherent two-arm V-dipole power pattern
 """
 
 import os
@@ -177,12 +178,130 @@ def thin_dipole_beam(
     return bm.astype(dtype)
 
 
+
+def v_dipole_arm_axes(opening_angle_deg, dipole_axis=(1.0, 0.0, 0.0), dtype=DTYPE_R_NPY):
+    """Return unit vectors for the two arms of a planar V dipole.
+
+    The arms are symmetric about ``dipole_axis``.  ``opening_angle_deg=180``
+    is the straight colinear dipole limit.  The V lies in the plane spanned by
+    ``dipole_axis`` and an arbitrary perpendicular vector; rotating this plane
+    around ``dipole_axis`` does not change the straight-dipole limit, but does
+    set the clocking of non-colinear V-dipole beams.
+    """
+    opening_angle_deg = float(opening_angle_deg)
+    if not 0.0 < opening_angle_deg <= 180.0:
+        raise ValueError("opening_angle_deg must be in the range 0-180 deg")
+
+    axis = _normalize_vector(dipole_axis, dtype=dtype)
+    ref = np.array([0.0, 0.0, 1.0], dtype=dtype)
+    if abs(float(axis @ ref)) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0], dtype=dtype)
+    perp = np.cross(ref, axis)
+    perp = _normalize_vector(perp, dtype=dtype)
+
+    half = np.deg2rad(opening_angle_deg / 2.0)
+    arms = np.stack(
+        [
+            np.cos(half) * axis + np.sin(half) * perp,
+            np.cos(half) * axis - np.sin(half) * perp,
+        ],
+        axis=0,
+    )
+    return arms.astype(dtype)
+
+
+def v_dipole_pattern(kh_total, arm_axes, pix_vecs, eps=1e-12):
+    """Coherent scalar power pattern for a two-arm V dipole.
+
+    Parameters
+    ----------
+    kh_total : float
+        Straight-equivalent dipole electrical half-length, ``pi * L_total * f / c``.
+        Each V arm is modeled as half this deployed length.
+    arm_axes : array_like, shape (2, 3)
+        Unit vectors for the two arm directions.
+    pix_vecs : array_like, shape (3, npix)
+        Unit vectors for beam evaluation directions.
+    eps : float
+        Floor on sin^2(theta) used to avoid singular on-arm values.
+
+    Returns
+    -------
+    pattern : ndarray, shape (npix,)
+        Unnormalised power beam.  The two arm electric fields are differenced
+        coherently before squaring.  At ``opening_angle_deg=180`` this reduces
+        to the straight two-arm dipole limit, up to an overall normalization.
+    """
+    arm_axes = np.asarray(arm_axes, dtype=float)
+    pix_vecs = np.asarray(pix_vecs, dtype=float)
+    if arm_axes.shape != (2, 3):
+        raise ValueError(f"arm_axes must have shape (2, 3), got {arm_axes.shape}")
+    if pix_vecs.ndim != 2 or pix_vecs.shape[0] != 3:
+        raise ValueError(f"pix_vecs must have shape (3, npix), got {pix_vecs.shape}")
+
+    kh_arm = 0.5 * float(kh_total)
+    fields = []
+    for axis in arm_axes:
+        u = _normalize_vector(axis)
+        cos_theta = u @ pix_vecs
+        sin2 = np.maximum(1.0 - cos_theta**2, eps)
+        numer = np.cos(kh_arm * cos_theta) - np.cos(kh_arm)
+        transverse = u[:, np.newaxis] - cos_theta[np.newaxis, :] * pix_vecs
+        field = np.where(sin2 > eps, numer / sin2, 0.0)[np.newaxis, :] * transverse
+        fields.append(field)
+
+    e_vec = fields[0] - fields[1]
+    return np.sum(e_vec * e_vec, axis=0)
+
+
+def v_dipole_beam(
+    freqs,
+    nside,
+    opening_angle_deg=90.0,
+    dipole_axis=(1.0, 0.0, 0.0),
+    dipole_length=2.0,
+    arm_axes=None,
+    horizon_clip=False,
+    dtype=DTYPE_R_NPY,
+    eps=1e-12,
+):
+    """Generate a frequency-dependent free-space two-arm V-dipole power beam.
+
+    ``dipole_length`` is the straight-equivalent deployed dipole length.  Each
+    V arm is modeled as half this length.  If ``arm_axes`` is provided, it must
+    contain the two arm unit vectors and overrides ``opening_angle_deg`` and
+    ``dipole_axis``.
+    """
+    freqs = np.asarray(freqs, dtype=dtype)
+    crd = np.stack(
+        healpy.pix2vec(nside, np.arange(healpy.nside2npix(nside))), axis=0
+    ).astype(dtype)
+    z = crd[2]
+    if arm_axes is None:
+        arm_axes = v_dipole_arm_axes(
+            opening_angle_deg, dipole_axis=dipole_axis, dtype=dtype
+        )
+    else:
+        arm_axes = np.asarray(arm_axes, dtype=dtype)
+
+    bm = np.empty((crd.shape[1], freqs.size), dtype=dtype)
+    for f_idx, freq_hz in enumerate(freqs):
+        kh_total = np.pi * float(dipole_length) * float(freq_hz) / C_LIGHT
+        bm[:, f_idx] = v_dipole_pattern(kh_total, arm_axes, crd, eps=eps)
+
+    if horizon_clip:
+        bm = np.where(z[:, None] >= 0, bm, 0.0)
+
+    return bm.astype(dtype)
+
 def analytic_dipole_beam(
     freqs,
     nside,
     dipole_axis=(1.0, 0.0, 0.0),
     dipole_model="thin",
     dipole_length=2.0,
+    opening_angle_deg=90.0,
+    arm_axes=None,
     horizon_clip=False,
     dtype=DTYPE_R_NPY,
     eps=1e-12,
@@ -198,10 +317,15 @@ def analytic_dipole_beam(
         HEALPix nside of the output beam.
     dipole_axis : array_like, shape (3,)
         Unit vector giving the dipole axis in the antenna frame.
-    dipole_model : {'short', 'thin'}
+    dipole_model : {'short', 'thin', 'v'}
         Analytic dipole model to use.
     dipole_length : float
-        Total physical dipole length [m]. Used only for dipole_model='thin'.
+        Total physical dipole length [m]. Used for dipole_model='thin' and as
+        the straight-equivalent deployed length for dipole_model='v'.
+    opening_angle_deg : float
+        Arm opening angle for dipole_model='v'. Ignored when ``arm_axes`` is provided.
+    arm_axes : array_like, shape (2, 3), optional
+        Explicit V-dipole arm axes for dipole_model='v'.
     horizon_clip : bool
         If True, set response below the horizon (z < 0) to zero.
     dtype : numpy dtype
@@ -228,6 +352,18 @@ def analytic_dipole_beam(
             nside,
             dipole_axis=dipole_axis,
             dipole_length=dipole_length,
+            horizon_clip=horizon_clip,
+            dtype=dtype,
+            eps=eps,
+        )
+    if dipole_model == "v":
+        return v_dipole_beam(
+            freqs,
+            nside,
+            opening_angle_deg=opening_angle_deg,
+            dipole_axis=dipole_axis,
+            dipole_length=dipole_length,
+            arm_axes=arm_axes,
             horizon_clip=horizon_clip,
             dtype=dtype,
             eps=eps,
