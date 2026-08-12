@@ -29,7 +29,11 @@ import jax.numpy as jnp
 import healpy
 
 from .const import DTYPE_R_JAX, DTYPE_R_NPY
-from .beam import dipole_beam_maps_jax, dipole_axes_from_angles
+from .beam import (
+    dipole_beam_maps_jax,
+    dipole_axes_from_angles,
+    v_dipole_beam_maps_jax,
+)
 
 
 # ── parametrisation helpers ─────────────────────────────────────────────────
@@ -59,6 +63,50 @@ def unpack_dipole_params(phys, n_dipoles):
     """Split the flat phys vector into ``(arm_lengths (D,), angles (D, 2))``."""
     n_dipoles = int(n_dipoles)
     return phys[:n_dipoles], phys[n_dipoles:].reshape(n_dipoles, 2)
+
+
+def pack_v_dipole_params(lengths_m, axis_angles_rad, opening_angles_deg,
+                         clock_angles_deg=None):
+    """Pack explicit V-dipole parameters into a flat physical vector.
+
+    Layout: ``[L..., axis_az/el..., opening_rad..., clock_rad...]``.  Each row
+    of ``axis_angles_rad`` gives the symmetry axis of one V dipole.  The opening
+    angles are the physical angle between the two arms.
+    """
+    lengths = np.asarray(lengths_m, dtype=DTYPE_R_NPY).ravel()
+    axis_angles = np.asarray(axis_angles_rad, dtype=DTYPE_R_NPY).reshape(
+        len(lengths), 2
+    )
+    openings = np.deg2rad(np.asarray(opening_angles_deg, dtype=DTYPE_R_NPY).ravel())
+    if clock_angles_deg is None:
+        clocks = np.zeros_like(openings)
+    else:
+        clocks = np.deg2rad(np.asarray(clock_angles_deg, dtype=DTYPE_R_NPY).ravel())
+    if openings.shape != lengths.shape or clocks.shape != lengths.shape:
+        raise ValueError(
+            "lengths, opening angles, and clock angles must have matching length"
+        )
+    return np.concatenate([lengths, axis_angles.ravel(), openings, clocks])
+
+
+def unpack_v_dipole_params(phys, n_dipoles):
+    """Split explicit V-dipole vector into length, axis, opening, and clock."""
+    n_dipoles = int(n_dipoles)
+    phys = jnp.asarray(phys)
+    i0 = n_dipoles
+    i1 = i0 + 2 * n_dipoles
+    i2 = i1 + n_dipoles
+    i3 = i2 + n_dipoles
+    if int(np.size(phys)) != i3:
+        raise ValueError(
+            f"expected {i3} V-dipole parameters for {n_dipoles} dipoles"
+        )
+    return (
+        phys[:i0],
+        phys[i0:i1].reshape(n_dipoles, 2),
+        phys[i1:i2],
+        phys[i2:i3],
+    )
 
 
 def build_gsm_sky_prior(gsm_maps, sky_coeffs_ref, rep_tol=1.0, max_modes=None):
@@ -366,4 +414,28 @@ class DipoleBeamVarPro:
         return t21_filter_forward(
             t21, self.fwd, self.geom, self.beam_maps(phys), self.U,
             self._invvar, ridge=self.ridge,
+        )
+
+
+class VDipoleBeamVarPro(DipoleBeamVarPro):
+    """VarPro recovery for coherent two-arm V dipoles.
+
+    The fitted physical vector is explicit in the V geometry:
+    ``[lengths, axis az/el pairs, opening angles, clock angles]``.  Opening and
+    clock angles are in radians inside the vector; use
+    :func:`pack_v_dipole_params` to build it from degree-valued engineering
+    inputs.
+    """
+
+    def beam_maps(self, phys):
+        lengths, axis_angles, opening_angles, clock_angles = unpack_v_dipole_params(
+            jnp.asarray(phys), self.n_dipoles
+        )
+        return v_dipole_beam_maps_jax(
+            lengths,
+            axis_angles,
+            opening_angles,
+            clock_angles,
+            self.freqs_hz,
+            self.pix_vecs,
         )

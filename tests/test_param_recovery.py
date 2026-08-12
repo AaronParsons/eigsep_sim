@@ -18,12 +18,15 @@ import astropy.units as u
 
 from eigsep_sim import (
     Beam, Sky, ForwardModel,
-    DipoleBeamVarPro, build_gsm_sky_prior, beam_pix_vecs,
+    DipoleBeamVarPro, VDipoleBeamVarPro, build_gsm_sky_prior, beam_pix_vecs,
     pack_dipole_params, unpack_dipole_params,
+    pack_v_dipole_params, unpack_v_dipole_params,
     dipole_beam_maps_jax, dipole_axes_from_angles,
+    v_dipole_beam_maps_jax,
     t21_filter_spectral, t21_filter_forward, t21_template,
 )
 from eigsep_sim.observer import LunarOrbit
+from eigsep_sim.beam import v_dipole_beam
 
 
 def build_param_problem(nside=8, nfreq=20, seed=0, noiseless=False):
@@ -184,6 +187,60 @@ def test_beam_maps_matches_coeff_path():
     d_coeff = np.asarray(fwd.simulate(sky_coeffs, beam.coeffs, geom=geom))
     d_maps = np.asarray(fwd.simulate(sky_coeffs, beam_maps=maps, geom=geom))
     assert np.max(np.abs(d_coeff - d_maps)) == 0.0
+
+
+def test_v_dipole_jax_maps_match_numpy_analytic():
+    freqs = np.linspace(50e6, 90e6, 5)
+    nside = 4
+    pix_vecs = beam_pix_vecs(nside)
+    phys = pack_v_dipole_params([6.0], [[0.0, 0.0]], [110.0], [0.0])
+    lengths, axis_angles, openings, clocks = unpack_v_dipole_params(phys, 1)
+    maps_jax = np.asarray(
+        v_dipole_beam_maps_jax(
+            lengths, axis_angles, openings, clocks, freqs, pix_vecs
+        )
+    )[0]
+    maps_np = v_dipole_beam(
+        freqs,
+        nside,
+        opening_angle_deg=110.0,
+        dipole_axis=(1.0, 0.0, 0.0),
+        dipole_length=6.0,
+    )
+    np.testing.assert_allclose(maps_jax, maps_np, atol=1e-11, rtol=1e-11)
+
+
+def test_v_dipole_varpro_fits_opening_angle_explicitly():
+    p = build_param_problem(nside=4, nfreq=8, noiseless=True)
+    lengths = np.array([6.0, 4.0])
+    axis_angles = np.array([[0.0, 0.0], [np.pi / 2.0, 0.0]])
+    opening_deg = np.array([105.0, 105.0])
+    clock_deg = np.array([0.0, 0.0])
+    phys_true = pack_v_dipole_params(lengths, axis_angles, opening_deg, clock_deg)
+
+    pix_vecs = beam_pix_vecs(p["beam"].nside)
+    L, axis, opening, clock = unpack_v_dipole_params(phys_true, 2)
+    maps_true = v_dipole_beam_maps_jax(
+        L, axis, opening, clock, p["beam"].freqs_hz, pix_vecs
+    )
+    data = np.asarray(
+        p["fwd"].simulate(
+            p["sky_coeffs"], beam_maps=maps_true, geom=p["geom"], T_iso=p["T21"]
+        )
+    )
+    vp = VDipoleBeamVarPro(
+        p["fwd"], data, p["inv_var"], p["sky_basis"], p["geom"], ridge=1e-10,
+    )
+    phys0 = phys_true.copy()
+    _, _, openings0, _ = unpack_v_dipole_params(phys0, 2)
+    phys0[6:8] = np.asarray(openings0) + np.deg2rad([3.0, -2.0])
+
+    res = vp.fit(phys0, max_iter=12, tol=1e-10)
+    _, _, openings_rec, _ = unpack_v_dipole_params(res["phys"], 2)
+    np.testing.assert_allclose(
+        np.rad2deg(np.asarray(openings_rec)), opening_deg, atol=0.2
+    )
+    assert res["loss"] < 0.05 * vp.loss(phys0)
 
 
 if __name__ == "__main__":

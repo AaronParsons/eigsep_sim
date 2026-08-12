@@ -477,6 +477,86 @@ def dipole_beam_maps_jax(arm_lengths_m, axes, freqs_hz, pix_vecs, eps=1e-12):
     return jnp.transpose(pattern, (1, 0, 2))          # (D, npix, F)
 
 
+def v_dipole_arm_axes_jax(axis_angles, opening_angles_rad, clock_angles_rad):
+    """Differentiable V-dipole arm axes from axis, opening, and clocking.
+
+    Parameters
+    ----------
+    axis_angles : array_like, shape (n_dipoles, 2)
+        Per-port V symmetry-axis ``[azimuth, elevation]`` in radians.
+    opening_angles_rad : array_like, shape (n_dipoles,)
+        Angle between the two physical arms of each V dipole, in radians.
+    clock_angles_rad : array_like, shape (n_dipoles,)
+        Rotation of the V plane about the symmetry axis, in radians.
+
+    Returns
+    -------
+    arm_axes : jnp.ndarray, shape (n_dipoles, 2, 3)
+        Unit vectors for the two arms of each V dipole.
+    """
+    axis = dipole_axes_from_angles(axis_angles)
+    opening = jnp.asarray(opening_angles_rad, dtype=DTYPE_R_JAX)
+    clock = jnp.asarray(clock_angles_rad, dtype=DTYPE_R_JAX)
+
+    ref_z = jnp.broadcast_to(
+        jnp.asarray([0.0, 0.0, 1.0], dtype=DTYPE_R_JAX), axis.shape
+    )
+    ref_y = jnp.broadcast_to(
+        jnp.asarray([0.0, 1.0, 0.0], dtype=DTYPE_R_JAX), axis.shape
+    )
+    p_z = jnp.cross(ref_z, axis)
+    p_y = jnp.cross(ref_y, axis)
+    nz = jnp.linalg.norm(p_z, axis=1, keepdims=True)
+    p0 = jnp.where(nz > 1e-6, p_z, p_y)
+    p0 = p0 / jnp.maximum(jnp.linalg.norm(p0, axis=1, keepdims=True), 1e-12)
+    q0 = jnp.cross(axis, p0)
+    q0 = q0 / jnp.maximum(jnp.linalg.norm(q0, axis=1, keepdims=True), 1e-12)
+
+    perp = jnp.cos(clock)[:, None] * p0 + jnp.sin(clock)[:, None] * q0
+    half = 0.5 * opening
+    arm_plus = jnp.cos(half)[:, None] * axis + jnp.sin(half)[:, None] * perp
+    arm_minus = jnp.cos(half)[:, None] * axis - jnp.sin(half)[:, None] * perp
+    return jnp.stack([arm_plus, arm_minus], axis=1)
+
+
+def v_dipole_beam_maps_jax(
+    dipole_lengths_m,
+    axis_angles,
+    opening_angles_rad,
+    clock_angles_rad,
+    freqs_hz,
+    pix_vecs,
+    eps=1e-12,
+):
+    """Differentiable coherent two-arm V-dipole power-beam maps.
+
+    ``dipole_lengths_m`` is the straight-equivalent deployed length; each V arm
+    is modeled as half this length, matching :func:`v_dipole_beam`.
+    """
+    lengths = jnp.asarray(dipole_lengths_m, dtype=DTYPE_R_JAX)
+    freqs_hz = jnp.asarray(freqs_hz, dtype=DTYPE_R_JAX)
+    pix_vecs = jnp.asarray(pix_vecs, dtype=DTYPE_R_JAX)
+    arms = v_dipole_arm_axes_jax(
+        axis_angles, opening_angles_rad, clock_angles_rad
+    )  # (D, 2, 3)
+
+    cos_theta = jnp.einsum("dak,pk->dap", arms, pix_vecs)  # (D, 2, P)
+    sin2 = jnp.maximum(1.0 - cos_theta ** 2, eps)
+    kh_arm = 0.5 * (jnp.pi / C_LIGHT) * lengths[:, None] * freqs_hz[None, :]
+    numer = (
+        jnp.cos(cos_theta[:, :, :, None] * kh_arm[:, None, None, :])
+        - jnp.cos(kh_arm)[:, None, None, :]
+    )
+    scale = jnp.where(sin2[:, :, :, None] > eps, numer / sin2[:, :, :, None], 0.0)
+    transverse = (
+        arms[:, :, None, :]
+        - cos_theta[:, :, :, None] * pix_vecs[None, None, :, :]
+    )
+    fields = scale[:, :, :, :, None] * transverse[:, :, :, None, :]
+    e_vec = fields[:, 0] - fields[:, 1]
+    return jnp.sum(e_vec * e_vec, axis=-1)  # (D, P, F)
+
+
 # ── Dipole reception physics ───────────────────────────────────────────────
 
 def gsm_like_tsky_K(freq_mhz):
