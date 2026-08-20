@@ -16,7 +16,15 @@ from .terrain import (
     NullTerrain,
     HorizonTerrain,
 )
-from .observer import Observer, EarthSurface, LunarSurface, LunarOrbit
+from .observer import (
+    Observer,
+    EarthSurface,
+    LunarSurface,
+    LunarOrbitObserver,
+    CircularLunarOrbit,
+    EphemerisLunarOrbit,
+    LunarOrbit,
+)
 from .ephemeris import (
     body_directions_gal,
     body_angular_radius,
@@ -98,6 +106,9 @@ __all__ = [
     "Observer",
     "EarthSurface",
     "LunarSurface",
+    "LunarOrbitObserver",
+    "CircularLunarOrbit",
+    "EphemerisLunarOrbit",
     "LunarOrbit",
     "body_directions_gal",
     "body_angular_radius",

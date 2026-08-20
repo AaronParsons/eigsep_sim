@@ -15,6 +15,7 @@ from astropy.coordinates import SkyCoord, CartesianRepresentation, EarthLocation
 import astropy.units as u
 from scipy.spatial.transform import Rotation
 from scipy.integrate import solve_ivp
+from scipy.interpolate import CubicSpline
 
 from .coord import rot_m
 from .const import R_MOON, GM_MOON
@@ -314,59 +315,45 @@ def circular_orbital_period(altitude):
     return 2.0 * np.pi * np.sqrt(r ** 3 / GM_MOON)
 
 
-class LunarOrbit(Observer):
+class LunarOrbitObserver(Observer):
     """
-    Spacecraft in a circular lunar orbit with an independent spin.
+    Shared base for lunar-orbiting spacecraft observers (spin + occultation
+    geometry).  The galactic frame is used as the inertial reference
+    throughout, consistent with the GSM sky model.
 
-    The orbital period is computed automatically from *altitude* via Kepler's
-    third law (:func:`circular_orbital_period`).  The galactic frame is used
-    as the inertial reference throughout, consistent with the GSM sky model.
+    Subclasses must implement:
+      - spacecraft_position() / spacecraft_position_stack(times) : position
+        of the spacecraft relative to the Moon centre, in the galactic
+        frame, metres
+      - altitude, orbital_radius, orbital_period : scalar summary
+        properties -- exact constants for a circular orbit, best-estimate
+        (e.g. mean) values for anything else
 
     Parameters
     ----------
-    altitude : float
-        Orbital altitude above the lunar surface [m].
-    rot_orbit_vec : array_like, shape (3,)
-        Unit vector in the galactic frame normal to the orbital plane.
-        The spacecraft orbits counter-clockwise around this axis.
     rot_spin_vec : array_like, shape (3,)
         Unit vector in the galactic frame about which the spacecraft spins.
-    start_pos : array_like, shape (3,), optional
-        Unit vector in the galactic frame giving the initial orbital
-        position direction from the Moon centre.  Default: [1, 0, 0].
     spin_period : float
         Spacecraft spin period [s].  0 means no spin.
     t0 : `~astropy.time.Time` or str, optional
-        Reference epoch: spacecraft is at ``start_pos`` with zero spin
-        phase at this time.  Default: J2000.
+        Reference epoch: spacecraft has zero spin phase at this time.
+        Default: J2000.
+    occultation_temperature_K : float, optional
+        Uniform thermal brightness [K] returned by ``occultation_emission``
+        for Moon-blocked directions.  Default: None (no emission).
     """
 
     occludes_sky = True
 
     def __init__(
         self,
-        altitude,
-        rot_orbit_vec,
         rot_spin_vec,
-        start_pos=None,
         spin_period=0.0,
         t0=None,
         occultation_temperature_K=None,
     ):
-        self.altitude = altitude
-        self.orbital_radius = R_MOON + altitude
-        self.orbital_period = circular_orbital_period(altitude)
-
-        self.rot_orbit_vec = np.asarray(rot_orbit_vec, dtype=float)
-        self.rot_orbit_vec /= np.linalg.norm(self.rot_orbit_vec)
-
         self.rot_spin_vec = np.asarray(rot_spin_vec, dtype=float)
         self.rot_spin_vec /= np.linalg.norm(self.rot_spin_vec)
-
-        if start_pos is None:
-            start_pos = np.array([1.0, 0.0, 0.0])
-        self.start_pos = np.asarray(start_pos, dtype=float)
-        self.start_pos /= np.linalg.norm(self.start_pos)
 
         self.spin_period = float(spin_period)
         self.t0 = Time("J2000") if t0 is None else Time(t0)
@@ -378,7 +365,6 @@ class LunarOrbit(Observer):
         super().__init__()
         self.time = self.t0
 
-        self._th_orbit = 0.0
         self._th_spin = 0.0
         self._pix_vec_cache = {}
 
@@ -387,23 +373,12 @@ class LunarOrbit(Observer):
         return (times - self.t0).to(u.s).value
 
     def set_time(self, t):
-        """Set the current epoch and update orbital and spin phases."""
+        """Set the current epoch and update the spin phase."""
         super().set_time(t)
         dt = (self.time - self.t0).to(u.s).value
-        self._th_orbit = 2 * np.pi * dt / self.orbital_period
         self._th_spin = (
             2 * np.pi * dt / self.spin_period if self.spin_period != 0.0 else 0.0
         )
-
-    def set_phases(self, th_orbit, th_spin=0.0):
-        """
-        Directly set orbital and spin phases in radians.
-
-        Useful for looping over orbital/spin configurations without
-        converting to absolute time.
-        """
-        self._th_orbit = float(th_orbit)
-        self._th_spin = float(th_spin)
 
     def spacecraft_position(self):
         """
@@ -415,8 +390,29 @@ class LunarOrbit(Observer):
         pos : ndarray, shape (3,)
             Position vector in metres.
         """
-        R = rot_m(self._th_orbit, self.rot_orbit_vec)
-        return R @ (self.start_pos * self.orbital_radius)
+        raise NotImplementedError
+
+    def spacecraft_position_stack(self, times):
+        """Batch spacecraft positions in galactic coordinates, shape (ntimes, 3)."""
+        raise NotImplementedError
+
+    @property
+    def altitude(self):
+        """Altitude above the lunar surface [m] (exact for a circular orbit,
+        a summary value such as the mean otherwise)."""
+        raise NotImplementedError
+
+    @property
+    def orbital_radius(self):
+        """Distance from the Moon centre [m] (exact for a circular orbit,
+        a summary value such as the mean otherwise)."""
+        raise NotImplementedError
+
+    @property
+    def orbital_period(self):
+        """Orbital period [s] (exact for a circular orbit, an estimate
+        otherwise)."""
+        raise NotImplementedError
 
     def rot_gal2top(self):
         """
@@ -441,17 +437,6 @@ class LunarOrbit(Observer):
         if R_spin.ndim == 2:
             R_spin = np.broadcast_to(R_spin, (len(Time(times)), 3, 3))
         return np.swapaxes(R_spin, -1, -2).astype(np.float32)
-
-    def spacecraft_position_stack(self, times):
-        """Batch spacecraft positions in galactic coordinates, shape (ntimes, 3)."""
-        dt = self._time_seconds(times)
-        th_orbit = 2 * np.pi * dt / self.orbital_period
-        R_orbit = rot_m(th_orbit, self.rot_orbit_vec)
-        return np.einsum(
-            "tij,j->ti",
-            R_orbit,
-            self.start_pos * self.orbital_radius,
-        )
 
     def _pix_vecs(self, nside):
         nside = int(nside)
@@ -501,3 +486,219 @@ class LunarOrbit(Observer):
         return np.full(
             len(freqs_hz), self.occultation_temperature_K, dtype=np.float32
         )
+
+
+class CircularLunarOrbit(LunarOrbitObserver):
+    """
+    Spacecraft in a circular lunar orbit with an independent spin.
+
+    The orbital period is computed automatically from *altitude* via Kepler's
+    third law (:func:`circular_orbital_period`).
+
+    Parameters
+    ----------
+    altitude : float
+        Orbital altitude above the lunar surface [m].
+    rot_orbit_vec : array_like, shape (3,)
+        Unit vector in the galactic frame normal to the orbital plane.
+        The spacecraft orbits counter-clockwise around this axis.
+    rot_spin_vec : array_like, shape (3,)
+        Unit vector in the galactic frame about which the spacecraft spins.
+    start_pos : array_like, shape (3,), optional
+        Unit vector in the galactic frame giving the initial orbital
+        position direction from the Moon centre.  Default: [1, 0, 0].
+    spin_period : float
+        Spacecraft spin period [s].  0 means no spin.
+    t0 : `~astropy.time.Time` or str, optional
+        Reference epoch: spacecraft is at ``start_pos`` with zero spin
+        phase at this time.  Default: J2000.
+    """
+
+    def __init__(
+        self,
+        altitude,
+        rot_orbit_vec,
+        rot_spin_vec,
+        start_pos=None,
+        spin_period=0.0,
+        t0=None,
+        occultation_temperature_K=None,
+    ):
+        self._altitude = altitude
+        self._orbital_radius = R_MOON + altitude
+        self._orbital_period = circular_orbital_period(altitude)
+
+        self.rot_orbit_vec = np.asarray(rot_orbit_vec, dtype=float)
+        self.rot_orbit_vec /= np.linalg.norm(self.rot_orbit_vec)
+
+        if start_pos is None:
+            start_pos = np.array([1.0, 0.0, 0.0])
+        self.start_pos = np.asarray(start_pos, dtype=float)
+        self.start_pos /= np.linalg.norm(self.start_pos)
+
+        super().__init__(
+            rot_spin_vec,
+            spin_period=spin_period,
+            t0=t0,
+            occultation_temperature_K=occultation_temperature_K,
+        )
+        self._th_orbit = 0.0
+
+    @property
+    def altitude(self):
+        return self._altitude
+
+    @property
+    def orbital_radius(self):
+        return self._orbital_radius
+
+    @property
+    def orbital_period(self):
+        return self._orbital_period
+
+    def set_time(self, t):
+        """Set the current epoch and update orbital and spin phases."""
+        super().set_time(t)
+        dt = (self.time - self.t0).to(u.s).value
+        self._th_orbit = 2 * np.pi * dt / self.orbital_period
+
+    def set_phases(self, th_orbit, th_spin=0.0):
+        """
+        Directly set orbital and spin phases in radians.
+
+        Useful for looping over orbital/spin configurations without
+        converting to absolute time.
+        """
+        self._th_orbit = float(th_orbit)
+        self._th_spin = float(th_spin)
+
+    def spacecraft_position(self):
+        R = rot_m(self._th_orbit, self.rot_orbit_vec)
+        return R @ (self.start_pos * self.orbital_radius)
+
+    def spacecraft_position_stack(self, times):
+        dt = self._time_seconds(times)
+        th_orbit = 2 * np.pi * dt / self.orbital_period
+        R_orbit = rot_m(th_orbit, self.rot_orbit_vec)
+        return np.einsum(
+            "tij,j->ti",
+            R_orbit,
+            self.start_pos * self.orbital_radius,
+        )
+
+
+# Backward-compat alias: existing code/tests construct `LunarOrbit(...)`.
+LunarOrbit = CircularLunarOrbit
+
+
+class EphemerisLunarOrbit(LunarOrbitObserver):
+    """
+    Spacecraft on a real, non-circular lunar-orbit ephemeris, with an
+    independent spin.
+
+    Position is interpolated from a supplied ``(times, positions_m)`` table
+    via a per-axis cubic spline; queries outside the loaded time span raise
+    ``ValueError`` rather than silently extrapolating a real trajectory.
+
+    ``altitude``/``orbital_radius`` are the *mean* values over the loaded
+    span, not physical invariants (unlike :class:`CircularLunarOrbit`, where
+    they're exact and constant).  ``orbital_period`` is estimated from the
+    spacing between periapsis passages in the loaded data.
+
+    Parameters
+    ----------
+    times : `~astropy.time.Time` or array_like
+        Ephemeris sample epochs, shape (N,).
+    positions_m : array_like, shape (N, 3)
+        Spacecraft position relative to the Moon centre, in the galactic
+        frame, metres -- same convention as
+        :meth:`LunarOrbitObserver.spacecraft_position`.
+    rot_spin_vec : array_like, shape (3,)
+        Unit vector in the galactic frame about which the spacecraft spins.
+    spin_period : float
+        Spacecraft spin period [s].  0 means no spin.
+    t0 : `~astropy.time.Time` or str, optional
+        Reference epoch for spin-phase bookkeeping.  Default: the first
+        loaded sample time.
+    """
+
+    def __init__(
+        self,
+        times,
+        positions_m,
+        rot_spin_vec,
+        spin_period=0.0,
+        t0=None,
+        occultation_temperature_K=None,
+    ):
+        times = Time(times)
+        positions_m = np.asarray(positions_m, dtype=float)
+        if positions_m.ndim != 2 or positions_m.shape[1] != 3:
+            raise ValueError("positions_m must have shape (N, 3)")
+        if len(times) != len(positions_m):
+            raise ValueError("times and positions_m must have the same length")
+
+        order = np.argsort(times.tdb.jd)
+        times = times[order]
+        positions_m = positions_m[order]
+
+        t0 = times[0] if t0 is None else Time(t0)
+        super().__init__(
+            rot_spin_vec,
+            spin_period=spin_period,
+            t0=t0,
+            occultation_temperature_K=occultation_temperature_K,
+        )
+
+        dt = (times - self.t0).to(u.s).value
+        self._t_min = float(dt[0])
+        self._t_max = float(dt[-1])
+        self._spline = CubicSpline(dt, positions_m, axis=0, extrapolate=False)
+
+        radii = np.linalg.norm(positions_m, axis=1)
+        self._orbital_radius = float(np.mean(radii))
+        self._altitude = self._orbital_radius - R_MOON
+        self._orbital_period = self._estimate_period(dt, radii)
+
+    @staticmethod
+    def _estimate_period(dt, radii):
+        """Median spacing between periapsis passages (radius local minima),
+        found directly on the loaded sample grid (no re-gridding -- a fixed
+        resampling density risks aliasing against the data's actual orbital
+        frequency); falls back to the circular-orbit Kepler estimate at the
+        mean radius if fewer than two periapsis passages are present in the
+        loaded span."""
+        is_min = (radii[1:-1] < radii[:-2]) & (radii[1:-1] < radii[2:])
+        minima_t = dt[1:-1][is_min]
+        if len(minima_t) < 2:
+            return circular_orbital_period(float(np.mean(radii)) - R_MOON)
+        return float(np.median(np.diff(minima_t)))
+
+    def _check_bounds(self, t_s):
+        if np.any(t_s < self._t_min) or np.any(t_s > self._t_max):
+            raise ValueError(
+                "requested time outside loaded ephemeris span "
+                f"[{self._t_min:.0f}, {self._t_max:.0f}] s from t0"
+            )
+
+    @property
+    def altitude(self):
+        return self._altitude
+
+    @property
+    def orbital_radius(self):
+        return self._orbital_radius
+
+    @property
+    def orbital_period(self):
+        return self._orbital_period
+
+    def spacecraft_position(self):
+        dt = (self.time - self.t0).to(u.s).value
+        self._check_bounds(dt)
+        return self._spline(dt)
+
+    def spacecraft_position_stack(self, times):
+        dt = self._time_seconds(times)
+        self._check_bounds(dt)
+        return self._spline(dt)
